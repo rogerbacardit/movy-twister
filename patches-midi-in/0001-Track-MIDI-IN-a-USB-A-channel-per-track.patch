@@ -1,0 +1,1149 @@
+From 06e2d6b38b0c4a546920afadc3ee2a5a28446469 Mon Sep 17 00:00:00 2001
+From: rogerbacardit <rogerbacardit@gmail.com>
+Date: Mon, 16 Nov 2026 17:16:01 +0100
+Subject: [PATCH 1/2] Track MIDI IN: a USB-A channel per track
+
+A USB-A controller's every channel played the selected track, so a
+sequencer sending several channels at once (a KeyStep Pro's four tracks)
+collapsed onto one track. A track may now claim a channel (its MIDI IN,
+SEL by default): that channel plays and records into that track whatever
+is selected. Unclaimed channels still follow the selection, so a Set with
+no claim behaves exactly as before.
+
+- engine ext_route.rs: `extmap` is `<active>[;<ch>:<dest>]*`; the ledger
+  is per channel (the same key on two channels is two notes); a wheel is
+  recentred only on a chain no channel reaches any more.
+- track/midi-in.ts: the per-track setting, carried in the UI blob; the
+  lower track wins a channel two tracks claim, so the engine and the
+  recording always agree.
+- track menu (Shift + track): a MIDI IN row, jog to it, knob 1 turns it.
+- Manual: playing.md "A channel for each track", controls.md.
+
+Gate: local suites (logic incl. new midi-in.mjs, app-loop, screenshot with
+the track menu baselines updated, perf, source-rules, host-globals,
+typecheck) and cargo test (6 new ext_route tests). Device tier not run yet:
+the box runs the v0.37.0 store build.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ browser-test/logic.mjs                        |   2 +
+ browser-test/logic/freeze.mjs                 |   2 +-
+ browser-test/logic/midi-in.mjs                |  90 ++++++++
+ browser-test/screenshot.mjs                   |  15 +-
+ .../screenshots/baseline/track_menu.png       | Bin 1014 -> 1141 bytes
+ .../baseline/track_menu_midi_in.png           | Bin 0 -> 1269 bytes
+ .../baseline/track_menu_unfreeze.png          | Bin 1337 -> 1456 bytes
+ build/browser.mjs                             |   3 +
+ engine/crates/movy-dsp/src/ext_route.rs       | 214 +++++++++++++-----
+ engine/crates/movy-dsp/src/lib.rs             |  14 +-
+ site/assets/screens/track_menu.png            | Bin 2222 -> 2431 bytes
+ site/assets/screens/track_menu_midi_in.png    | Bin 0 -> 2672 bytes
+ site/assets/screens/track_menu_unfreeze.png   | Bin 2778 -> 2960 bytes
+ site/manual/playing.md                        |  21 +-
+ site/reference/controls.md                    |   2 +-
+ src/midi/external.ts                          |   9 +-
+ src/seq/track-menu-input.ts                   |  12 +-
+ src/seq/track-menu.ts                         |  42 +++-
+ src/seq/ui-state.ts                           |   8 +-
+ src/track/ext-route.ts                        |  22 +-
+ src/track/midi-in.ts                          |  58 +++++
+ 21 files changed, 429 insertions(+), 85 deletions(-)
+ create mode 100644 browser-test/logic/midi-in.mjs
+ create mode 100644 browser-test/screenshots/baseline/track_menu_midi_in.png
+ create mode 100644 site/assets/screens/track_menu_midi_in.png
+ create mode 100644 src/track/midi-in.ts
+
+diff --git a/browser-test/logic.mjs b/browser-test/logic.mjs
+index c372a8de..a4fcdda0 100644
+--- a/browser-test/logic.mjs
++++ b/browser-test/logic.mjs
+@@ -88,6 +88,7 @@ import { run as run_loop_window } from './logic/loop-window.mjs';
+ import { run as run_note_view } from './logic/note-view.mjs';
+ import { run as run_step_piano } from './logic/step-piano.mjs';
+ import { run as run_external_midi } from './logic/external-midi.mjs';
++import { run as run_midi_in } from './logic/midi-in.mjs';
+ import { run as run_track_watch } from './logic/track-watch.mjs';
+ import { run as run_tracks_refs } from './logic/tracks-refs.mjs';
+ import { run as run_tracks_chain } from './logic/tracks-chain.mjs';
+@@ -216,6 +217,7 @@ const SUITES = [
+     run_note_view,
+     run_step_piano,
+     run_external_midi,
++    run_midi_in,
+     run_track_watch,
+     run_tracks_refs,
+     run_tracks_chain,
+diff --git a/browser-test/logic/freeze.mjs b/browser-test/logic/freeze.mjs
+index 57eeb1f7..fed675ca 100644
+--- a/browser-test/logic/freeze.mjs
++++ b/browser-test/logic/freeze.mjs
+@@ -76,7 +76,7 @@ export async function run() {
+     menu.openTrackMenu(2);
+     eq('open for T3', menu.trackMenuTrack(), 2);
+     let vm = menu.buildTrackMenuVM();
+-    eq('one row: FREEZE T3', vm.rows.map(r => r.name).join('|'), 'FREEZE T3');
++    eq('FREEZE T3 first, then MIDI IN', vm.rows.map(r => r.name).join('|'), 'FREEZE T3|MIDI IN');
+     eq('the hint says what it does', vm.hint, 'Records every clip. Saves CPU.');
+     menu.trackMenuClick('Surge');
+     eq('a click freezes it', writes.join(' '), 'frz=2');
+diff --git a/browser-test/logic/midi-in.mjs b/browser-test/logic/midi-in.mjs
+new file mode 100644
+index 00000000..19121600
+--- /dev/null
++++ b/browser-test/logic/midi-in.mjs
+@@ -0,0 +1,90 @@
++/* browser-test/logic/midi-in.mjs — a track's MIDI IN (track/midi-in.ts): a
++ * claimed USB-A channel plays its track whatever is selected; the engine's
++ * route, the recording, the Set and the track menu all agree on it.
++ *
++ * Run by browser-test/logic.mjs.
++ */
++
++import { eq, lastMusicalOp, _log } from './harness.mjs';
++
++export async function run() {
++    _log('\ntrack MIDI IN (channel per track):');
++    const { installMockEngine, uninstallMockEngine } = await import('../mock-engine.mjs');
++    const { seqEngineTick, resetSeqEngine } = await import('../../dist/esm/seq/engine.js');
++    const { resetSeqState } = await import('../../dist/esm/seq/state.js');
++    const { resetStepRec } = await import('../../dist/esm/seq/step-rec.js');
++    const { resetSeqChord } = await import('../../dist/esm/seq/router-pads.js');
++    const { selectTrack } = await import('../../dist/esm/track/focus.js');
++    const { onMidiMessageExternal } = await import('../../dist/esm/midi/external.js');
++    const mi = await import('../../dist/esm/track/midi-in.js');
++    const { serializeUiState, applyUiState } = await import('../../dist/esm/seq/ui-state.js');
++    const menu = await import('../../dist/esm/seq/track-menu.js');
++
++    const engine = installMockEngine();
++    const reset = () => { resetSeqEngine(); resetSeqState(); resetStepRec(); resetSeqChord(); engine.reset(); mi.resetMidiIn(); };
++    const ext = (...b) => { onMidiMessageExternal(b); seqEngineTick(); };
++    const lastOp = () => lastMusicalOp(engine.ops);
++
++    /* Nothing claimed: the route is exactly what it always was. */
++    reset(); selectTrack(0); seqEngineTick(); seqEngineTick();
++    eq('no claim: the route is the active track alone', engine.params.extmap, '0');
++
++    /* KeyStep Pro: ch 2 -> track 2, ch 4 -> track 4. */
++    mi.setTrackMidiIn(1, 2);
++    mi.setTrackMidiIn(3, 4);
++    seqEngineTick();
++    eq('claims ride after the active track', engine.params.extmap, '0;2:1;4:3');
++    eq('channel 2 is track 2', mi.trackForChannel(2), 1);
++    eq('an unclaimed channel follows the selection', mi.trackForChannel(5), -1);
++
++    mi.setTrackMidiIn(5, 2);
++    eq('two claims on one channel: the lower track wins', mi.trackForChannel(2), 1);
++    mi.setTrackMidiIn(5, 0);
++
++    /* Recording lands on the claimed track, whatever is selected. */
++    ext(0x91, 60, 90);
++    eq('ch 2 records on track 2', lastOp(), 'non 1 60 90');
++    ext(0x93, 60, 80);
++    eq('the same key on ch 4 is a second note, on track 4', lastOp(), 'non 3 60 80');
++    ext(0x81, 60, 0);
++    eq('its off closes the ch 2 note', lastOp(), 'nof 1 60');
++    ext(0x83, 60, 0);
++    eq('and the ch 4 one', lastOp(), 'nof 3 60');
++    ext(0x90, 62, 70);
++    eq('an unclaimed channel records on the active track', lastOp(), 'non 0 62 70');
++    ext(0x80, 62, 0);
++
++    /* The Set carries it; an old Set is all SEL. */
++    const blob = serializeUiState();
++    mi.resetMidiIn();
++    applyUiState(blob);
++    eq('MIDI IN round-trips through the UI blob', mi.trackMidiIn(3), 4);
++    applyUiState(JSON.stringify({ oct: [4, 4] }));
++    eq('a Set from before MIDI IN is all SEL', mi.trackMidiIn(3), 0);
++
++    /* Steps clamp at SEL and 16. */
++    mi.stepTrackMidiIn(6, -1);
++    eq('below SEL stays SEL', mi.trackMidiIn(6), 0);
++    for (let i = 0; i < 20; i++) mi.stepTrackMidiIn(6, 1);
++    eq('above 16 stays 16', mi.trackMidiIn(6), 16);
++    eq('labels', mi.midiInLabel(0) + '|' + mi.midiInLabel(16), 'SEL|CH 16');
++
++    /* The track menu: jog to MIDI IN, knob 1 turns it, click does not freeze. */
++    mi.resetMidiIn();
++    menu.openTrackMenu(2);
++    eq('the menu opens on FREEZE', menu.buildTrackMenuVM().selected, 0);
++    menu.trackMenuKnob(1);
++    eq('knob 1 on FREEZE changes nothing', mi.trackMidiIn(2), 0);
++    menu.trackMenuJog(1);
++    menu.trackMenuKnob(1); menu.trackMenuKnob(1); menu.trackMenuKnob(1);
++    const vm = menu.buildTrackMenuVM();
++    eq('the MIDI IN row shows the channel', vm.rows[1].name + ' ' + vm.rows[1].value, 'MIDI IN CH 3');
++    eq('and is the selected row', vm.selected, 1);
++    const sig = menu.trackMenuSig();
++    menu.trackMenuKnob(1);
++    eq('a turn changes what the menu draws', menu.trackMenuSig() !== sig, true);
++    menu.closeTrackMenu();
++
++    uninstallMockEngine();
++    reset();
++}
+diff --git a/browser-test/screenshot.mjs b/browser-test/screenshot.mjs
+index ea444347..2dde0bf1 100644
+--- a/browser-test/screenshot.mjs
++++ b/browser-test/screenshot.mjs
+@@ -46,7 +46,7 @@ const PRESETS = [
+     'ai_preview_orig', 'ai_preview_opt1', 'ai_preview_opt3', 'ai_preview_var8', 'ai_preview_scrolled', 'ai_hold_progress_50', 'ai_hold_variation_50', 'ai_hold_double_50', 'ai_hold_newclip_50',
+     'cpu-movy-tracks', 'cpu-unsplit-module', 'cpu-overscale',
+     'cpu-empty', 'cpu-sends', 'cpu-sends-quiet', 'cpu-master', 'cpu-frozen', 'leave_modal',
+-    'power_modal', 'track_menu', 'track_menu_unfreeze', 'frozen_view', 'frozen_view_cut', 'freezing_view', 'freeze_big_toast', 'capture_select', 'capture_fixed', 'undo_toast', 'redo_toast',
++    'power_modal', 'track_menu', 'track_menu_unfreeze', 'track_menu_midi_in', 'frozen_view', 'frozen_view_cut', 'freezing_view', 'freeze_big_toast', 'capture_select', 'capture_fixed', 'undo_toast', 'redo_toast',
+     'undo_empty', 'undo_unavailable', 'clip-undo-toast', 'track_volume_unity',
+     'track_volume_quiet', 'track_volume_min', 'track_volume_max', 'master_volume',
+     'font_5x3_all', 'font_small_all', 'font_big_all_1', 'font_big_all_2', 'page_body',
+@@ -106,7 +106,7 @@ const BASE = {
+     'flags-top': 'test8', 'flags-scrolled': 'test8', gen_preview_knob: 'test8',
+     ai_preview_orig: 'test8', ai_preview_opt1: 'test8', ai_preview_opt3: 'test8', ai_preview_var8: 'test8', ai_preview_scrolled: 'test8', ai_hold_progress_50: 'test8', ai_hold_variation_50: 'test8', ai_hold_double_50: 'test8', ai_hold_newclip_50: 'test8',
+                                                                             lfo_chain: 'test8',         lfo_assign_toast: 'test8',
+-    leave_modal: 'test8', power_modal: 'test8', track_menu: 'test8', track_menu_unfreeze: 'test8', frozen_view: 'test8', frozen_view_cut: 'test8', freezing_view: 'test8', freeze_big_toast: 'test8',
++    leave_modal: 'test8', power_modal: 'test8', track_menu: 'test8', track_menu_unfreeze: 'test8', track_menu_midi_in: 'test8', frozen_view: 'test8', frozen_view_cut: 'test8', freezing_view: 'test8', freeze_big_toast: 'test8',
+     master_volume: 'test8',
+     track_volume_unity: 'test8', track_volume_quiet: 'test8',
+     track_volume_min: 'test8', track_volume_max: 'test8',
+@@ -721,10 +721,15 @@ function applyView(preset) {
+         }
+         /* Shift + track button: the track menu, drawn like Settings. */
+         case 'track_menu':
+-        case 'track_menu_unfreeze': {
++        case 'track_menu_unfreeze':
++        case 'track_menu_midi_in': {
+             const un = preset === 'track_menu_unfreeze';
+-            const vm = { rows: [{ name: (un ? 'UNFREEZE' : 'FREEZE') + ' T3', value: un ? 'CONFIRM?' : '>', selected: true }],
+-                         selected: 0, hint: un ? 'Click again: play stops, the synth comes back.' : 'Records every clip. Saves CPU.' };
++            const mi = preset === 'track_menu_midi_in';
++            const vm = { rows: [{ name: (un ? 'UNFREEZE' : 'FREEZE') + ' T3', value: un ? 'CONFIRM?' : '>', selected: !mi },
++                                { name: 'MIDI IN', value: mi ? 'CH 2' : 'SEL', selected: mi }],
++                         selected: mi ? 1 : 0,
++                         hint: mi ? 'Knob 1: USB channel. SEL: selected track.'
++                             : un ? 'Click again: play stops, the synth comes back.' : 'Records every clip. Saves CPU.' };
+             lastRender = () => renderFlagsView(vm, 'T3');
+             lastRender();
+             break;
+diff --git a/browser-test/screenshots/baseline/track_menu.png b/browser-test/screenshots/baseline/track_menu.png
+index aa33519c459af588cd2f0c11ac958ff811fd4e41..10924ad72d34a19f5dda8ffa72a3ca38a07663af 100644
+GIT binary patch
+literal 1141
+zcmbVMZAcSg9A6O@fm~YMAYxWzg`D~!LLqNfI!uO{cGC;d^7>Gev__O`jf@bs^~m;Z
+zAW>3b=**Xc7=kY=wqr$58BDDt+eR3RbPEoJ*318Yr|9QCY|q>8`M>;rzvo;hPgG=X
+z-mzJu(PUO0FRz91HvEok%7Fj(lWlDp&4!Z7@}rz}-H#Vl7js`_w@*~RYIIZfZ@+Rr
+zyvy+Cu<P@7Wkq~}0&9QA)z8A%)sjhK_BrzDNRTG+OEx0EDT<UadY?|P*x5pT4a<nd
+z<4;I+Xb(VAhsKsRt|C*s`T61SxiP^~GKEn_c#djdyoqQ5U>g~Aqg5R4)A^MXcj+lM
+z6q}c-82w$TmJJCmsX`nkQXShOF6|e4bb=TX`XF<99Pr|F(+o!$8GoYL1rSD@_BnFt
+z26+fEUOwG{`>8ph1_Ir%Y$YC;%}BAw{EUebmk!W@J+x8YLgH_gQ0aCI$z!WVc}Nm^
+zp(X}ff#U{dxw8C8Y-ioVPS3Se6*G_JxD1RSVpPZvg|VX3z<7CJL*#`NTX-4M$8KU}
+zk)S8^$X5L40VK*XQKj+N6Pwc@C(Y0oTm)7Hi<a=|ml9AI=mq3J;-Sq6t#MT8&zLp@
+zHM##n+gRgDn?+yl$HfA7#YnO4N6h++#3%k|(Igf>_?~H<vp&_%s_X$r%golUVO9cW
+z=LJhW3yn-Goed}jGN?@rYu`rtv85|olGqI;COi3-NHCjp+jux_K@i+kggPTb_qYoj
+zuQ<U7j!>bnnT;VL!Sg;xmx;A=aH~hB-%1kEdeq$KSa7L%nqf?Ks+Q`qg3R4enaELr
+zJkT*&?Q@`ti^$!ry(`LkmC%9RYY;T)+KzRq_=Vx&ULAPc=a{Ww!AK~>B1c7nb!bY1
+zJY<4-qns?l(E|r%;KGMCPzG$!qr*9v8dhnyHV16g1Ac6Yl!4p&ZRlc-YK1Fk3h){d
+zKE59nRgmB+6V(9FMD(B%S8=y}pYmk<>L$J%hzCidt)q$^EhQh}*$7!AmlmB8P4ek*
+z+b3d1QB>~SgI^^|vC!b0L~&GjN{-!ARYL1|;jsXr>BZG>sSDch<Hnty>lj;E{HEGp
+W7m>cv(|_S}qNy~TC?7a>_Rc><TQAfA
+
+literal 1014
+zcmb`GZ%7ky7{@1(hQmPwUVjeKED0R5RJM+ZrA$n4CJ`vat!6|~bGq|rk^`lGt42B#
+zL>bzPV9<+93Bt}~*?HcHkkmj%*~EEoMyR(UykNPW-`$el^sX28JAQwj=l6U+&-eGB
+zp}r<3dw;e@qsgf~Z8;17Zum~^%7pRbVpo?&vtz2(QhBZ;V{O{(JTkr8@?n1VeEnYg
+z?AG(Lu<)zlX!p*t`}^LXDVZ5<j|RUEua4V1e%43|_JE;hBi_P9f984Pu~MQA<2S#@
+zv{X~jx7x|b@95*Cup*Dxl6UY|@t8cK21mQyJ^W28#<x$&dEUu*mF_b=F042iKl_Ew
+zR~Fo1ZWuz)jw^Wp^16$iLEl2qSFH<kC8WnlE?KbvN_r)zh3$EIe9q3C*os1Yyt&g=
+z;JwU5#IZU!GZ1g?XG=&2D$1&xrxRwh&W8d9@ffLB(`pGw_r!|1sX;?Uz_2v~^`LZ*
+z@StyvYaLXMQW11LDivhs5{@v}D2{=OP#;UXHjU&4-uol-O?&wwm$-`YPf5J@hO7M3
+zf0|4I(bp=tgk6>9{-X#A8ZsCOeV8lsw!mJSiCh92YKNGKeip$QLK=jXmxx9hGCKbv
+zji?V0Azg3?Vo|!}Gt2}xXbC+v0qc+yT_cYDHKK$?luS}`9e~Y8$tZb`5|k9umniFM
+zb3+}jQc|yC?7GG@iBc)>&L!Y1w7+qiF7V9vrtZa?``86&LldGLx{m(JOfngqqBMky
+zl1Y@zB6400j8?@Ng1!GXzAj3k!&yY~Ar5jJl%FjGQ=r=CDs^s{(g~BzbI1$!LcXbl
+zz``srkq-hv5~$2oVIEYlLXAkhgNi5wi(sCHjr0N=BjEvC-o@9E!4T9?V%rC%Fb9tS
+zS_30E#z^9+Wt#^wf`9=ifZzNU!;o_Ha4@mWbD_8bR7OOpKw+bYygjLtt#8fzrGGdo
+Zm9aP(dEAiYUxxRrsjaTJj8<K|^&8GM{m}pb
+
+diff --git a/browser-test/screenshots/baseline/track_menu_midi_in.png b/browser-test/screenshots/baseline/track_menu_midi_in.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..6c620b7346da550e59658cffb84e2a0a1fc4dec1
+GIT binary patch
+literal 1269
+zcma)6Z)h8J7*0W~tn3ELJeZeAQ&_={b0!#*bt_xxtkugDQ8quEwQ3EPY)y~Q)pjh?
+zD6z(2YOw8*VEv%^pxCu@*m{lK!Vyd@TGl{Ujc8I%C1CKrm_@42=e^6sFM=QPyWgMp
+z&-1>|^Je_9W8FJ<?Ac+lSa$Y2)b%*N=kPmx+pSpFH$owc<(70$*O4bi8Y-D11J=Ur
+zT~|NeVp{iHee?H)i}Ly8TeimFdyBcZ{pIcOM;oK^?D11mzZK7OpO!nBLU3sNfzO3&
+zZG+l=@nBrV@%q8qIc~DNRUJG~yAr%l%$2Hxqk5CHnTi%Jm;05cKNB~a^e-zHnNw5M
+z;#a|;y^->>an&IvSNaq;g}}v@!1(f6^QAJDYVsrxxhGVoXJ7s`?oJO9$w&{c3%Nce
+zrrIMXu~ya)Af{G}&nqXiIWHR}lL^%&?xWmCfptDtYNOr4uSnAz`7txjy=x|QdXipN
+z8rd89p*hk|u_&j1*YaTo2`5c_e(6Li>Sb1g^DCtm0#~>$u#$VMfhu}VSro5j?((3B
+z3Dw@{$@RqvuC%EIwx5z>VW9RSJ|0THAT6S&eSo=NJo6xv&sKbZQL~yAzZ7tYMp>r;
+zY4K01RC}Euw2wH%Ki)@QPYY~5I|f&Q_3b(vHhO)-36})FOpMH@!N<btsDUd}Sx29T
+z151~}g%7OX@s;B6i;WA9v@eR^{;#Jmf<sHQZ1J5!zcnrMXsEFy_*C?yGL5xY<~tms
+zKc960PCn}})(f-^&I>HSc(HYnfnjC7(^K#L|8k&<kQ#19vrSc*EZ7Y$z6lPwpdu$8
+z!IsQxft$xkC~y@-euA%0s@-8&7=~xp!*Szsn(uHz0AQ9#JdVEBwXr;)jJQn6lHUBd
+z*W1z5x>zpTBQwJRJ6>e2qovU!uro5h{4gU;^DdC9)b0V30z-j)k~<#e{(6;zw_l2>
+z-KpqIwP<qO4RT4H2#yS3Jy()Bk|3!Fgc({UL52F1O>ItK6C@32F=6T(O+&;-O^tyt
+zThcIzIsr&>C-|@HKG0=8OOd_I8ZD$G%8D^CBGTN<{*+0eCu^F%n_RU3>h5F`H=9~N
+zQBPr9|9lT!mEN$WCsYiNf%gnem)=e_ga*tEy)@(>+LAdUXAU!_>8+YBqE!aGyW!j%
+zX&cpFpb`ntKLZs**p<>DLfcPapM;O5+fZDBb5V&n26o?j1#&*{ABw%vuypC=@u`;V
+S&-gpD^c+3bHQV{jD}Mv}U~}#O
+
+literal 0
+HcmV?d00001
+
+diff --git a/browser-test/screenshots/baseline/track_menu_unfreeze.png b/browser-test/screenshots/baseline/track_menu_unfreeze.png
+index f13f67a3a3305e1d2aa626a20f7eb257ff2a59d2..76967533547d82c39e0fa2294b8d1f2865d06423 100644
+GIT binary patch
+literal 1456
+zcma)+e`p(J7{{a7RW`b89o%5BgKoy5y;z}tG}PYwvBs{XKex1A2p#r7;-t(~rHg4;
+z#0pJ3m<+Xo9YZ@h*L1Z#BWWdZGvtoJ1}#ofhm|%7%)vo0vt$PBTEEYm=zoHL+`T{V
+zd7tO={k|9K>S(FjzHht9WU6XC+I$S{dw5=Wd>h`kmjeNlsp3p)^NUXJBe{h5hQ+n(
+zgC9F}cgMbyzirMun+!gDec_88`jLS6Q<WHQyk}XioxkPFU-sRRyTt)@;bB{ydg9&V
+zqLy_Pb}1`M>*+nIWHmbP<U^7+;ll>=;jVvoe%H6WBY!jZ4X-Zr{XEi;IwFi2HQYZ<
+z(j|mPt(>E9np2F7z@^wkM7q#pcC(ehC8J-_kBNdRg-0a;--SmblGChS;iGIArD#b`
+z$tCt;!v#I-Vh1>ci+Wbz+=V$kdk~vtRg<TA`F_I`FAw&Lnv7OO7@MNEunvWH;!uir
+zYorc^*rxe0X@F{*@kz4UV|HM%Kcx2}nc_L>ZBh0S>aiC}pj>GE4)3Q-t=tlzv7{Ce
+zze&+&gD6JJZc(Y6@)3^la*9XwK1jD?zlGa+84U`<;v|S8MK|gJ0uMzCjI$gO6Dic8
+z(X#bGvUo!N{;k;6z3ER^UfUlJ=|CU}YS1o3>Bwru%FRE2h*N{;O4<R=A*`;apCAoZ
+zk0a0({#rHQKe$K9^osr)iB<?}WX^!v;9qYe9StPa;?2azm<;o$0=<PU5S-@2qq9xL
+z3Q}fet%kA2BxCl+qj4lOvNE~<*JpC+p_7&Kj^`Hoeo5qR?>zO{(COH>|95Fv%MSI`
+z{QwI#+Cp{#GD6^Jsfwr+M^!e3ru73HKuH5?@u(p0M#aBlHyomRJ85j8>Ny4Lpt6Vw
+z$^T>t2+T(tB>#<(20~E_VTM7rNwF8^KqP2q-s}&RTTJJ#!Vldd4kvRMnR<Lj@;c!V
+z(lC`Izk*)3=x<>t>r=^DZ+={#@FBg`J&;zC@1KWT+=cu_Qrp8!$@r5s&)P}!l0~mS
+z4HLl!YlHdm9y96#{HAF-(8wGlpZw`Gr;@MGFostRcYVUg@}cm;wM*qeCdS7pVA;mF
+z3+TF8cC~QAChCaM6po{$@Uf$iKVR~{ky-l?w)fwy@ZKGARYJ?M7IKKWixIToG?XT3
+zG6ad@Cd#B2Ndfc`Qp|&ntE7foIQx0!n*@k(;XZ=QIRNwk+gKSS{RC)yxMWgnE<<JD
+zJJ-|g$Q~pad8%Yd%aUhtD`fV|Kv`o(MkIe)xwYM>@KB>|3a*v>mwm-HaNO9LN=A$?
+z>8fKk{uNje1BO%DXg05s%Qrt^LXqXC=&H>4f`EY}2oPJEgD&jgjmJt>{ST{enI_wZ
+Ww^@r%wc$@}YPEMXfBn*{@Ba<33btba
+
+literal 1337
+zcmbtUT}V@57@kDh4|dAvT$C;f%!`h7Q5Vv(UsuXNYt1}M%sLP&5H$+1lV~(T*P+X-
+z$XZ!KF0D?+H2NXgIaiTZFtaA<b~zCzv0AWP&--m!H(hnHec$=s_j}LtKF{+W*MZXg
+znM+nLF&GS)CB;QntQYXxwJ06`A4ghR42Fe<lA_(V#<ZzHQ?2kRtLVeKJzU<Et!HKr
+zUq7xj#p(^lJMT|6Kf0e$+;e0yf5g=PR*u}2N2P;>HR`~x(mM6)&jW>8$R1s;1g5`D
+zEcN@cusIvKBx;>961W|IGM`tCtceUwJvFKWRiB)kf3MIUUdPWZKD*#)&F3xAdR_?!
+z1>VmN`oxZMu98I(`}{s$>5@fBwQ;KGX%%gpLw#UmSm?0^rKm)}S%-uIMeh>@sxEF<
+zbi3dUA6Ik-k~PVt9|q>}`*NF3z`L+oaUk$+7j2~OWX)036u8$b0H=rETFzOh3f&e|
+z1atYy=o2lJN4vxcAQ__FFbe<(;89#UA6bBy7bwisn?o&lXq09IzGXd{U9KdaQlhY9
+zC0=6}ZtJ1XP7e9)Vtf@fhh8he6R=xBIoizUtGiJx9st3k62Jk_IF@yEE}j0)Pu>cg
+zc$GFiwrO&r;Z#Py#WYa$WpL`_vf676^)H?|16?^|o2LFJbY2TJRMowK7q%6+%z~ss
+zf59ti=m*QoEJf_l*YhfYgPu5Q+Q6%AI<HiuPL3vT&F3I!7Z7`l5-Nz+B}!PKxEmwz
+zhp$ZUlpAxg=>t=iB(o%Zd&&S_tc-QPZ)57X+6As5awl{<2(^$5p3I;-9E4uD0J3H^
+zXN!n(!&>MnoC4<#!#5DNf>^J1F>^o^W|7!RB0p)BcsE(fS{T;`clN+M4o@qk;e|HN
+zP2#+?VmIDx^t8G?_!Hx<@Ld_QV_T!f<{#WNOKo#@>Sf!ciKhW1X2SK$h~jlMXpId@
+za7)s8eqZ$}rB{v(v58{Zf_JiZmI7bG^nb~rNs1XVbj<OZPjd88hGUL;y3>3!V=dTf
+z$^+GmyO=A*Ffq-D$1oD}udR&J6t!3&dN|mBj<tgr8${}-LYgUK6AB0*jE!SB$k^r;
+zcbhpHS(DRYqfY@!Hg(AljI)cO^E_LONa{EoG$E<^9uQ&<6PxkiMHUS%@K!>iUh;?~
+s8o7Z<z}%J75CK^{J?Yec3_)VSkHYNiP{pB(_#_%i%%w$-_8hzT8>W$ar~m)}
+
+diff --git a/build/browser.mjs b/build/browser.mjs
+index c7f07775..c90640d0 100644
+--- a/build/browser.mjs
++++ b/build/browser.mjs
+@@ -299,6 +299,9 @@ await esbuild.build({
+         resolve(root, 'src/seq/freeze-wave.ts'),
+         resolve(root, 'src/seq/frozen-view-vm.ts'),
+         resolve(root, 'src/seq/track-menu.ts'),
++        /* A track's MIDI IN (channel per track): an entry point so the logic
++         * suite (midi-in.mjs) can claim channels and read them back. */
++        resolve(root, 'src/track/midi-in.ts'),
+         resolve(root, 'src/seq/freeze-screen.ts'),
+         resolve(root, 'src/seq/frozen-playhead.ts'),
+         resolve(root, 'src/renderer/playhead-column.ts'),
+diff --git a/engine/crates/movy-dsp/src/ext_route.rs b/engine/crates/movy-dsp/src/ext_route.rs
+index 17018a4f..1abea49e 100644
+--- a/engine/crates/movy-dsp/src/ext_route.rs
++++ b/engine/crates/movy-dsp/src/ext_route.rs
+@@ -1,44 +1,38 @@
+-//! Routing an external USB-A keyboard (cable 2) to the active track's chain on
+-//! the audio thread.
++//! Routing an external USB-A keyboard (cable 2) to a track's chain on the
++//! audio thread.
+ //!
+ //! Same reason as `pad_route`: a UI round trip would add a tick (5-16 ms) to
+-//! every note. The UI owns which chain is active and, on a drum track, which
+-//! note each pad plays; it pushes that as `extmap` and the DSP only looks up.
++//! every note. The UI owns which chain each message plays and, on a drum track,
++//! which note each pad plays; it pushes that as `extmap` and the DSP only looks
++//! up.
+ //!
+-//! Every channel is accepted and collapsed onto channel 1, because the user
+-//! picks the destination by selecting a track on Move, not on the controller.
+-//! Note-offs come from the ledger (see `pad_route.rs` for why).
++//! By default every channel is accepted and collapsed onto the ACTIVE track,
++//! because the user picks the destination by selecting a track on Move, not on
++//! the controller. A track may instead claim a MIDI channel (its MIDI IN in
++//! the track menu): that channel then plays that track whatever is selected, so
++//! a sequencer sending several channels (a KeyStep Pro's four tracks) plays
++//! several tracks at once. Unclaimed channels still follow the selection.
++//!
++//! `extmap` is `<dest>[;<ch>:<dest>]*`: the active track's destination, then
++//! one per claimed channel (1-16). A `<dest>` is `"<chain>"`, played as it
++//! comes, or `"<chain>,<p0>,<p1>,…"`, a drum rack with note `36 + i` playing
++//! `p_i`. Note-offs come from the ledger (see `pad_route.rs` for why), kept per
++//! channel so the same key on two channels is two notes.
+ 
+ const DRUM_BASE: usize = 36;
++const CHANNELS: usize = 16;
+ 
+-#[derive(Debug)]
+-pub struct ExtRoute {
++#[derive(Debug, Clone, Copy)]
++struct Dest {
+     chain: i32,
+     /// Incoming note -> pitch the chain plays, -1 for a dead key.
+     map: [i16; 128],
+-    held: [Option<(usize, u8)>; 128],
+-    /// Whether a wheel left its rest position on `chain`, so a chain change
+-    /// only resets what was actually moved.
+-    bent: bool,
+-    modded: bool,
+ }
+ 
+-impl Default for ExtRoute {
+-    fn default() -> Self {
+-        Self::new()
+-    }
+-}
++impl Dest {
++    const NONE: Dest = Dest { chain: -1, map: [-1; 128] };
+ 
+-impl ExtRoute {
+-    pub fn new() -> Self {
+-        Self { chain: -1, map: [-1; 128], held: [None; 128], bent: false, modded: false }
+-    }
+-
+-    /// `"<chain>"` plays notes as they come; `"<chain>,<p0>,<p1>,…"` is a drum
+-    /// rack, note `36 + i` playing `p_i`. Returns the chain being left when the
+-    /// chain changes with a wheel off rest, so the caller can reset it there.
+-    /// Malformed input changes nothing.
+-    pub fn set_map(&mut self, val: &str) -> Result<Option<usize>, ()> {
++    fn parse(val: &str) -> Result<Dest, ()> {
+         let mut it = val.split(',');
+         let chain: i32 = it.next().and_then(|s| s.trim().parse().ok()).ok_or(())?;
+         let mut map = [-1i16; 128];
+@@ -55,47 +49,107 @@ impl ExtRoute {
+                 *m = i as i16;
+             }
+         }
+-        self.map = map;
+-        let left = if chain != self.chain && self.chain >= 0 && (self.bent || self.modded) {
+-            Some(self.chain as usize)
+-        } else {
+-            None
+-        };
+-        if chain != self.chain {
+-            self.bent = false;
+-            self.modded = false;
++        Ok(Dest { chain, map })
++    }
++
++    fn chain(&self) -> Option<usize> {
++        usize::try_from(self.chain).ok()
++    }
++}
++
++#[derive(Debug)]
++pub struct ExtRoute {
++    active: Dest,
++    claimed: [Option<Dest>; CHANNELS],
++    held: [[Option<(usize, u8)>; 128]; CHANNELS],
++    /// Chains a wheel left off rest (bit per chain), so a route change only
++    /// resets what was actually moved, and only where it can no longer be
++    /// released.
++    bent: u128,
++    modded: u128,
++}
++
++impl Default for ExtRoute {
++    fn default() -> Self {
++        Self::new()
++    }
++}
++
++fn bit(chain: usize) -> u128 {
++    if chain < 128 { 1u128 << chain } else { 0 }
++}
++
++impl ExtRoute {
++    pub fn new() -> Self {
++        Self {
++            active: Dest::NONE,
++            claimed: [None; CHANNELS],
++            held: [[None; 128]; CHANNELS],
++            bent: 0,
++            modded: 0,
+         }
+-        self.chain = chain;
+-        Ok(left)
++    }
++
++    fn dest(&self, ch: usize) -> &Dest {
++        self.claimed[ch].as_ref().unwrap_or(&self.active)
++    }
++
++    /// Install a new `extmap`. Returns the chains left with a wheel off rest —
++    /// no channel reaches them any more, so the caller resets them there.
++    /// Malformed input changes nothing.
++    pub fn set_map(&mut self, val: &str) -> Result<Vec<usize>, ()> {
++        let mut segs = val.split(';');
++        let active = Dest::parse(segs.next().ok_or(())?)?;
++        let mut claimed = [None; CHANNELS];
++        for seg in segs {
++            let (ch, dest) = seg.split_once(':').ok_or(())?;
++            let ch: usize = ch.trim().parse().map_err(|_| ())?;
++            if !(1..=CHANNELS).contains(&ch) {
++                return Err(());
++            }
++            claimed[ch - 1] = Some(Dest::parse(dest)?);
++        }
++        self.active = active;
++        self.claimed = claimed;
++        let mut reach = self.active.chain().map_or(0, bit);
++        for d in self.claimed.iter().flatten() {
++            reach |= d.chain().map_or(0, bit);
++        }
++        let stray = (self.bent | self.modded) & !reach;
++        self.bent &= reach;
++        self.modded &= reach;
++        Ok((0..128).filter(|c| stray & bit(*c) != 0).collect())
+     }
+ 
+     /// One cable-2 message: `emit(chain, msg)` for each message to play.
+     pub fn route(&mut self, status: u8, d1: u8, d2: u8, mut emit: impl FnMut(usize, [u8; 3])) {
++        let ch = (status & 0x0F) as usize;
+         let note = (d1 & 0x7F) as usize;
+-        let chain = usize::try_from(self.chain).ok();
++        let dest = *self.dest(ch);
++        let chain = dest.chain();
+         match status & 0xF0 {
+             0x90 if d2 > 0 => {
+-                let (Some(chain), Ok(pitch)) = (chain, u8::try_from(self.map[note])) else { return };
++                let (Some(chain), Ok(pitch)) = (chain, u8::try_from(dest.map[note])) else { return };
+                 /* A retrigger before the off: close the first note, or it would
+                  * be orphaned when its ledger slot is overwritten. */
+-                if let Some((c, p)) = self.held[note].replace((chain, pitch)) {
++                if let Some((c, p)) = self.held[ch][note].replace((chain, pitch)) {
+                     emit(c, [0x80, p, 0]);
+                 }
+                 emit(chain, [0x90, pitch, d2]);
+             }
+             0x80 | 0x90 => {
+-                if let Some((c, p)) = self.held[note].take() {
++                if let Some((c, p)) = self.held[ch][note].take() {
+                     emit(c, [0x80, p, 0]);
+                 }
+             }
+             0xB0 if d1 == 1 => {
+                 let Some(chain) = chain else { return };
+-                self.modded = d2 != 0;
++                if d2 != 0 { self.modded |= bit(chain) } else { self.modded &= !bit(chain) }
+                 emit(chain, [0xB0, 1, d2]);
+             }
+             0xE0 => {
+                 let Some(chain) = chain else { return };
+-                self.bent = !(d1 == 0 && d2 == 0x40);
++                if d1 == 0 && d2 == 0x40 { self.bent &= !bit(chain) } else { self.bent |= bit(chain) }
+                 emit(chain, [0xE0, d1, d2]);
+             }
+             _ => {}
+@@ -158,14 +212,14 @@ mod tests {
+     fn wheels_reset_on_the_chain_being_left() {
+         let mut r = ExtRoute::new();
+         r.set_map("1").unwrap();
+-        assert_eq!(r.set_map("2").unwrap(), None, "nothing moved");
++        assert!(r.set_map("2").unwrap().is_empty(), "nothing moved");
+         assert_eq!(play(&mut r, 0xE0, 0, 0x60), [(2, [0xE0, 0, 0x60])]);
+-        assert_eq!(r.set_map("2").unwrap(), None, "same chain");
+-        assert_eq!(r.set_map("5").unwrap(), Some(2));
+-        assert_eq!(r.set_map("1").unwrap(), None, "reset is per chain");
++        assert!(r.set_map("2").unwrap().is_empty(), "same chain");
++        assert_eq!(r.set_map("5").unwrap(), vec![2]);
++        assert!(r.set_map("1").unwrap().is_empty(), "reset is per chain");
+         play(&mut r, 0xB0, 1, 64);
+         play(&mut r, 0xB0, 1, 0);
+-        assert_eq!(r.set_map("2").unwrap(), None, "wheel back at rest");
++        assert!(r.set_map("2").unwrap().is_empty(), "wheel back at rest");
+         assert!(play(&mut r, 0xB0, 7, 64).is_empty(), "other CCs ignored");
+     }
+ 
+@@ -177,4 +231,62 @@ mod tests {
+         assert!(r.set_map("2,a").is_err());
+         assert_eq!(play(&mut r, 0x90, 60, 1), [(1, [0x90, 60, 1])]);
+     }
++
++    #[test]
++    fn a_claimed_channel_plays_its_track_whatever_is_selected() {
++        let mut r = ExtRoute::new();
++        r.set_map("1;2:5;4:7").unwrap();
++        assert_eq!(play(&mut r, 0x91, 60, 100), [(5, [0x90, 60, 100])], "ch 2 -> chain 5");
++        assert_eq!(play(&mut r, 0x93, 64, 90), [(7, [0x90, 64, 90])], "ch 4 -> chain 7");
++        assert_eq!(play(&mut r, 0x90, 67, 80), [(1, [0x90, 67, 80])], "unclaimed ch 1 -> active");
++        assert_eq!(play(&mut r, 0x9F, 67, 80), [(1, [0x90, 67, 80])], "unclaimed ch 16 -> active");
++    }
++
++    #[test]
++    fn the_same_key_on_two_channels_is_two_notes() {
++        let mut r = ExtRoute::new();
++        r.set_map("1;2:5;4:7").unwrap();
++        play(&mut r, 0x91, 60, 100);
++        play(&mut r, 0x93, 60, 100);
++        assert_eq!(play(&mut r, 0x81, 60, 0), [(5, [0x80, 60, 0])]);
++        assert_eq!(play(&mut r, 0x83, 60, 0), [(7, [0x80, 60, 0])]);
++    }
++
++    #[test]
++    fn a_claimed_drum_track_maps_its_pads() {
++        let mut r = ExtRoute::new();
++        r.set_map("3;10:2,36,38,42").unwrap();
++        assert_eq!(play(&mut r, 0x99, 37, 90), [(2, [0x90, 38, 90])]);
++        assert_eq!(play(&mut r, 0x90, 37, 90), [(3, [0x90, 37, 90])], "the active track stays melodic");
++    }
++
++    #[test]
++    fn a_released_claim_falls_back_to_the_active_track() {
++        let mut r = ExtRoute::new();
++        r.set_map("1;2:5").unwrap();
++        play(&mut r, 0x91, 60, 100);
++        r.set_map("1").unwrap();
++        assert_eq!(play(&mut r, 0x81, 60, 0), [(5, [0x80, 60, 0])], "the held note closes where it started");
++        assert_eq!(play(&mut r, 0x91, 62, 100), [(1, [0x90, 62, 100])]);
++    }
++
++    #[test]
++    fn wheels_reset_only_where_no_channel_reaches() {
++        let mut r = ExtRoute::new();
++        r.set_map("1;2:5").unwrap();
++        play(&mut r, 0xE1, 0, 0x60);
++        assert!(r.set_map("2;2:5").unwrap().is_empty(), "chain 5 still claimed");
++        assert_eq!(r.set_map("2").unwrap(), vec![5]);
++    }
++
++    #[test]
++    fn malformed_channel_segments_change_nothing() {
++        let mut r = ExtRoute::new();
++        r.set_map("1;2:5").unwrap();
++        assert!(r.set_map("1;0:5").is_err(), "channel 0");
++        assert!(r.set_map("1;17:5").is_err(), "channel 17");
++        assert!(r.set_map("1;2").is_err(), "no destination");
++        assert!(r.set_map("1;2:x").is_err());
++        assert_eq!(play(&mut r, 0x91, 60, 1), [(5, [0x90, 60, 1])]);
++    }
+ }
+diff --git a/engine/crates/movy-dsp/src/lib.rs b/engine/crates/movy-dsp/src/lib.rs
+index a3a7fa46..06cb21d2 100644
+--- a/engine/crates/movy-dsp/src/lib.rs
++++ b/engine/crates/movy-dsp/src/lib.rs
+@@ -390,15 +390,17 @@ impl Instance {
+                 }
+             }
+             /* The external keyboard's route (ext_route.rs), pushed by comparison
+-             * beside `padmap`. Leaving a chain with a wheel off rest recentres it
+-             * there: the release that would have done so now reaches another track. */
++             * beside `padmap`. A chain left with a wheel off rest, and that no
++             * channel reaches any more, is recentred there: the release that
++             * would have done so now reaches another track. */
+             "extmap" => match self.ext.set_map(val) {
+                 Err(()) => host::log("extmap: refused a malformed map"),
+-                Ok(Some(left)) => {
+-                    self.chains.on_midi(left, &[0xE0, 0, 0x40], MOVE_MIDI_SOURCE_INTERNAL);
+-                    self.chains.on_midi(left, &[0xB0, 1, 0], MOVE_MIDI_SOURCE_INTERNAL);
++                Ok(left) => {
++                    for c in left {
++                        self.chains.on_midi(c, &[0xE0, 0, 0x40], MOVE_MIDI_SOURCE_INTERNAL);
++                        self.chains.on_midi(c, &[0xB0, 1, 0], MOVE_MIDI_SOURCE_INTERNAL);
++                    }
+                 }
+-                Ok(None) => {}
+             },
+             /* `clickdb <0..11>` — metronome boost over the default level. The
+              * UI pushes it on every engine boot, since a re-dlopened engine
+diff --git a/site/assets/screens/track_menu.png b/site/assets/screens/track_menu.png
+index c021cf95d6267675138e79511c81e71d0719ea58..15bd7f5565dcdffc90b0973ed7ce6f6840d31789 100644
+GIT binary patch
+literal 2431
+zcmeHJUuc_E6hEo7YIW?PbmI09kj+e@gp!9^JDRE4)>uf&m=qLJq0r(6i*~wMnt%E-
+z_Ask$gDbXMovlT228=QW%~C}zi!sAZTZ&^HZt0w6wj^uKH@nu~`R@I`=8GWs;*$@T
+z^Y!-JbI<*q^ZT6~X?E{gSGlp0h}O9pox6$3@M)rZDqy~TE8RhK?@pKV$vv-`Zhle!
+z=9aqtEfamtM-P|n_`UUH<LiH(+i-YdIDX~MLyl*sQ^CP_u!6RZmebZTxvpDRhkFKU
+z)7~?SHTiF5tTYk*v5fjJ%9X#GU9{V7)f}kr&eSimDW`(>G1^|Itybl`+sC>(mnvyt
+z-{(Y`&*buFYH`M8wx5o*P<Y-DG}8L9dZ&qkr#8^=ptj5%(Gw<m=0y`FwWYj$t%Jh5
+zpQCW6w$7%#CfchxuvL<dU)tuXI--}5%GGSd5=i-f&PJX$+fO{+otc_US;YH}#9A7@
+zpG<Ai9IL6fp?!Zx)PK@|h;1mI8%le-E=;CwA{hQZhJ!CJB{v09<1q8DEG19%4E!`>
+z^}y?W^^2;9;+?;>%^if71`XTRt`B<#5Mmtn_QhH*BhPa)R^P3f{IzVPRz;4(Zma9g
+z_>d@EsIaPs>eG;68y&~Jhn~<Lq_{b8_43&p*+?iBYdNkKsysZR?)tP+u=Qtb2lT9U
+zl=wA$4eghK5-Q~zjOQ$}4K@c-m(pIvc^@^q<x2O&rq2_N7KdGK%-L!CBZe0%cWd}^
+z1yKI|YAgl{K%hj*S2NbrD)3ydPEPAV3dRLG0MK&#*ckyqy|JT4wOC3-J2;R4oCrpR
+zJEF!zi2rWMG3_oy{c`mpSGAgg33YedjkdX?Dsp*?@zm3S)Iw-_&H4DCT43N5iW$nX
+z{4H=B!4nFy&gieAa=Q!=Zg$*7{TGTDrZMe*yQVt-28;Zwke=qIe+D@p3B9D!mw8qt
+z=ytTB9VJEKO6ZAhV3tBnB)iaEOc1aWYTyxCC=N@)Lkn0EKx0sbbrd?Y*7FXKQxY9i
+zlU;;MgoolZ+og)E_8Qu1{0CJI;Kn^F#7#11trc;UFBFden<Q^MzqZZIVsl=PvFsAm
+ztA$1h#smeMq)^I0On;I6o~fcH%}3r5dWhEMY!VPJi0rakFdIS{1ps*7%EQ7zQc4IB
+z04&TxQ}Nd<)R1*kC{PG;2hHO2#inB0SFHWXCaFSZdqm*w!&Nv0Q2b*J?JVY~iLNrt
+zx<h#S!KKQChk2^w4c0QsLec-`F92C-(k2Ysv$^*)*<gv{;;QiGc0$v1=|C^ZnhQj@
+zzt9_uEjN)Ef1EAG5jTMt7C65$qQ)rF36HMq?Bx(Z!BY+%T*LdTpB6WX*;P8vwYjd@
+z>sFp-oU=ZB5K}Zz1$|U9MMax4gi=+*=Zn?epII+vI!*ks*H9?))a3oN&}~#uv(A;^
+usE(Knd?oQg@yy-TTRQlQGy5;T6?0&{t!i|m=K=h%BG(SL^OL7uc;heS@qhUM
+
+literal 2222
+zcmeHJT}abW6hBj}Fw%#J)UZ8d2<>SV1ueA?qbzb|A0sIjDX!=t%v!}p8$pRsX2obw
+zoA!l$(DtD8MQjFUxYUXDGN~q+6Jc2>wEi%(bMF0byIT)E1U>aI?)~3;&iS3s-(BO5
+z^3C%y^D+ToUfGt?3V<}+DqzkmTwXW#8vy2<EGu2V`?TWgD|OR>r%y6E?_FA)m44x-
+zrK?#ncIW!y;SuG??WJ#jxE?Aa;T8o{J^=W-8?44<uuh|w=2pARpPi02wXV3%p9SAd
+zd*rJH(CQ!!snf2~M#9mp)vmQ4+tVRhNjI4=P@VyY$5fVfweHggI<HDOHyJ-&d_H-C
+zj2;z@x}&uWGarT{4+URJCITht&{3g)p_q$j3#43VwaH*@Y0xos673CaLumTig|d=Q
+zpHn}onFyT8s~?>o3BSyZf60f5MQUPU_P?{MTAmqZTWfl4Z6>4Vj%<ox&7&JBSZ-(B
+z=~&Ib%x{V`Er^2vQ3uE3m*zvv2CR8u7(2qY#XE%vJd?Lrex@4#yl7X2d^b!+_~}gm
+zB;{0z7&?yg?HS){y7!-vPlI9fmKSN=@{sQxI(%P9uU=|+9&?cj)5z=d+cJGuZiOCJ
+zck^a3*LD8s)PgMO@dG@LHI(3QtU$41QosGbj`!_9O^X}b%338<p#O3~>ackx7fuAE
+zF1zX&E;uMS)v>Ov?X}??P^-&}mfv|soQ`ie6*vl<Kxnd%EX;5C!WGtDA{wA8?;xKd
+zE>GI1=H#dr`L3@>a}1lho+;pz%2Va3j)Tu!6$!zXjpjql618=HBusenk~mM@Au17u
+z7Josc0X@zx#zv}zAKRx^hJ4-t%LECXO3a)f7DpM}Cyt1(0WGfx`3m`B>0$9m8WhJQ
+z+)(SzBIS^$+T-jKX_rnpS5lIqGh8#s=|rB@>FxX!Magvpu%y6pCO|?M=d?Cm7Ehyh
+z(5?!q87F8NLr{Q)-TNgQQ)=+~?W&oYYS&B75Xd65>tjVsRFC*ihv~oyp_S-$apv7-
+zUU`znRBJIlgdh$=r9>e4adad)icFT(V9tpl@q~9u5VJxKVmo3#v9j<4;vw}0-Ce^x
+zpgTzKBxb=FWl=1?Ov}X>baI}qd@+D^uP_PpjEPjm9sofd9d*VN2?N^&aeR7se<r#o
+z4b0jk38j&h7p(e6Nv}-yqWTQ@ne^Jaqvzw(;N|J0$Bd^NIxR`ie~d${jxaCuWd1$%
+bM6(~fAIj;oY}$qYL!fL^d8uo|!E?U=A{F^}
+
+diff --git a/site/assets/screens/track_menu_midi_in.png b/site/assets/screens/track_menu_midi_in.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..54d171dfbcb3bd7b537ee8b9d34ad3433103ae8c
+GIT binary patch
+literal 2672
+zcmeHJU1*zC7(SUlvxQl(6+vla%q2v&)Y?LzO;>a+O-z?a=1{@7x#`AWRK<)Y#cWgS
+zWP)w8UZiQsijsB&N8OD#p=;M+H)O1860A2<M~gFa(pnS9Vt;(z_k3U4FV1<Rcix<Q
+zIp;g)eb4hg&+~pKo^`ftD1Eq82(iI#YjO**4v#u<-@W*m?3p?sM5)Ez^we`c-LDhX
+zT`yf8X`a~n$?@&)8Lq$nO?2Yc&jVHOlttfY+vV8$X7gg-$RM_V+9$;MI)e~ryGn#O
+z^LwJo7d_Qyj#%BU))1DapVWzChg*f%Q&}#=3)e4smr{4>V@Yqi*Xll<en5!a7FxJ;
+zw-Db})4MO{uUOrd<Ypn}KQHX#Wq;Z-V7}^$I(hNMLePE4<CoFQ<Q-yGAjD)L1RWcB
+z^yCpBab_=V)?R|oD@;u}#-H$Xe9&^E*3)re)8QKRS<V#3%H)udZj>n3o5ZnNPn|#d
+z{VSTYryOPe=(aEE2rRZ)-Gj41I`;(aiT!|ue!|V7j~Ry@#_kGnXf{~4Bjm*YVjMnB
+zCqCkhcNps#D<M_}DRqiie9Fe|l+h0~huVFVSGFsiz-ZUU#=|W)_Q$;oHl2v_Tqo6b
+z6_%<%4VQ2>7!R8puH9zL_YON;zNiohZ<=nY-QW1w(rpSd?ZsO+we<k_KN1M1=4}xI
+zC3TR}YN+<af1`=HHPbWno)BO875<?VKnF!rATFj$j{?gWQoKmm2aI&75;4Dx!eqcT
+zTn%Ub1vj9t7ArSM&-aMjvekX`B%zim#_HU`c;`x+L~{(UBPphS!Wb@+&Tgbp<5?$e
+zGC`oCzyaohMVtEHC~teh1^MjK7MT_G|CH)2{~Z#3;@)|4QKfn^J7F~s78~6AOdzf@
+z)Yq$s?P_ZXreI+o+08s((ymGoKvqQA5=9Hx1&0`5Ua@B71Pqqd2}6Mp>Uo5?BdU~C
+z<y4H76=m1KTRZkDLL=i~<$<?+{<(eejC6_!hjuO4WXN{@JNGJWEM!%%mHWF><A-P|
+z0GZT>$?0-)+IslYtgI|vh5m55^hhax(gHHOxGDPukCw1G02ri{<o)W09WYNauUhg4
+z=@Ls$z3FZ4O>6wCL3LI*A24oIO?g?`U8MNV6dVx4rZFnP6tj=*;F_U`NR1IOEw*cE
+zFq$za#R_cZhnXP3I}^+!+!ZPmK&HmfPu&e@qr^}@p5-KL=)&|GqXi%+Ip78%a7m>r
+zp*JnquDzv&^w!4oY4GxKZ9;|Kwu;MW=4*vh8HOK)qC(>t2{P9*ovNF1Bh1=Y8y+<*
+z*|w1R8qVr+7Huee9;lolNF`%r4FDj*pdU%L6&Q=COgm}+5-q;}XWZ1p;(+$X{`5m!
+znL=lDF{;b^lS7YmrwlxnCx_;ki@NV7v>yc_y~<s@-2PKAAM!`%8<}~PTzvFwhTkMs
+z3`N4pL)KsjumB3OigHA;z+Bw!`F^EaqO{8fo}CTmpHY{wnYE_`IJ#aN;D{}6!gtn(
+n+FtsPmDN^YRRsU$#+CIY@#B~Cul<q5m!z;aJDWzH-t+FCd`&1a
+
+literal 0
+HcmV?d00001
+
+diff --git a/site/assets/screens/track_menu_unfreeze.png b/site/assets/screens/track_menu_unfreeze.png
+index 595eb1759d57f29e4c1a96d2212559d6b6307466..c572f31a67d59ee553ebb375e15e64c996e9a0dd 100644
+GIT binary patch
+literal 2960
+zcmeHJZA@Eb6n>dw3fnLNjfn>Q!5G<=fqY~{25TlPrR$)ExXq~8WzH_k7Wh-#Amc+_
+zVlde{)+p^J5EEKMoMMd0lEzqO1`AmP(>6MPAS@EetuY`UiYV0QocG=f_qzB`fBEP3
+z_PzH#?{m(1&hy-kXKSomQy)(iLTt5FRn`iz0k=uwp-uQ1x;%PPh|NcBmHVGNm-O?^
+zf_GoqUw`1H^}QF;w)pOblQTB`TH!xfaj?g7c>GLS{jC9IdAAUsyqzM%^;Zz*C!Y|5
+zrTHtbTjL!{WF&j>mK%@G@6Hh7`P&<X_@*F9v^Ta^f7?(#*;!iMwQnT5@oFB{#tP}d
+zAt8=s(!0}vh95gaetI(SsvdVcjvBR3oC&#qpv^eyq@T{C^-Ba{KJwUnRe3=jb~x|o
+z$5GU7XLRvJ{61<zV!I#y0VQ3CyF<nRU8{qHb^KgkO*G)O#*6Dhzf^Sx?YW-VUcP2T
+z15ar8az($+%o3{7roJ9uUXpW&%AyQsHx{WOO0xQ+Ze^;o`8HjVSxr`dZqP25Q#`R#
+zA@>{wX#Ua+sgNEnTv8&r)m`;vwI3*vuiT0^XrJ-rmEY@ZJ|0?-2oa$O+qu|@9lR-x
+z<8mS8PN1E@d+S!Xe~JXK)?L|!w(l76Th_QMv~b}cuimD<`k;OA2$wB0tN$9{@{;2a
+zWhzq#HbQ7hu+^ush?0_(?k%os#;L`1%Y8~DtZ||JBdrHB#Z>5hD2pu`aF}Uj@#S@w
+z)s{p93D;T|QCjrUbX~qyRttdb4nOT6sJy`y`iwJ2msYpSLYgQAa)Y*qbuKgSf6q~F
+zfT}xns&YL)UwDv%@~nVdI0!Aw;1Z$u=qt~MMC`SuirK}W-N6hztMSllJg7-|U)|M`
+z<B5R{Q=Q8;s?8%}@(*T~W3FoDgc-+WswnDK6V3TEpVHbWmRh+t!zx=BOU$!|0xga4
+z7BTqSeAPI26C>bonI<-YE?xxsc8g!5rOudPW5=CWS~p{mj~gQJY#Ryq|B^xY{=MRi
+zo(2`fYpmNk)26%nCeWb|S?zTy%||Mtfn27rPF_uQGz!Nt$IvyX8)ytwz&+%^!1DO6
+z>aLzyl}-*;T)c?kXBljXxTPXV(ScmSCRD8hsrK?-DSAwP%<1>{FakPu9>*r-VGbES
+zLDJe1V3mPhK-XQgvR>CYjFe^wD!qP1eM|0xZeeg%gB(Mu>YR#Rrp6HEXrnGrL#ZSU
+zn8Q0JSSbyxHqhaPceLW1WjH9;7f2n`Si%`em%uCoDvC&Q3`fz#J5e39LnxtYe;f4+
+zH#Ftg#Uc!ELI~LnCpSV4GRp*a$H7*N1QO|<m{e|bLzNa5Q#3tMXq3U1mmgqt)CZky
+zgqo%q+R8T4ms3Ta7`i|Y!Xw<;qgqZ-a<VKg?;dWlxsCT%RU<1^q5WE=jow^llS~y3
+zq=8a%ze<z>vEcTSdoXwQe6k*Cc$v&~_yXJ$S1@)R>o&~xnkFV7oyUS4Vf5_8sHjD{
+zDEmH+)2Bpw9FD-D;E4`%ia_a90!5(f?PE`wzMU+L1+0J=bDBto{3@uVuePa%i~sl-
+zq5ODYFIs8rWGbzn5|xuDPa6w~@z#t<A^<S~Y&Kk0+Y6J~rcpw>0r~J)nk1^8w6w*{
+zkT=QecAS4wBMN`}00R|Cr;CI&!OWyN*GdPYB#;S{+2q^8$wC}4R)6i&(>QPc>08rn
+ZqHxdCh3SL#4t!|~+ku+OkDodA#$VVB-Kziq
+
+delta 1175
+zcmZ8gT}V@582+4!Y(-s&S%kZpdWc|aC<?=6MB!x4fj0%>4>|1T!re?XVVtN4Bx=q>
+z%^%i?bTNpi+fgfI7?BQ{ql>`A9Lek=T^otz*89HS&QTid@Nv%jz0dPL&-0E|eyJGK
+zsWeYt*IX@rW+*L^mP&gH|1)K8f>y?QE4}$@(O|Cc8ky4#PU-zk9X}`V*|<C_G<7^r
+z#Xsr>>$*%gXU<*^yVkuUSHhXQEt~y#4o_m?fs#nvl~Q{Wi>_4CyE~JLKcK?2#UHc^
+zo`hiYJ=wyueRyUdXl>Mnrc?29ZAb`;_$snYmjNYhS!wgNYeVp&N*fA9OBnlXEMm6?
+z+kmg%m+QrnJu5Z6M3e*d$Pk(W3^jP$x8G)nnhBhPT*dFfkW$O0Q{;0KIp{$A`EZ;h
+zNI(_MlP#Nsl&ke5-YxvcYwIzJm4yL&NGj;yCO#<GX`64LsYB!=!4m|kCa&w=U7tuF
+z0Si9N>$0nkaHe&6_M|6a?^iMQV}h~wrdq~c#jL~k3k)LTsBPv5_TYwO9+4MZeCTce
+zjt1>HNM_(=*tWRolA>=Qiq?Yf*RqB>S>LL1#x8HnHXm>b%u$Tv2N=u#&1<sx8h()x
+zP?4K%Lwnsd@>J~<AX4~-L`Daq(pX7@7_%OglOWs0147iHse+*d2~q-Ck>g}GqTA4a
+zh=K&*UyV3MHcIlr6GFJ3qf;z@0*Cs*{SqNa-Me?lD~U&=5aO(4!`Sh>0G^zDjszHh
+ziq6YCp_W%sIMDR8rD*5y0W5+lE+`V-rbQ4v2^a^Qc24Qn@*Aik&-y4$IFDIdfpvgg
+zf-Jx=!ZfZKi`-K)_M%S-gu$FFY~U*86SKDHQs+PEvaQ;XU0x#P0C581&a}$nmlo8=
+zJ16w!HSgSSA_Wq14uA-nC~g->@GZwxmDimnW;rLO@}a`(?|7yYR<uIe(u_*y4rz|%
+Y%DVp~8+RPBDF(mRi|rR)p6|W=4;daoU;qFB
+
+diff --git a/site/manual/playing.md b/site/manual/playing.md
+index 4c3dc7f0..a1d3058c 100644
+--- a/site/manual/playing.md
++++ b/site/manual/playing.md
+@@ -84,9 +84,28 @@ them, without touching the pattern.
+ Plug a class-compliant USB MIDI keyboard or groovebox into the Move's **USB-A**
+ port. It plays the **selected track**, just like the pads.
+ 
+-- **Any MIDI channel** plays the selected track. Choose the destination on the Move.
++- **Any MIDI channel** plays the selected track. Choose the destination on the Move,
++  or give a track its own channel (below).
+ - **Velocity** comes from the keyboard. Full velocity only affects the pads.
+ - **Recording** works as with the pads: live, step recording, and hold-step + key.
+ - On a **drum track**, C1 (MIDI note 36) plays pad 1, C#1 pad 2, and so on.
+ - **Mod wheel** and **pitch bend** reach the synth live but are not recorded.
+ - Other CCs, aftertouch and MIDI clock are ignored.
++
++### A channel for each track
++
++A controller that sends several channels at once, such as a sequencer with one
++track per channel, can play several Movy tracks together.
++
++1. Hold **Shift** and press the track's button. Its menu comes up.
++2. Turn the **jog** to **MIDI IN**.
++3. Turn **knob 1** to the channel, **CH 1** to **CH 16**. **Back** closes the menu.
++
++![MIDI IN in the track menu](../assets/screens/track_menu_midi_in.png){ .small }
++
++- That channel now plays that track, whichever track is selected, and records
++  into it.
++- Channels no track has claimed still play the selected track.
++- **SEL**, the default, gives the channel back to the selected track.
++- If two tracks take the same channel, the lower-numbered one plays it.
++- Each Set remembers its tracks' channels.
+diff --git a/site/reference/controls.md b/site/reference/controls.md
+index 1079612b..b5086984 100644
+--- a/site/reference/controls.md
++++ b/site/reference/controls.md
+@@ -59,7 +59,7 @@ The shortcuts also work in Session view, except the Clip page and the generators
+ | **Shift** + **pad** (drums) | Select a voice without playing it. |
+ | **Mute** + **pad** (drums) | Mute that voice. **Shift** + **Mute** + pad: solo it. |
+ | **Track buttons** | Select a track in the focused group. Hold: look and come back. |
+-| **Shift** + track button | That track's menu: [Freeze](../manual/sounds.md#freezing-a-track) it, or unfreeze a frozen one. **Back** cancels a freeze while it records. |
++| **Shift** + track button | That track's menu: [Freeze](../manual/sounds.md#freezing-a-track) it, or unfreeze a frozen one, and its [MIDI IN](../manual/playing.md#a-channel-for-each-track) channel (jog to the row, knob 1 turns it). **Back** cancels a freeze while it records. |
+ 
+ ## Sequencer
+ 
+diff --git a/src/midi/external.ts b/src/midi/external.ts
+index 964d63e2..5a29a9fe 100644
+--- a/src/midi/external.ts
++++ b/src/midi/external.ts
+@@ -9,13 +9,18 @@ import { extDrumPitch } from '../track/ext-route.js';
+ import { seqNotePadPlayed, seqNotePadReleased } from '../seq/router-pads.js';
+ import { EXT_KEY_BASE, extHold, extRelease } from './external-ledger.js';
+ import { freezeBusy, freezeGuard } from '../seq/freeze.js';
++import { trackForChannel } from '../track/midi-in.js';
+ 
+ export function onMidiMessageExternal(data: number[]): void {
+     if (!data || data.length < 3) return;
+     const type = data[0] & 0xF0, note = data[1] & 0x7F, vel = data[2];
+-    const key = EXT_KEY_BASE + note;
++    /* Keyed by channel too: the same key on two channels is two notes, on
++     * two tracks once channels are claimed (track/midi-in.ts). */
++    const ch = (data[0] & 0x0F) + 1;
++    const key = EXT_KEY_BASE + (ch - 1) * 128 + note;
+     if (type === 0x90 && vel > 0) {
+-        const track = appState.activeTrack.index;
++        const claimed = trackForChannel(ch);
++        const track = claimed >= 0 ? claimed : appState.activeTrack.index;
+         /* Not into a frozen clip, and nothing while a freeze is recorded (the
+          * engine refuses both too: freeze_lock.rs, ext_route.rs). */
+         if (freezeBusy(Date.now())) return;
+diff --git a/src/seq/track-menu-input.ts b/src/seq/track-menu-input.ts
+index 0a4795c6..370f120b 100644
+--- a/src/seq/track-menu-input.ts
++++ b/src/seq/track-menu-input.ts
+@@ -1,10 +1,12 @@
+ /* The track menu's input (seq/track-menu.ts), first look in the router while
+- * it is open: Back closes, a jog click acts, every other press is swallowed
+- * (releases pass, so nothing held at the open sticks). */
++ * it is open: Back closes, the jog picks a row and its click acts, knob 1
++ * turns the MIDI IN row, every other press is swallowed (releases pass, so
++ * nothing held at the open sticks). */
+ 
+ import { appState, VIEW_CHAIN } from '../app/state.js';
+ import { selectTrack } from '../track/focus.js';
+-import { closeTrackMenu, trackMenuActive, trackMenuClick, trackMenuTrack } from './track-menu.js';
++import { closeTrackMenu, trackMenuActive, trackMenuClick, trackMenuJog, trackMenuKnob, trackMenuRow,
++         trackMenuTrack, ROW_FREEZE } from './track-menu.js';
+ 
+ /** `true` = consumed. */
+ export function trackMenuMidi(data: number[]): boolean {
+@@ -13,6 +15,7 @@ export function trackMenuMidi(data: number[]): boolean {
+     const press = (type === 0x90 || type === 0xB0) && d2 > 0;
+     if (type === 0xB0 && d1 === MoveBack && d2 > 0) { closeTrackMenu(); return true; }
+     if (type === 0xB0 && d1 === MoveMainButton && d2 > 0) {
++        if (trackMenuRow() !== ROW_FREEZE) return true;   // MIDI IN turns, it does not click
+         const t = trackMenuTrack();
+         trackMenuClick(appState.trackModels[t]?.[1]?.getModuleName() ?? '');
+         /* Freeze or unfreeze, the click lands on its track: a freeze shows its
+@@ -24,7 +27,8 @@ export function trackMenuMidi(data: number[]): boolean {
+         }
+         return true;
+     }
+-    if (type === 0xB0 && d1 === MoveMainKnob) return true;   // one row: nothing to move
++    if (type === 0xB0 && d1 === MoveMainKnob) { trackMenuJog(decodeDelta(d2)); return true; }
++    if (type === 0xB0 && d1 === MoveKnob1) { trackMenuKnob(decodeDelta(d2)); return true; }
+     /* Knob touches (notes 0-9) and turns are presses too. */
+     return press || type === 0xA0 || type === 0xE0;
+ }
+diff --git a/src/seq/track-menu.ts b/src/seq/track-menu.ts
+index 691c51c3..7df5f822 100644
+--- a/src/seq/track-menu.ts
++++ b/src/seq/track-menu.ts
+@@ -1,6 +1,7 @@
+ /* The track menu: Shift + a track button. A list drawn like Settings
+- * (flags-view.ts) with, for now, one row: FREEZE T3, or UNFREEZE T3 on a
+- * frozen track. Jog click acts, Back closes. It opens for the pressed track
++ * (flags-view.ts): FREEZE T3 (UNFREEZE T3 on a frozen track), acted on by a
++ * jog click, and MIDI IN, the USB-A channel that plays the track
++ * (track/midi-in.ts), turned by knob 1. The jog picks the row, Back closes. It opens for the pressed track
+  * WITHOUT switching to it (user, 2026-11-08): freeze T5 while working on T2.
+  *
+  * Unfreeze with the transport running stops it (the synth reload blocks the
+@@ -10,8 +11,13 @@
+ import { seqState } from './state.js';
+ import { isFrozen, freezeConfirm } from './freeze.js';
+ import type { FlagsPageVM } from './flags-page-vm.js';
++import { midiInLabel, stepTrackMidiIn, trackMidiIn } from '../track/midi-in.js';
+ 
+-const state = { track: -1, armed: false };
++export const ROW_FREEZE = 0;
++export const ROW_MIDI_IN = 1;
++const ROWS = 2;
++
++const state = { track: -1, armed: false, row: ROW_FREEZE };
+ 
+ export function trackMenuActive(): boolean {
+     return state.track >= 0;
+@@ -24,6 +30,23 @@ export function trackMenuTrack(): number {
+ export function openTrackMenu(track: number): void {
+     state.track = track;
+     state.armed = false;
++    state.row = ROW_FREEZE;
++}
++
++export function trackMenuRow(): number {
++    return state.row;
++}
++
++/** Jog: move between the rows. Leaving FREEZE drops an armed confirm. */
++export function trackMenuJog(dir: number): void {
++    const next = Math.max(0, Math.min(ROWS - 1, state.row + (dir > 0 ? 1 : -1)));
++    if (next !== state.row) state.armed = false;
++    state.row = next;
++}
++
++/** Knob 1 on the MIDI IN row steps the channel. */
++export function trackMenuKnob(dir: number): void {
++    if (state.track >= 0 && state.row === ROW_MIDI_IN && dir !== 0) stepTrackMidiIn(state.track, dir);
+ }
+ 
+ export function closeTrackMenu(): void {
+@@ -39,7 +62,7 @@ function stops(): boolean {
+  *  frozen screen names it afterwards). */
+ export function trackMenuClick(name: string): void {
+     const t = state.track;
+-    if (t < 0) return;
++    if (t < 0 || state.row !== ROW_FREEZE) return;
+     if (stops() && !state.armed) {
+         state.armed = true;
+         return;
+@@ -51,7 +74,7 @@ export function trackMenuClick(name: string): void {
+ /** Changes whenever the menu would draw differently (freeze-screen.ts). */
+ export function trackMenuSig(): string {
+     return state.track < 0 ? '' : state.track + (state.armed ? 'a' : '') + (isFrozen(state.track) ? 'f' : '')
+-        + (seqState.playing ? 'p' : '');
++        + (seqState.playing ? 'p' : '') + 'r' + state.row + 'm' + trackMidiIn(state.track);
+ }
+ 
+ export function buildTrackMenuVM(): FlagsPageVM {
+@@ -59,11 +82,14 @@ export function buildTrackMenuVM(): FlagsPageVM {
+     const frozen = isFrozen(state.track);
+     /* An arm the transport no longer needs (Stop pressed meanwhile) is gone. */
+     if (!stops()) state.armed = false;
++    const onMidi = state.row === ROW_MIDI_IN;
+     return {
+         rows: [{ name: (frozen ? 'UNFREEZE ' : 'FREEZE ') + label,
+-                 value: state.armed ? 'CONFIRM?' : '>', selected: true }],
+-        selected: 0,
+-        hint: state.armed ? 'Click again: play stops, the synth comes back.'
++                 value: state.armed ? 'CONFIRM?' : '>', selected: !onMidi },
++               { name: 'MIDI IN', value: midiInLabel(trackMidiIn(state.track)), selected: onMidi }],
++        selected: state.row,
++        hint: onMidi ? 'Knob 1: USB channel. SEL: selected track.'
++            : state.armed ? 'Click again: play stops, the synth comes back.'
+             : frozen ? 'Brings the synth back.' + (stops() ? ' Stops play.' : '')
+                      : 'Records every clip. Saves CPU.',
+     };
+diff --git a/src/seq/ui-state.ts b/src/seq/ui-state.ts
+index 4bafc287..5e3035d9 100644
+--- a/src/seq/ui-state.ts
++++ b/src/seq/ui-state.ts
+@@ -1,5 +1,5 @@
+-/* The per-set UI-only state: tonic, scale, mode, pad layout, per-track octave
+- * and track mutes. Kept apart from the engine's own serialization because the
++/* The per-set UI-only state: tonic, scale, mode, pad layout, per-track octave,
++ * track mutes and each track's MIDI IN. Kept apart from the engine's own serialization because the
+  * engine knows nothing about any of it — it is ferried in its own JSON file
+  * alongside the state blob. */
+ 
+@@ -11,6 +11,7 @@ import { mutesSnapshot, restoreMutes, resetTrackMutes } from '../mixer/track-mut
+ import { seqState } from './state.js';
+ import { seqCmd } from './engine.js';
+ import { readPrefDefaultQuant } from './prefs.js';
++import { midiInSnapshot, restoreMidiIn, resetMidiIn } from '../track/midi-in.js';
+ 
+ const clampInt = (v: unknown, lo: number, hi: number, dflt: number): number =>
+     typeof v === 'number' && isFinite(v) ? Math.max(lo, Math.min(hi, v | 0)) : dflt;
+@@ -28,6 +29,7 @@ export function serializeUiState(): string {
+         layout: keyboardState.layout,
+         oct:    keyboardState.octave.slice(),
+         mutes:  mutesSnapshot(),
++        midiIn: midiInSnapshot(),
+         defaultQuant: seqState.defaultQuant,
+     });
+ }
+@@ -52,6 +54,7 @@ export function applyUiState(blob: string): void {
+         keyboardState.mode   = clampInt(o.mode,   0, MODE_NAMES.length - 1, 0);
+         keyboardState.layout = clampInt(o.layout, 0, layoutNames(keyboardState.mode).length - 1, 0);
+         if (o.mutes) restoreMutes(o.mutes);
++        restoreMidiIn(o.midiIn);
+         /* Absent = a set written before this feature, or a brand new one. Both
+          * adopt the machine default rather than snapping to zero — that is the
+          * whole point of keeping it outside the set. */
+@@ -76,5 +79,6 @@ export function resetUiState(): void {
+     keyboardState.layout = 0;
+     resetOctaves();
+     resetTrackMutes();
++    resetMidiIn();
+     applyDefaultQuant(readPrefDefaultQuant());
+ }
+diff --git a/src/track/ext-route.ts b/src/track/ext-route.ts
+index 549120db..5ce1dc57 100644
+--- a/src/track/ext-route.ts
++++ b/src/track/ext-route.ts
+@@ -1,5 +1,7 @@
+ /* The engine's route for an external USB-A keyboard (engine ext_route.rs): which
+- * chain the keys play, and on a drum track which note each key's pad plays.
++ * chain the keys play, and on a drum track which note each key's pad plays —
++ * for the active track, and for each track that claims a MIDI channel
++ * (track/midi-in.ts).
+  *
+  * Pushed by comparison every tick, as pad-route.ts does and for its reason: the
+  * things that change it (track switch, module change, a rack redeclaring its
+@@ -10,7 +12,8 @@ import { appState } from '../app/state.js';
+ import { drumNoteOfPad } from '../keyboard/drum-grid.js';
+ import type { DrumConfig } from '../types/param.js';
+ import { drumConfigFor } from './pad-route.js';
+-import { chainInstance } from './ref.js';
++import { chainInstance, TRACK_COUNT } from './ref.js';
++import { trackForChannel, MIDI_IN_MAX } from './midi-in.js';
+ 
+ /* Note the first drum pad sits on: the GM / Move kick. One key per pad upward. */
+ export const EXT_DRUM_BASE = 36;
+@@ -23,8 +26,8 @@ export function extDrumPitch(note: number, cfg: DrumConfig): number {
+     return pad >= 1 && pad <= cfg.padCount ? drumNoteOfPad(pad, cfg) : -1;
+ }
+ 
+-function buildMap(): string {
+-    const t = appState.activeTrack.index;
++/* One destination: `<chain>` or `<chain>,<p0>,…` for a drum rack. */
++function destFor(t: number): string {
+     const drum = drumConfigFor(t);
+     const parts: number[] = [chainInstance(t)];
+     if (drum && drum.padCount < 1) return '-1';   // a rack with no pads: the bare chain would play it melodically
+@@ -32,6 +35,17 @@ function buildMap(): string {
+     return parts.join(',');
+ }
+ 
++/* `<active>[;<ch>:<dest>]*`. A Set where no track claims a channel pushes
++ * exactly what it always did. */
++function buildMap(): string {
++    const segs = [destFor(appState.activeTrack.index)];
++    for (let ch = 1; ch <= MIDI_IN_MAX; ch++) {
++        const t = trackForChannel(ch);
++        if (t >= 0 && t < TRACK_COUNT) segs.push(ch + ':' + destFor(t));
++    }
++    return segs.join(';');
++}
++
+ export function syncExtRoute(send: (key: string, value: string) => void): void {
+     const next = buildMap();
+     if (next === pushed) return;
+diff --git a/src/track/midi-in.ts b/src/track/midi-in.ts
+new file mode 100644
+index 00000000..a21d8a62
+--- /dev/null
++++ b/src/track/midi-in.ts
+@@ -0,0 +1,58 @@
++/* A track's MIDI IN: the USB-A channel that plays it whatever is selected
++ * (1-16), or SEL — follow the selection, the default and movy's behaviour
++ * before this existed. Lets a controller that sends several channels at once
++ * (a KeyStep Pro's four sequencer tracks) play several tracks.
++ *
++ * Per Set: carried in the UI blob beside the octaves (seq/ui-state.ts). The
++ * engine is told through `extmap` (track/ext-route.ts); the recording side
++ * asks `trackForChannel` (midi/external.ts). */
++
++import { TRACK_COUNT } from './ref.js';
++
++export const MIDI_IN_SEL = 0;
++export const MIDI_IN_MAX = 16;
++
++const midiIn: number[] = new Array(TRACK_COUNT).fill(MIDI_IN_SEL);
++
++const clamp = (v: unknown): number =>
++    typeof v === 'number' && isFinite(v) ? Math.max(MIDI_IN_SEL, Math.min(MIDI_IN_MAX, v | 0)) : MIDI_IN_SEL;
++
++export function trackMidiIn(track: number): number {
++    return midiIn[track] ?? MIDI_IN_SEL;
++}
++
++export function setTrackMidiIn(track: number, ch: number): void {
++    if (track >= 0 && track < TRACK_COUNT) midiIn[track] = clamp(ch);
++}
++
++/** One knob detent: SEL, 1, 2 … 16, stopping at the ends. */
++export function stepTrackMidiIn(track: number, dir: number): void {
++    setTrackMidiIn(track, trackMidiIn(track) + (dir > 0 ? 1 : -1));
++}
++
++export function midiInLabel(ch: number): string {
++    return ch === MIDI_IN_SEL ? 'SEL' : 'CH ' + ch;
++}
++
++/**
++ * The track channel `ch` (1-16) plays, or -1 when no track claims it (it then
++ * follows the selection). Two tracks on one channel: the lower one wins — one
++ * channel, one destination, so the engine and the recording always agree.
++ */
++export function trackForChannel(ch: number): number {
++    if (ch < 1 || ch > MIDI_IN_MAX) return -1;
++    return midiIn.indexOf(ch);
++}
++
++export function midiInSnapshot(): number[] {
++    return midiIn.slice();
++}
++
++/** Tolerant: an absent or malformed value (a Set from before this) is all SEL. */
++export function restoreMidiIn(v: unknown): void {
++    for (let t = 0; t < TRACK_COUNT; t++) midiIn[t] = Array.isArray(v) ? clamp(v[t]) : MIDI_IN_SEL;
++}
++
++export function resetMidiIn(): void {
++    midiIn.fill(MIDI_IN_SEL);
++}
+-- 
+2.54.0 (Apple Git-157)
+

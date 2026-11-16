@@ -51,3 +51,14 @@ El usuario tiene dudas sobre la implementación: empezar por escucharlas.
 - `twResetKnob`: al pulsar en el canal 2 los CC 8–15, escribe el valor guardado con `setParam` en la misma fuente que usa la página (virtual, propia de Movy o `componentPort`). El valor guardado no se borra tras el reset. Deja una línea `twReset` en el log.
 - Limitación: un preset cargado por el navegador (jog) no borra los valores guardados.
 - PROBADO Y FUNCIONA en el Move (2026-11-16), junto con los aros que siguen al parámetro. Copia local: `ui-device-con-sync.js`. La copia de seguridad de antes de ambos cambios sigue en el Move: `/data/UserData/schwung/backup-movy-ui-twister-antes-de-sync.js`.
+
+## 2026-11-16 (tarde): MIDI IN (un canal por pista). HECHO y probado en el Move
+- El usuario eligió "cada pista elige su canal". Rust + compilador cruzado instalados (`~/.cargo`, brew `aarch64-unknown-linux-gnu`, solo esa fórmula marcada como trusted).
+- Para el autor (sobre main): rama `midi-channel-per-track` (06e2d6b3 + 936c00a3), parches en `patches-midi-in/`.
+  - Motor `ext_route.rs`: el formato de `extmap` pasa a ser `<activa>[;<ch>:<dest>]*`; ledger por canal; 6 tests nuevos.
+  - Interfaz: `track/midi-in.ts`, guardado en `ui-state.json` (`midiIn`), fila MIDI IN en el menú de pista (Shift + botón de pista; jog para elegir la fila, knob 1 para cambiar), `markUiStateDirty` al girar.
+  - Manual: `site/manual/playing.md` ("A channel for each track") y `controls.md`. Escena de captura `track_menu_midi_in`.
+- En el Move (v0.37.0): rama `device-v037` = Twister + aros que siguen el parámetro (ya en el código fuente: `midi/ext-follow.ts`) + MIDI IN con un menú de pista mínimo (solo la fila MIDI IN, porque la v0.37 no tiene Freeze). Parches en `patches-device-v037/`.
+  - Desplegados `ui.js` y `dsp.so` (copias: `ui-device-v037-midi-in.js`, `dsp-device-v037-midi-in.so`). Copia de seguridad previa en el Move: `/data/UserData/schwung/backup-movy-<fecha-hora>/`.
+  - Probado por el usuario con el KeyStep Pro: T1=CH10 (batería), T2–T4 = CH2–4. Funciona y se guarda en el Set.
+- Pendiente: decidir la publicación upstream (¿issue/PR del Twister y de MIDI IN por separado?), sincronizar el reloj MIDI con el KeyStep, y que el usuario cargue un módulo de batería en T1.

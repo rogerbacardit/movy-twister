@@ -1,0 +1,114 @@
+From 00e84b45e307b651a89c054b00195d43832a7835 Mon Sep 17 00:00:00 2001
+From: rogerbacardit <rogerbacardit@gmail.com>
+Date: Mon, 16 Nov 2026 17:24:02 +0100
+Subject: [PATCH 2/4] Twister rings 9-16 follow the parameters knobs 1-8 edit
+
+Ported from the device-side ui.js edit of 2026-11-16 into source
+(midi/ext-follow.ts, called from knob-leds.ts). A factory Twister is
+absolute: a parameter changed elsewhere left its ring behind, and the
+encoder could hit its end while the parameter was mid-way.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/midi/ext-follow.ts    | 42 +++++++++++++++++++++++++++++++++++++++
+ src/midi/ext-knobs.ts     |  8 +++++++-
+ src/renderer/knob-leds.ts |  2 ++
+ 3 files changed, 51 insertions(+), 1 deletion(-)
+ create mode 100644 src/midi/ext-follow.ts
+
+diff --git a/src/midi/ext-follow.ts b/src/midi/ext-follow.ts
+new file mode 100644
+index 00000000..6cb4c36d
+--- /dev/null
++++ b/src/midi/ext-follow.ts
+@@ -0,0 +1,42 @@
++/* ext-follow.ts — a Twister's rings 9-16 follow the parameters knobs 1-8 edit.
++ *
++ * A factory Twister is absolute: its ring is where IT thinks the value is.
++ * Without this, a parameter changed elsewhere (a preset, the Move's own knob,
++ * another page) leaves the ring behind, and the encoder can hit its 0 or 127
++ * end while the parameter is still mid-way — it then sends nothing more and
++ * the parameter cannot reach its end. So each knob LED update also sets the
++ * ring (channel 1, CC 8-15) to the parameter, and moves the origin the absolute
++ * decoder counts from to match.
++ *
++ * Armed only once a controller has spoken (midi/ext-knobs.ts), so a Move with
++ * nothing on USB-A sends nothing. Diffed per encoder: a quiet page costs no
++ * MIDI at all.
++ */
++
++import { platform } from '../platform/index.js';
++import { TW_KNOB_BASE, EXT_KNOBS } from './ext-knob-map.js';
++
++let armed = false;
++let onSync: ((cc: number, v: number) => void) | null = null;
++const sent: number[] = new Array(EXT_KNOBS).fill(-1);
++
++/** Start following, and resend every ring on the next update (a reconnect). */
++export function armTwisterFollow(sync: (cc: number, v: number) => void): void {
++    armed = true;
++    onSync = sync;
++    sent.fill(-1);
++}
++
++/** Called with the knob LEDs' levels (0..1, null = nothing bound). */
++export function twisterFollow(levels: readonly (number | null)[]): void {
++    if (!armed) return;
++    for (let k = 0; k < EXT_KNOBS; k++) {
++        const lv = levels[k];
++        if (lv === null || lv === undefined || !isFinite(lv)) continue;
++        const v = Math.max(0, Math.min(127, Math.round(lv * 127)));
++        if (sent[k] === v) continue;
++        sent[k] = v;
++        onSync?.(TW_KNOB_BASE + k, v);
++        platform.externalSend([0x0B, 0xB0, TW_KNOB_BASE + k, v]);
++    }
++}
+diff --git a/src/midi/ext-knobs.ts b/src/midi/ext-knobs.ts
+index f898d2a4..3bc919c0 100644
+--- a/src/midi/ext-knobs.ts
++++ b/src/midi/ext-knobs.ts
+@@ -8,6 +8,7 @@ import { platform } from '../platform/index.js';
+ import { pageOwnerOf } from '../app/page-owner.js';
+ import { onMidiMessageInternal, knobModel } from './router.js';
+ import { createExtKnobState, extKnobActions, TW_ASSIGNED } from './ext-knob-map.js';
++import { armTwisterFollow } from './ext-follow.js';
+ 
+ const state = createExtKnobState();
+ 
+@@ -46,7 +47,12 @@ function presetTurn(delta: number): void {
+ 
+ export function onExternalControlChange(data: number[]): void {
+     const now = Date.now();
+-    if (now - lastCcMs > WAKE_GAP_MS) paintTwister();
++    if (now - lastCcMs > WAKE_GAP_MS) {
++        paintTwister();
++        /* The rings then follow the parameters, and the absolute decoder
++         * counts from where each ring was put (midi/ext-follow.ts). */
++        armTwisterFollow((cc, v) => state.abs.set('tw' + cc, v));
++    }
+     lastCcMs = now;
+     const ch = (data[0] & 0x0F) + 1;
+     for (const a of extKnobActions(state, ch, data[1] & 0x7F, data[2] & 0x7F)) {
+diff --git a/src/renderer/knob-leds.ts b/src/renderer/knob-leds.ts
+index f6a5c20a..746742f8 100644
+--- a/src/renderer/knob-leds.ts
++++ b/src/renderer/knob-leds.ts
+@@ -1,5 +1,6 @@
+ import { mlog } from '../log.js';
+ import { ledBudgetTake } from '../seq/led-cache.js';
++import { twisterFollow } from '../midi/ext-follow.js';
+ 
+ /* White intensity scale (knobs 1-4) — always lit so row is identifiable */
+ function whiteLevel(nv: number): number {
+@@ -88,6 +89,7 @@ export function updateKnobLEDsFrom(levels: readonly (number | null)[]): void {
+         scratchColor[physK] = knobColor(physK, scratchNv[physK]);
+     }
+     writeKnobRow(scratchColor, scratchNv);
++    twisterFollow(levels);   // an external Twister's rings, when one is connected
+ }
+ 
+ /** Light exactly one knob at `nv` (0..1) and darken the other seven.
+-- 
+2.54.0 (Apple Git-157)
+
