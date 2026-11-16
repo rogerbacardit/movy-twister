@@ -110,3 +110,8 @@ El usuario tiene dudas sobre la implementación: empezar por escucharlas.
 - Commit 2be657cb: el Twister se arma al cargar el Set (pinta los aros y sigue los parámetros sin tocarlo). Si se enchufa con Movy ya abierto, hace falta girar un encoder.
 - Estado final desplegado en el Move: ui.js md5 7e6a46a6 (device-v037 HEAD 2be657cb), dsp.so f6c3aa1d.
 - Backup: GitHub rogerbacardit/movy-twister, ramas `code-snapshot` (código) y `notes` (este archivo + parches).
+
+## 2026-11-16 (noche): Twister llega al 0 y al 100% (commit 53adadec en device-v037)
+- Causa: cada paso relativo movía range/200 (knob_engine de Schwung) → 128 pasos del Twister = 64% del rango. Además el aro solo se resincronizaba en un frame renderizado; con la página quieta se quedaba en el tope.
+- Arreglo: parámetros continuos con min/max se fijan por la POSICIÓN del aro (`continuousAt`, lineal como `normalizedOf`); `twisterFollowRest()` en cada tick resincroniza el aro al soltar (HOLD_MS 350).
+- Probado a mano por el usuario: funciona. Desplegado en el Move. Snapshot en GitHub: rama `code-snapshot` (02a3d3ae).
