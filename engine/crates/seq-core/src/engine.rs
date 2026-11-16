@@ -11,15 +11,7 @@ use crate::clock::Clock;
 use crate::track::{Track, CLIPS_PER_TRACK, LANES, NUM_TRACKS};
 use crate::{PPQN, STEPS_PER_BAR, TICKS_PER_BAR, TICKS_PER_STEP};
 
-mod ai_clip;
-pub use ai_clip::{parse_ai_notes, AiClipWrite};
 mod note_view;
-mod phase;
-mod freeze_lock;
-mod link;
-#[cfg(test)]
-mod link_tests;
-pub use freeze_lock::{clip_edit_verb as freeze_lock_verb, FreezeLock, LoopPos, RecWindow, TrackWindows};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum OutEvent {
@@ -64,8 +56,6 @@ struct Gate {
 
 pub struct Engine {
     pub clock: Clock,
-    /// Ableton Link: what the session last said and what we asked of it.
-    pub link: crate::link_follow::LinkFollow,
     pub tracks: Vec<Track>,
     pub playing: bool,
     /// Track whose active clip the UI is watching (step LEDs / status).
@@ -144,9 +134,6 @@ pub struct Engine {
     /// gesture the user made — the same list the screen reads out and
     /// persistence stores, with no second representation to keep in sync.
     pub song: Vec<u8>,
-    /// Freeze's lock (engine/freeze_lock.rs): per track, the clip slot a
-    /// loop was captured from. Set by movy-dsp; refuses the clip edits.
-    pub freeze_lock: FreezeLock,
     /// Raw index in `song` of the first press of the entry now playing.
     song_pos: usize,
     /// Master bar on which the current entry started. `None` until the song's
@@ -209,10 +196,6 @@ pub struct Engine {
     /// UI's stack is in-memory too, so persisting these would restore history
     /// for a stack that no longer exists.
     pub undo: crate::undo::UndoRing,
-    /// AI MIDI preview: full copies of a clip per option (0 = ORIG), keyed
-    /// (track, slot, option) because a generator session parked on one clip
-    /// outlives work on others. Never saved (engine/ai_clip.rs).
-    pub ai_stash: std::collections::HashMap<(usize, usize, usize), Clip>,
 }
 
 /// How far apart two tempos are, as a ratio >= 1 — direction-agnostic, so a
@@ -235,7 +218,6 @@ impl Engine {
     pub fn new(sample_rate: u32, bpm_x100: u32) -> Self {
         Engine {
             clock: Clock::new(sample_rate, bpm_x100),
-            link: Default::default(),
             tracks: (0..NUM_TRACKS).map(|_| Track::new()).collect(),
             playing: false,
             watch_track: 0,
@@ -248,7 +230,6 @@ impl Engine {
             clip_clipboard: None,
             recording: false,
             song: Vec::new(),
-            freeze_lock: FreezeLock::default(),
             song_pos: 0,
             song_start_bar: None,
             song_armed: false,
@@ -290,7 +271,6 @@ impl Engine {
             was_following: false,
             resume_anchor_pending: false,
             undo: crate::undo::UndoRing::new(),
-            ai_stash: std::collections::HashMap::new(),
         }
     }
 
@@ -453,19 +433,6 @@ impl Engine {
             self.tracks[track].clips[slot].clear();
             self.drop_rec_notes_for(track, slot);
             self.free_unused_lanes(track);
-            /* A deleted clip has nothing left to play, so it stops now rather
-             * than at the bar (Live does the same). Left pointing at the empty
-             * slot, the grid kept painting it as a playing/queued clip in the
-             * track's colour. service_tick flushes the gates of a track it no
-             * longer services, so nothing hangs. */
-            let t = &mut self.tracks[track];
-            if t.playing_slot == Some(slot) {
-                t.playing_slot = None;
-                t.pending_stop = false;
-            }
-            if t.queued_slot == Some(slot) {
-                t.queued_slot = None;
-            }
         }
     }
 
@@ -609,32 +576,6 @@ impl Engine {
         self.clock.reset();
         self.master_tick = 0;
         self.playing = true;
-    }
-
-    /// Freeze's silent pass (movy-dsp `freeze_bank.rs`): start the transport
-    /// with ONLY `track` playing its active clip, from the loop start. `false`
-    /// — and nothing changes — when the transport already runs or the track
-    /// has no clip to play. The caller mutes the output and stops it again.
-    pub fn play_alone(&mut self, track: usize) -> bool {
-        match self.tracks.get(track) {
-            Some(t) => self.play_alone_slot(track, t.active_clip),
-            None => false,
-        }
-    }
-
-    /// `play_alone` for any clip `slot` of the track (a freeze records every
-    /// clip, one after another); the selection is left alone.
-    pub fn play_alone_slot(&mut self, track: usize, slot: usize) -> bool {
-        if self.playing || !self.tracks.get(track).and_then(|t| t.clips.get(slot)).is_some_and(|c| c.exists()) {
-            return false;
-        }
-        for (i, t) in self.tracks.iter_mut().enumerate() {
-            t.playing_slot = if i == track { Some(slot) } else { None };
-            t.queued_slot = None;
-            t.pending_stop = false;
-        }
-        self.start_transport();
-        true
     }
 
     /// Play button / auto-start: every track plays its selected clip (native
@@ -1738,10 +1679,6 @@ impl Engine {
     }
 
     pub fn live_note_on(&mut self, track: usize, pitch: u8, vel: u8) {
-        // A frozen track records nothing, from any keyboard (freeze_lock.rs).
-        if self.freeze_lock.locked(track) {
-            return;
-        }
         self.capture_push(track, pitch, vel, true);
         if track >= NUM_TRACKS || track != self.rec_track {
             return;
@@ -1809,8 +1746,7 @@ impl Engine {
     /// Follow is automatic (design §7 Phase 3): engaged while we play and
     /// Move's transport runs.
     fn follow_active(&self) -> bool {
-        // Link wins over MIDI clock while it has peers (link_follow.rs).
-        self.playing && self.ext_running && !self.link.active()
+        self.playing && self.ext_running
     }
 
     /// External MIDI transport, delivered to movy-dsp on_midi.
@@ -1818,9 +1754,6 @@ impl Engine {
     /// runs (design §7 Phase 3). Engage/disengage edges are handled in
     /// advance_block; this only maintains the external-clock model.
     pub fn on_external_realtime(&mut self, status: u8, out: &mut Vec<OutEvent>) {
-        if self.link.active() {
-            return;
-        }
         match status {
             0xFA => {
                 self.ext_running = true;
@@ -1974,10 +1907,7 @@ impl Engine {
             });
         }
         if self.master_tick % crate::TICKS_PER_BAR as u64 == 0 {
-            /* A track lent to a freeze capture keeps its launches waiting
-             * (engine/freeze_lock.rs `freeze_swap_in`). */
-            let lock = &self.freeze_lock;
-            for (_, t) in self.tracks.iter_mut().enumerate().filter(|(i, _)| !lock.swapped(*i)) {
+            for t in &mut self.tracks {
                 if let Some(slot) = t.queued_slot.take() {
                     t.playing_slot = Some(slot);
                     t.active_clip = slot;
@@ -2199,24 +2129,11 @@ impl Engine {
                         if self.tracks[ti].auto_step != n.step as i32 {
                             self.emit_automation(ti, slot, n.step, out);
                         }
-                        /* LENGTHS ARE STORED AS ASKED; THIS IS WHERE THEY ARE
-                         * CUT (`Clip::max_gate_at` is the same rule, for the
-                         * UI). A note still sounding at its own pitch ends here,
-                         * or its later note-off would end the new one early; and
-                         * no gate rings past the loop end into the next pass.
-                         * Compared on the EMITTED pitch: that is the note the
-                         * synth holds. */
-                        if let Some(gi) = self.gates.iter()
-                            .position(|g| g.track == ti as u8 && g.pitch == emit_pitch)
-                        {
-                            self.gates.swap_remove(gi);
-                            out.push(OutEvent::NoteOff { track: ti as u8, pitch: emit_pitch });
-                        }
                         out.push(OutEvent::NoteOn { track: ti as u8, pitch: emit_pitch, vel: n.vel });
                         self.gates.push(Gate {
                             track: ti as u8,
                             pitch: emit_pitch,
-                            ticks_left: n.gate.min(clip_end.saturating_sub(pos)).max(1),
+                            ticks_left: n.gate.max(1),
                         });
                     }
                 }
@@ -2523,13 +2440,9 @@ impl Engine {
             .map(|t| (t.playing_slot, t.queued_slot, t.pending_stop))
             .collect();
 
-        /* A frozen track's clips are what its loop was recorded from: an undo
-         * of an edit made before the freeze must not change them under it. */
-        let kept = self.freeze_lock.keep_clips(&self.tracks);
         if !crate::persist::load(self, blob) {
             return false;
         }
-        self.freeze_lock.put_back(&mut self.tracks, kept);
 
         for (t, (playing, queued, pending)) in self.tracks.iter_mut().zip(transport) {
             t.playing_slot = playing;
@@ -2755,13 +2668,6 @@ mod tests {
 
     fn engine() -> Engine {
         Engine::new(RATE, 12000)
-    }
-
-    #[test]
-    fn play_alone_refuses_an_empty_track() {
-        let mut e = engine();
-        assert!(!e.play_alone(3));
-        assert!(!e.playing);
     }
 
     #[test]
@@ -3126,40 +3032,6 @@ mod tests {
         run_ext_ticks(&mut e, 24, &mut out);
         e.on_external_realtime(0xFC, &mut out);
         assert!(e.playing, "external Stop leaves movy playing");
-    }
-
-    /// Note on/off events of `pitch` on track 0, in order: true = on.
-    fn on_offs(ev: &[OutEvent], pitch: u8) -> Vec<bool> {
-        ev.iter().filter_map(|x| match *x {
-            OutEvent::NoteOn { track: 0, pitch: p, .. } if p == pitch => Some(true),
-            OutEvent::NoteOff { track: 0, pitch: p } if p == pitch => Some(false),
-            _ => None,
-        }).collect()
-    }
-
-    #[test]
-    fn a_long_note_is_cut_by_its_own_next_note() {
-        // Stored 8 steps, but the same pitch returns at step 2: the first must
-        // be closed there, or its note-off would end the second one early.
-        let mut e = engine();
-        let c = e.tracks[0].active_mut();
-        c.toggle_step(0, &[(60, 100)]);
-        c.toggle_step(2, &[(60, 100)]);
-        c.set_length(0, 0, None, 8 * TICKS_PER_STEP);
-        e.play();
-        let ev = run_ticks(&mut e, 2 * TICKS_PER_STEP as u64 + 4);
-        assert_eq!(on_offs(&ev, 60), [true, false, true]);
-    }
-
-    #[test]
-    fn a_long_note_is_cut_at_the_loop_end() {
-        let mut e = engine();
-        let c = e.tracks[0].active_mut();
-        c.toggle_step(15, &[(60, 100)]);
-        c.set_length(15, 15, None, 1000);
-        e.play();
-        let ev = run_ticks(&mut e, 16 * TICKS_PER_STEP as u64 + 4);
-        assert_eq!(on_offs(&ev, 60), [true, false], "rang into the next pass");
     }
 
     #[test]
@@ -4861,22 +4733,6 @@ mod tests {
         let t0 = sess.split(',').next().unwrap();
         // slots 0 and 1 exist → bitmap 0x03; playing 0; queued -; selected 0.
         assert_eq!(t0, "03.0.-.0");
-    }
-
-    #[test]
-    fn deleting_the_playing_clip_stops_its_track() {
-        let mut e = engine();
-        e.tracks[0].clips[0].toggle_step(0, &[(60, 100)]);
-        e.tracks[0].clips[1].toggle_step(0, &[(62, 100)]);
-        e.launch_clip(0, 0);          // stopped → plays at once, transport starts
-        e.launch_clip(0, 1);          // running → slot 1 queued
-        e.delete_clip_at(0, 0);
-        let t0 = |e: &Engine| e.status().split("sess=").nth(1).unwrap()
-            .split(',').next().unwrap().to_string();
-        // The emptied slot is neither playing nor painted as such.
-        assert_eq!(t0(&e), "02.-.1.1");
-        e.delete_clip_at(0, 1);
-        assert_eq!(t0(&e), "00.-.-.1", "a deleted clip cannot stay queued");
     }
 
     #[test]

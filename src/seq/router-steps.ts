@@ -4,18 +4,16 @@
  * what it dispatches to. The shifted functions the row can reach live next
  * door in step-shortcuts.ts — two of the branches below hand off to them. */
 
-import { resetHold, holdRelease } from '../ai/hold.js';
-import { aiHoldPress, aiVariationTap, holdOwns, holdStep } from '../ai/gestures.js';
 import { mlog } from '../log.js';
 import { appState } from '../app/state.js';
 import { beginEdit, endEdit, CLOSE } from '../undo/group.js';
 import { trackLabel } from '../undo/label.js';
-import { NUM_STEP_BUTTONS, STEP_DOUBLE_LOOP, STEP_QUANTIZE } from './constants.js';
+import { NUM_STEP_BUTTONS } from './constants.js';
 import { deleteActive, deleteStep } from './edit-ops.js';
 import { dupActive, onUnit as dupOnUnit } from './duplicate.js';
 import { seqCmd } from './engine.js';
-import { doubleLoop, loopStepOff, loopStepOn } from './loop-mode.js';
-import { cycleQuantize, shiftStepFunction } from './step-shortcuts.js';
+import { loopStepOff, loopStepOn } from './loop-mode.js';
+import { shiftStepFunction } from './step-shortcuts.js';
 import { muteHeld, muteMarkGestured, muteShiftHeld } from './router-buttons.js';
 import { toggleMute, toggleSolo } from '../mixer/track-mutes.js';
 import { TRACK_COUNT } from '../track/ref.js';
@@ -133,21 +131,6 @@ export function handleStepButton(button: number, on: boolean, shiftHeld: boolean
             : { kind: 'step', track: watchedTrack(), step: absB });
     } else if (on && deleteActive()) {
         deleteStep(button);
-    } else if (on && !shiftHeld && holdOwns(button)) {
-        /* A Shift + hold whose release was lost: this plain press starts fresh,
-         * or its release would be taken for the hold's and skip editStepUp. */
-        resetHold();
-        handleStepButton(button, on, shiftHeld);
-    } else if (holdStep(button) && (on ? shiftHeld : holdOwns(button))) {
-        /* Track view: generators start only from a hold (ai/hold.ts). A Shift
-         * tap on 16 still cycles quantize and one on 15 still doubles the
-         * loop, on RELEASE; one on 14 says to hold. */
-        if (on) aiHoldPress(holdStep(button)!);
-        else {
-            const r = holdRelease(Date.now());
-            if (button === STEP_QUANTIZE) mlog('quant: step16 release ' + r + ' shift ' + shiftHeld);
-            if (r === 'tap') (button === STEP_QUANTIZE ? cycleQuantize : button === STEP_DOUBLE_LOOP ? doubleLoop : aiVariationTap)();
-        }
     } else if (on && shiftHeld) {
         shiftStepFunction(button);
     } else if (on) {

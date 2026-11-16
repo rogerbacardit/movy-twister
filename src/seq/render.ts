@@ -5,7 +5,7 @@
  * it keep the frame alive while content is showing; *Tick() ages them. */
 
 import { drawJogToast } from '../renderer/overlay.js';
-import { W, HEADER_H, TOAST_Y, TOAST_H } from '../renderer/layout.js';
+import { W, TOAST_Y, TOAST_H } from '../renderer/layout.js';
 import { fontPrint, fontWidth } from '../font/index.js';
 import { songBandTokens, songBandVisible, songTerminal } from './song.js';
 import { seqState } from './state.js';
@@ -18,21 +18,14 @@ const DEFAULT_TTL = 60; // ticks (~0.3s at the ~196 Hz device rate)
  * view-switch notifications (Note/Session/Loop). Placed at the top so it
  * never covers the bottom loop/bar strip. */
 let headerText = '';
-let headerRight = '';
 let headerTtl = 0;
 
-/** `right` is drawn flush right — a held knob's value, the way a Schwung
- *  page shows a touched param (name left, value right). */
-export function seqHeaderAnnounce(msg: string, ttlTicks: number = DEFAULT_TTL, right = ''): void {
+export function seqHeaderAnnounce(msg: string, ttlTicks: number = DEFAULT_TTL): void {
     headerText = msg;
-    headerRight = right;
     headerTtl = ttlTicks;
 }
 
 export function seqHeaderActive(): boolean { return headerTtl > 0; }
-
-/** What the header band shows ('' when none; `left|right`) — read by tests. */
-export function seqHeaderShown(): string { return headerTtl > 0 ? headerText + (headerRight ? '|' + headerRight : '') : ''; }
 
 export function seqHeaderTick(): void {
     if (headerTtl > 0) headerTtl--;
@@ -40,12 +33,11 @@ export function seqHeaderTick(): void {
 
 export function drawSeqHeader(): void {
     if (headerTtl <= 0) return;
-    fill_rect(0, 0, W, HEADER_H, 1);       // inverted header band, 1 px around the text
+    fill_rect(0, 0, W, 9, 1);              // inverted header band
     fontPrint(2, 1, headerText, 0);
-    if (headerRight) fontPrint(W - 2 - fontWidth(headerRight), 1, headerRight, 0);
 }
 
-export function resetSeqHeader(): void { headerText = ''; headerRight = ''; headerTtl = 0; }
+export function resetSeqHeader(): void { headerText = ''; headerTtl = 0; }
 
 let text = '';
 let ttl = 0;
@@ -55,20 +47,9 @@ let ttl = 0;
  * value a caller passes. */
 const TOAST_TTL = 196;
 
-/* Bumped when the toast's TEXT changes. tick.ts repaints on it: a toast
- * updated while it is still showing (Freeze's "FREEZING T1 n%", re-said every
- * ~40 ms, never expiring in between) was otherwise drawn once and left at its
- * first value. A repeat of the same text is not a change. */
-let version = 0;
-
 export function seqToast(msg: string): void {
-    if (msg !== text || ttl === 0) version++;
     text = msg;
     ttl = TOAST_TTL;
-}
-
-export function seqToastVersion(): number {
-    return version;
 }
 
 export function seqToastActive(): boolean {
@@ -120,32 +101,11 @@ function songBandSig(): string {
         + (songTerminal() ? '!' : '');
 }
 
-/** The inverted bottom band with its leading word; returns where tokens start.
- *  Shared by the Song band and the AI preview selector (ai/preview-render.ts). */
-export function drawBandLead(lead: string): number {
-    fill_rect(0, TOAST_Y, W, TOAST_H, 1);       // inverted band, as the toast draws
-    fontPrint(2, TOAST_Y + 1, lead, 0);
-    return 2 + fontWidth(lead) + SONG_GAP * 2;
-}
-
-/** One band entry at x; `current` is boxed. Returns the x after it, or -1 when
- *  it would not fit (nothing drawn). */
-export function drawBandToken(x: number, label: string, current: boolean, gap = SONG_GAP): number {
-    const w = fontWidth(label);
-    if (x + w > W - 1) return -1;
-    if (current) {
-        /* Boxed rather than inverted again: the band is already inverted,
-         * so the current entry is a hole punched back through it. */
-        fill_rect(x - 1, TOAST_Y, w + 2, TOAST_H, 0);
-        fontPrint(x, TOAST_Y + 1, label, 1);
-    } else {
-        fontPrint(x, TOAST_Y + 1, label, 0);
-    }
-    return x + w + gap;
-}
-
 export function drawSongBand(): void {
-    let x = drawBandLead('SONG');
+    fill_rect(0, TOAST_Y, W, TOAST_H, 1);       // inverted band, as the toast draws
+    let x = 2;
+    fontPrint(x, TOAST_Y + 1, 'SONG', 0);
+    x += fontWidth('SONG') + SONG_GAP * 2;
     /* A song parked on an empty scene has ENDED. The width it needs comes off
      * the token budget first, so the marker can never be the thing that gets
      * clipped — an arrangement that has stopped must say so. */
@@ -158,9 +118,17 @@ export function drawSongBand(): void {
         x += fontWidth('.') + SONG_GAP;
     }
     for (const t of tokens) {
-        const next = drawBandToken(x, t.label, t.current);
-        if (next < 0) break;
-        x = next;
+        const w = fontWidth(t.label);
+        if (x + w > W - 1) break;
+        if (t.current) {
+            /* Boxed rather than inverted again: the band is already inverted,
+             * so the entry now playing is a hole punched back through it. */
+            fill_rect(x - 1, TOAST_Y, w + 2, TOAST_H, 0);
+            fontPrint(x, TOAST_Y + 1, t.label, 1);
+        } else {
+            fontPrint(x, TOAST_Y + 1, t.label, 0);
+        }
+        x += w + SONG_GAP;
     }
     if (end) {
         fontPrint(x + SONG_GAP, TOAST_Y + 1, 'END', 0);

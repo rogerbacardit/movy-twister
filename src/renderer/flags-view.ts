@@ -34,11 +34,9 @@ export function firstVisibleRow(selected: number, count: number): number {
     return Math.max(0, Math.min(selected - half, count - VISIBLE_ROWS));
 }
 
-/** `title`: the Settings page, or another list drawn the same way (the
- *  track menu, seq/track-menu.ts). */
-export function renderFlagsView(vm: FlagsPageVM, title = 'SETTINGS'): void {
+export function renderFlagsView(vm: FlagsPageVM): void {
     clear_screen();
-    drawHeader(title, null, true);
+    drawHeader('SETTINGS', null, true);
 
     if (vm.rows.length === 0) {
         fontPrint(2, LIST_TOP, 'No settings', 1);

@@ -1,5 +1,5 @@
 /* The per-set UI-only state: tonic, scale, mode, pad layout, per-track octave
- * and track mutes. Kept apart from the engine's own serialization because the
+ * and track mutes. (MIDI IN is machine-level, seq/prefs.ts.) Kept apart from the engine's own serialization because the
  * engine knows nothing about any of it — it is ferried in its own JSON file
  * alongside the state blob. */
 

@@ -28,12 +28,6 @@ import './dist/scenarios/master-volume.js';
 import './dist/scenarios/power.js';
 import './dist/scenarios/debug-tools.js';
 import './dist/scenarios/ext-midi.js';
-import './dist/scenarios/ducker.js';
-import './dist/scenarios/link.js';
-import './dist/scenarios/ai.js';
-import './dist/scenarios/midi-out.js';
-import './dist/scenarios/freeze.js';
-import './dist/scenarios/freeze-mem.js';
 
 const argv = process.argv.slice(2);
 const flag = (n) => { const i = argv.indexOf(n); return i >= 0 ? argv[i + 1] : undefined; };

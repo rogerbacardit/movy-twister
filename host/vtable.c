@@ -6,7 +6,6 @@
 
 #include "log.h"
 #include "midi_out.h"
-#include "mirror.h"
 #include "movy_host.h"
 #include "param_bulk.h"
 #include "status_snap.h"
@@ -124,23 +123,11 @@ static int get_one(void *ctx, const char *key, char *buf, int cap) {
 
 static void set_one(void *ctx, const char *key, const char *val) {
     (void)ctx;
-    /* Single and bulk sets both land here, on the audio thread the mirror
-     * pushes from: the one place the master gain can be seen in order. */
-    if (!strcmp(key, "mfx:vol")) mirror_master_volume(val);
     if (g_api->set_param) g_api->set_param(g_inst, key, val);
 }
 
 const char *engine_slowest_key(void) { return g_slow_key; }
 uint64_t engine_slowest_us(void) { return g_slow_us; }
-
-int engine_block_detail(char *buf, int cap) {
-    buf[0] = '\0';
-    if (!g_api || !g_inst) return 0;
-    int n = get_one(NULL, "blockprof", buf, cap);
-    if (n < 0 || n >= cap) { buf[0] = '\0'; return 0; }
-    buf[n] = '\0';
-    return n;
-}
 
 static void service_one(pq_req_t *r);
 

@@ -40,7 +40,7 @@ _log('\nTest: drum module detection via loadHierarchy');
   const vmk = mk.getViewModel();
   eq('krautdrums: drumPadCount=16', vmk.drumPadCount, 16);
   eq('krautdrums: drumCurrentPad defaults to 1', vmk.drumCurrentPad, 1);
-  eq('krautdrums: rawMidi pad 1 is the lit grid pad', vmk.drumCurrentPhysPad, 68);
+  eq('krautdrums: pad 1 is the lit grid pad', vmk.drumCurrentPhysPad, 68);
 
   const plaitsPreset = {
     'synth:name': 'Plaits',
@@ -141,9 +141,9 @@ _log('\nTest: track colors — track 3 neon pink, track 4 royal blue');
   /* A cheap pin so the table is not completely unguarded on a checkout without
    * the schwung sibling repo — track-colors.mjs skips wholesale when it is
    * missing, and that is where the real palette reasoning lives. */
-  eq('track 3 = AzureBlue dim(95)',    TRACK_COLOR[2], 95);
-  eq('track 4 = NeonPink(23)',         TRACK_COLOR[3], 23);
-  eq('track 3 dim = ElectricViolet dim(103)', TRACK_COLOR_DIM[2], 103);
+  eq('track 3 = Bright Orange(3)',     TRACK_COLOR[2], 3);
+  eq('track 4 = purple #972BFF(23)',   TRACK_COLOR[3], 23);
+  eq('track 3 dim = Bright Orange dim(69)',   TRACK_COLOR_DIM[2], 69);
   eq('track 4 dim = NeonPink dim(109)',       TRACK_COLOR_DIM[3], 109);
 }
 

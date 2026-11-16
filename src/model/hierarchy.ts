@@ -119,12 +119,12 @@ export function loadHierarchy(s: ModelState): void {
         for (const lvl of Object.values(allLevels)) {
             if (lvl.params) {
                 for (const p of lvl.params) {
-                    if (p && typeof p === 'object' && p.key) paramDefs[p.key] = p;
+                    if (typeof p === 'object' && p.key) paramDefs[p.key] = p;
                 }
             }
             if (lvl.knobs) {
                 for (const k of lvl.knobs) {
-                    if (k && typeof k === 'object' && k.key) knobInline[k.key] = k;
+                    if (typeof k === 'object' && k.key) knobInline[k.key] = k;
                 }
             }
         }
@@ -207,7 +207,6 @@ export function loadHierarchy(s: ModelState): void {
     const voices = (s.drumConfig && declaredSurface && declaredSurface.layout === 'drums')
         ? padVoices(s.drumConfig, declaredSurface.voices) : [];
     s.drumPadNames = voices.map((v) => (v && v.name) || '');
-    s.drumPadRoles = voices.map((v) => (v && v.role) || '');
     s.voiceKeys = voiceKeysOf(declaredHierarchy, voices.map((v) => ({ note: v ? v.note : NaN })));
     if (s.drumConfig) {
         s.drumPadCount = s.drumConfig.padCount;

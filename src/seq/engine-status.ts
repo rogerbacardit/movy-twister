@@ -12,12 +12,8 @@ import { activeFromStr, adoptLoopWindow, muteFromStr, occFromHex, padMutesFromSt
 import { rationalToIdx } from './clip-scale.js';
 import { noteProbeGen } from './probe-bridge.js';
 import { markUiStateDirty } from './ui-dirty.js';
-import { localWritePending } from './local-writes.js';
 import { noteReportedTrack } from './watch.js';
 import { requestLabelSync } from './label-sync.js';
-import { freezeStatusField } from './freeze.js';
-import { loadErrorField } from './load-errors.js';
-import { linkStatusField } from './link-status.js';
 
 /* -1 until the first status: the opening value is not a change, and treating
  * it as one would mark every fresh open dirty and rewrite the set for nothing. */
@@ -47,7 +43,7 @@ export function takeNoopSnapId(): number {
  * transitions are always logged. */
 let lastEnginePlay: boolean | null = null;
 
-export function parseStatus(s: string, served = Infinity): void {
+export function parseStatus(s: string): void {
     seqState.engineOk = true;
     /* Cleared each poll rather than only overwritten: an engine that predates
      * the fields sends none of them, and last poll's numbers standing in for
@@ -67,7 +63,6 @@ export function parseStatus(s: string, served = Infinity): void {
         else if (key === 'tick') seqState.engineTick = Number(val) || 0;
         else if (key === 'bpm') seqState.bpmX100 = Number(val) || seqState.bpmX100;
         else if (key === 'ext') seqState.extSync = val === '1';
-        else if (key === 'lk' || key === 'lkp') linkStatusField(key, val);
         else if (key === 'swing') seqState.swingPct = Number(val) || seqState.swingPct;
         else if (key === 'trk') {
             seqState.reportedTrack = Number(val) || 0;
@@ -81,9 +76,7 @@ export function parseStatus(s: string, served = Infinity): void {
             seqState.clipScaleIdx = rationalToIdx(n || 1, d || 1);
         }
         else if (key === 'ctr') seqState.clipTranspose = Number(val) || 0;
-        else if (key === 'quant') {
-            if (!localWritePending('quant', served)) seqState.clipQuant = Number(val) || 0;
-        }
+        else if (key === 'quant') seqState.clipQuant = Number(val) || 0;
         else if (key === 'dquant') seqState.defaultQuant = Number(val) || 0;
         /* The engine's count of serviced chain-module changes. A movy chain
          * lives only inside the engine, so the UI cannot know it changed unless
@@ -122,8 +115,6 @@ export function parseStatus(s: string, served = Infinity): void {
         else if (key === 'prq') noteProbeGen(Number(val) || 0);
         else if (key === 'chpend') seqState.chainPending = Number(val) || 0;
         else if (key === 'sbad') seqState.setBad = val === '-' ? '' : val;
-        else if (key === 'frz' || key === 'frzc' || key === 'frze' || key === 'frzm' || key === 'frzr' || key === 'frzp') freezeStatusField(key, val);
-        else if (key === 'lde') loadErrorField(val);
         else if (key === 'chcost') seqState.cpuCost = val;
         else if (key === 'mtr') seqState.mixMeter = val;
         else if (key === 'chwall') seqState.cpuWall = val;

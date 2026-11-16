@@ -1,5 +1,7 @@
 /* The engine's route for an external USB-A keyboard (engine ext_route.rs): which
- * chain the keys play, and on a drum track which note each key's pad plays.
+ * chain the keys play, and on a drum track which note each key's pad plays —
+ * for the active track, and for each track that claims a MIDI channel
+ * (track/midi-in.ts).
  *
  * Pushed by comparison every tick, as pad-route.ts does and for its reason: the
  * things that change it (track switch, module change, a rack redeclaring its
@@ -10,7 +12,8 @@ import { appState } from '../app/state.js';
 import { drumNoteOfPad } from '../keyboard/drum-grid.js';
 import type { DrumConfig } from '../types/param.js';
 import { drumConfigFor } from './pad-route.js';
-import { chainInstance } from './ref.js';
+import { chainInstance, TRACK_COUNT } from './ref.js';
+import { trackForChannel, MIDI_IN_MAX } from './midi-in.js';
 
 /* Note the first drum pad sits on: the GM / Move kick. One key per pad upward. */
 export const EXT_DRUM_BASE = 36;
@@ -23,13 +26,24 @@ export function extDrumPitch(note: number, cfg: DrumConfig): number {
     return pad >= 1 && pad <= cfg.padCount ? drumNoteOfPad(pad, cfg) : -1;
 }
 
-function buildMap(): string {
-    const t = appState.activeTrack.index;
+/* One destination: `<chain>` or `<chain>,<p0>,…` for a drum rack. */
+function destFor(t: number): string {
     const drum = drumConfigFor(t);
     const parts: number[] = [chainInstance(t)];
     if (drum && drum.padCount < 1) return '-1';   // a rack with no pads: the bare chain would play it melodically
     if (drum) for (let pad = 1; pad <= drum.padCount; pad++) parts.push(drumNoteOfPad(pad, drum));
     return parts.join(',');
+}
+
+/* `<active>[;<ch>:<dest>]*`. A Set where no track claims a channel pushes
+ * exactly what it always did. */
+function buildMap(): string {
+    const segs = [destFor(appState.activeTrack.index)];
+    for (let ch = 1; ch <= MIDI_IN_MAX; ch++) {
+        const t = trackForChannel(ch);
+        if (t >= 0 && t < TRACK_COUNT) segs.push(ch + ':' + destFor(t));
+    }
+    return segs.join(';');
 }
 
 export function syncExtRoute(send: (key: string, value: string) => void): void {

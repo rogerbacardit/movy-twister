@@ -13,7 +13,6 @@ import { appState, trackIsDrum, VIEW_CLIP_PARAMS } from '../app/state.js';
 import { MAX_STEPS } from './constants.js';
 import { SCALE_RATIONALS } from './clip-scale.js';
 import { QUANT_VALUES } from './quant.js';
-import { writeClipQuant } from './clip-quant.js';
 
 const TRANSPOSE_MIN = -36, TRANSPOSE_MAX = 36;
 
@@ -73,5 +72,6 @@ export function applyClipQuantIdx(track: number, idx: number): void {
     const next = QUANT_VALUES[i];
     if (next === seqState.clipQuant) return;
     beginGesture(gestureKey(3, track), KNOB_VERBS[3], trackLabel(track));
-    writeClipQuant(track, next);
+    seqState.clipQuant = next;
+    seqCmd('cq ' + track + ' ' + next);
 }

@@ -14,7 +14,6 @@
 #include "quickjs-libc.h"
 #include "placement.h"
 #include "rt.h"
-#include "speaker.h"
 #include "surface_keys.h"
 #include "ui.h"
 #include "ui_eval.h"
@@ -122,7 +121,6 @@ int ui_run(const char *ui_path) {
         }
         display_publish(tick);
         mirror_poll(tick);
-        speaker_poll(tick);
         rt_poll();
         placement_poll();
         sleep_to(&next);

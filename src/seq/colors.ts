@@ -42,24 +42,36 @@ export const C_REC_RED = 127;  // Red — recording indicator (index 1 renders p
  * `browser-test/track-colors.mjs` holds all of that, and also checks these
  * indices still mean what they mean in schwung's own palette — the table here
  * is a copy, and a copy can drift. */
-export const TRACK_COLOR = [
-    65, 7, 95, 23,        // G1: Bright Red dim, Vivid Yellow, Azure Blue dim, Neon Pink
-    9, 2, 23, 95,         // G2: Bright Lime, Orange Red, Neon Pink, Azure Blue dim
-    95, 23, 3, 9,         // G3: Azure Blue dim, Neon Pink, Bright Orange, Bright Lime
-    23, 95, 9, 69,        // G4: Neon Pink, Azure Blue dim, Bright Lime, Bright Orange dim
-];
+export const GREEN_T = 126;   // Green (#00FF00)
+export const BLUE_T = 125;    // Blue (#0000FF)
+export const ORANGE_T = 3;    // Bright Orange
+export const PURPLE_T = 23;   // #972BFF (palette 22 "Purple" is a blue)
+const DIM_OF: Record<number, number> = { [GREEN_T]: 85, [BLUE_T]: 99, [ORANGE_T]: 69, [PURPLE_T]: 109 };
 
+/* Track colours: the user's four, rotated. Tracks 1-4 are green, strong blue,
+ * orange and purple, and each later group starts one colour on, so every row
+ * (a group's 4 tracks) and every column (one track index across groups) holds
+ * all four — the distinctness rule, met with the four hues furthest apart.
+ * A Twister's rings take the same colour as the active track
+ * (midi/ext-colors.ts).
+ *
+ * The bans below still hold, and `browser-test/track-colors.mjs` checks them:
+ *   - cool hues (LAB 145-310) above L 45 read as white on the root pad.
+ *   - pastels (L > 65 with chroma under 0.7*L), whatever their hue.
+ * It also checks these indices still mean what they mean in schwung's own
+ * palette — the table here is a copy, and a copy can drift. */
+export const TRACK_COLOR = [
+    GREEN_T, BLUE_T, ORANGE_T, PURPLE_T,
+    BLUE_T, ORANGE_T, PURPLE_T, GREEN_T,
+    ORANGE_T, PURPLE_T, GREEN_T, BLUE_T,
+    PURPLE_T, GREEN_T, BLUE_T, ORANGE_T,
+];
 
 /* Dim variants, still used by two things the Session selector no longer is:
  * muted track buttons and the watched track's empty in-loop steps, where the
  * dim colour marks the LOOP WINDOW. Each shares its bright partner's hue and is
- * clearly darker. They repeat wherever the bright table repeats. */
-export const TRACK_COLOR_DIM = [
-    71, 77, 103, 109,     // Tan dim, Vivid Yellow dim, Electric Violet dim, Neon Pink dim
-    81, 71, 109, 103,     // Bright Lime dim, Tan dim, Neon Pink dim, Electric Violet dim
-    103, 109, 6, 81,      // Electric Violet dim, Neon Pink dim, Ochre, Bright Lime dim
-    109, 103, 81, 71,     // Neon Pink dim, Electric Violet dim, Bright Lime dim, Tan dim
-];
+ * clearly darker. */
+export const TRACK_COLOR_DIM = TRACK_COLOR.map((c) => DIM_OF[c]);
 
 export function trackColor(track: number): number {
     return TRACK_COLOR[track & 15];

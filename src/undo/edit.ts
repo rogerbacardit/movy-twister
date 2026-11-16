@@ -2,8 +2,7 @@
  * every call site. Kept separate from group.ts so that file stays about the
  * open-group state machine and nothing else. */
 
-import { CLOSE, beginEdit, endEdit } from './group.js';
-import { setDetail } from './group-ops.js';
+import { CLOSE, beginEdit, endEdit, setDetail } from './group.js';
 
 /** A one-shot edit: opens a group, runs the mutation, closes it. The engine
  *  decides whether anything actually changed (ucommit), so a delete on an

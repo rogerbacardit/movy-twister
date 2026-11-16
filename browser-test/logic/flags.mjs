@@ -9,8 +9,6 @@ import {
     flagsPageState, flagsPageActive, flagsPageJog, resetFlagsPage,
     flagsRowCount, backupsRowSelected, clickRowSelected, migrateRowSelected, actionRowSelected,
     readPrefClickDb, clickVolumeTurn, clickVolumeLabel, resetClickVolume,
-    readPrefLink, linkSettingOn, linkSettingToggle, linkSettingTurn, linkSettingLabel, resetLinkSetting, linkRowSelected,
-    flagsKnobLevel,
     buildFlagsPageVM, VISIBLE_ROWS, firstVisibleRow,
     wrapWords, HINT_W, HINT_LINES, fontWidth, W,
     readPrefModuleBlacklist, installMockEngine, uninstallMockEngine,
@@ -80,14 +78,13 @@ export async function run() {
     ok('which is CLICK VOLUME', clickRowSelected());
     flagsPageJog(1);
     eq('jog moves down', flagsPageState.selected, 1);
-    ok('onto LINK', linkRowSelected());
+    ok('onto BACKUPS', backupsRowSelected());
     flagsPageJog(1);
-    ok('then BACKUPS: no GENERATORS row (no SAFE/BALANCED/WILD)', backupsRowSelected());
-    flagsPageJog(1);
-    ok('migrate_row_stays_last', migrateRowSelected() && flagsPageState.selected === flagsRowCount() - 1);
+    ok('and the migrate row is last', migrateRowSelected());
     flagsPageJog(-1);
-    ok('and BACKUPS is last-1, where the device scenarios step to', backupsRowSelected());
-    for (let i = 0; i < 6; i++) flagsPageJog(-1);
+    eq('and back up', flagsPageState.selected, 1);
+    flagsPageJog(-1);
+    flagsPageJog(-1);
     eq('the top is clamped, not wrapped', flagsPageState.selected, 0);
     for (let i = 0; i < 10; i++) flagsPageJog(1);
     eq('and so is the bottom', flagsPageState.selected, flagsRowCount() - 1);
@@ -108,22 +105,16 @@ export async function run() {
      * and undrawn — and every screenshot stayed byte-identical, because the
      * viewmodel never changed. */
     eq('one drawn row per selectable row', vm.rows.length, flagsRowCount());
-    eq('settings_has_no_generators_row', vm.rows.map((r) => r.name).join(','), 'CLICK VOLUME,LINK,BACKUPS,MIGRATE FROM MOVE');
-    eq('link_row_drawn_off_by_default', vm.rows[1].value, 'OFF');
-    eq('backups_row_drawn', vm.rows[2].value, '>');
+    eq('the rows', vm.rows.map((r) => r.name).join(','), 'CLICK VOLUME,BACKUPS,MIGRATE FROM MOVE');
     eq('exactly one row is selected', vm.rows.filter((r) => r.selected).length, 1);
     ok('CLICK VOLUME explains itself', vm.hint.length > 0);
     eq('and shows the default level', vm.rows[0].value, '0 dB');
 
     /* The band follows the selection, or it is describing a different row than
      * the one under the inverted band. */
-    flagsPageJog(1);
-    ok('the link row explains itself', /live/i.test(buildFlagsPageVM().hint), buildFlagsPageVM().hint);
-    flagsPageJog(1);
-    ok('the backups row explains itself', /version/i.test(buildFlagsPageVM().hint));
     flagsPageJog(2);
     const mv = buildFlagsPageVM();
-    ok('the migrate row can be selected', mv.rows[3].selected);
+    ok('the migrate row can be selected', mv.rows[2].selected);
     ok('and the hint is its own', mv.hint.toLowerCase().includes('from move'), mv.hint);
 
     /* Scrolling: the list is short, and the window is asserted at a length it
@@ -176,75 +167,6 @@ export async function run() {
     eq('a restart restores the level into the engine', eng.params.clickdb, '11');
     uninstallMockEngine(); uninstallMockFs();
     resetClickVolume(); resetSeqEngine();
-}
-
-/* ── Link: off by default, a click toggles it, durable, reaches the engine ── */
-{
-    _log('\nLink setting');
-
-    installMockFs();
-    resetLinkSetting();
-    ok('a fresh install has Link off', !readPrefLink() && !linkSettingOn());
-    eq('and the row says OFF', linkSettingLabel(), 'OFF');
-
-    let eng = installMockEngine();
-    resetSeqEngine();
-    seqEngineTick();
-    eq('off is pushed on boot (a new engine starts with Link off anyway)', eng.params.link, '0');
-
-    linkSettingToggle();
-    eq('a click turns it on in the engine', eng.params.link, '1');
-    ok('and stores it for this Move', readPrefLink());
-    eq('the row says ON', linkSettingLabel(), 'ON');
-
-    resetLinkSetting();
-    resetSeqEngine();
-    uninstallMockEngine();
-    eng = installMockEngine();
-    seqEngineTick();
-    eq('a restart turns Link back on in the new engine', eng.params.link, '1');
-    linkSettingToggle();
-    eq('a second click turns it off', eng.params.link, '0');
-    ok('and stores that', !readPrefLink());
-    uninstallMockEngine(); uninstallMockFs();
-    resetLinkSetting(); resetSeqEngine();
-}
-
-/* ── Knob 1 edits the selected row, and its LED shows the value ──────────── */
-{
-    _log('\nSettings knob 1');
-
-    installMockFs();
-    resetLinkSetting(); resetClickVolume(); resetFlagsPage();
-    const eng = installMockEngine();
-
-    /* CLICK VOLUME: the LED is the level across the knob's range, as on a
-     * parameter page (0 dB at the bottom, +11 dB at the top). */
-    eq('knob_led_click_at_default', flagsKnobLevel(), 0);
-    clickVolumeTurn(11);
-    eq('knob_led_click_at_top', flagsKnobLevel(), 1);
-
-    /* LINK: right is on, left is off; turning further changes nothing. */
-    flagsPageJog(1);
-    ok('on the LINK row', linkRowSelected());
-    eq('knob_led_link_off', flagsKnobLevel(), 0);
-    ok('turning left at off does nothing', !linkSettingTurn(-1));
-    ok('link_knob_right_turns_on', linkSettingTurn(1) && linkSettingOn());
-    eq('and the engine is told', eng.params.link, '1');
-    ok('and it is stored', readPrefLink());
-    eq('knob_led_link_on', flagsKnobLevel(), 1);
-    ok('turning right again does nothing', !linkSettingTurn(3));
-    ok('link_knob_left_turns_off', linkSettingTurn(-2) && !linkSettingOn());
-    eq('and the engine hears that too', eng.params.link, '0');
-
-    /* BACKUPS and MIGRATE are clicked, not turned: knob 1 goes dark there. */
-    flagsPageJog(1);
-    eq('knob_led_dark_on_backups', flagsKnobLevel(), null);
-    flagsPageJog(1);
-    eq('knob_led_dark_on_migrate', flagsKnobLevel(), null);
-
-    uninstallMockEngine(); uninstallMockFs();
-    resetLinkSetting(); resetClickVolume(); resetFlagsPage(); resetSeqEngine();
 }
 
 /* ── The hint band: every row says what it does, in two lines ────────────── */

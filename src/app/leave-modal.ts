@@ -18,6 +18,7 @@ interface LeaveOption { label: string; action: LeaveAction; }
 
 const LEAVE: LeaveOption[] = [{ label: 'Close Movy', action: 'close' }];
 const POWER: LeaveOption[] = [{ label: 'Power off', action: 'poweroff' }, { label: 'Cancel', action: 'cancel' }];
+
 function options(): LeaveOption[] {
     return leaveModalState.kind === 'power' ? POWER : LEAVE;
 }
@@ -78,11 +79,6 @@ export function leaveModalSel(): number { return leaveModalState.sel; }
 
 export function leaveModalTitle(): string {
     return leaveModalState.kind === 'power' ? 'Power off?' : 'Leave Movy?';
-}
-
-/* A line under the title, or '' for none (the renderer keeps the slot). */
-export function leaveModalNote(): string {
-    return '';
 }
 
 export function openLeaveModal(): void {

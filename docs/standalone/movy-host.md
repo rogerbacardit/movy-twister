@@ -164,30 +164,11 @@ ableton cannot get `SCHED_FIFO` (WP0 findings §3.1). The launcher re-stages
 shipped one, and runs `schwung-heal`, which installs it. movy-host calls
 `bin/heal rt <pid> <audio tid>`. The helper touches only a process whose
 executable is the `movy-host` beside it: the audio thread by **tid**
-(FIFO 70) and `movy-render*` (FIFO 68), plus `RLIMIT_MEMLOCK` and `RLIMIT_AS`. It goes by tid
+(FIFO 70) and `movy-render*` (FIFO 68), plus `RLIMIT_MEMLOCK`. It goes by tid
 because a thread spawned from the audio thread inherits its name. Memory is
 locked before the audio thread starts: a `mlockall` with audio live stalled one
 frame for 85 ms. With no usable helper movy-host runs degraded and says so
 (`rt: … DEGRADED`, `STATE rt=other`).
-
-The address-space cap is lifted in the same call, before any set loads. Move's
-launcher caps every process at 1.66 GiB, and a fork-mode module (osirus, the
-Virus) forks its DSP emulator from movy-host: the emulator inherits the cap
-and all of movy-host's mappings, with ~830 MB of its own on top. Once the
-freeze helpers' malloc arenas took movy-host to 883 MB with six Virus chains,
-every emulator died in `bootDSPs` (SIGSEGV in `virus_debug.log`) and the page
-stayed on "Booting DSP...". The cap never bounded RAM (it is per process). The
-log says `rt: … address space unlimited`, or `capped at … MB` when the helper
-could not lift it.
-
-`rt_init` also pins glibc's mmap threshold at 1 MB (`MH_MMAP_THRESHOLD`).
-Left alone, glibc raises it to the size of each mmapped block freed, and a
-frozen loop is megabytes. After the first thaw, loops then came from the freeze
-helper's and the saver's arenas, which keep what is freed, so under `mlockall`
-every loop ever held stayed locked RAM. Measured on the box: +5.4 MB of RSS per
-reopen of a Set with 5.6 MB of loops (`test-device` scenario `freeze-mem`).
-Pinned, every block that size is its own mapping, and freeing it hands the RAM
-back.
 
 ## Core placement (WP11)
 
@@ -208,26 +189,8 @@ shortest SPI call (`pump_min_us`, boundary wait + ~400 µs DMA) and the longest
 gap, and `late_frames` (`frame_clock.h`). An overrun never skips a frame: the
 transfer runs late and the block rate falls (serial render of an over-budget
 set ran at 293.7 Hz, not 344.5), so lateness is a gap more than 1/16 frame
-past 2902 µs.
-
-**The glitch recorder** (`glitch.h`, 2026-10-30) logs every frame whose work
-passes 2502 µs (the frame less the ~400 µs DMA), the point past which the next
-transfer is late. That is an audible click. `audio: glitch frame` splits the
-frame into io (display, input), params (naming the slowest, not the last),
-render and post (status publish, mirror, output copy), then appends the engine's own account of that block (`blockprof`,
-`block_prof.rs`): seq, set, load, mod, plan, render, mix, send and master in
-µs, and `top=`, the three costliest chains as `slot:module:µs`. A late transfer
-that no over-budget frame explains gets `audio: late transfer … with no
-over-budget work`: lateness from outside the audio thread's work. Lines are
-capped at 20 a second, and the next line counts any dropped (`+N unlogged`). It
-replaced the slow-frame log, which fired only past 10 ms, so every click
-shorter than that went unrecorded. The lines are also kept for weeks in
-`/data/UserData/schwung/movy-glitch.log` (`glitch_log.h`, 2026-10-31). The file
-is always written, whatever `debug_log_on` says, and each line is dated. It
-carries only the glitch lines plus the context around them: each launch's
-banner, set loads and `page ready` lines. Past 8 MB it rotates once to `.1`.
-`scripts/glitch-report.sh` (`-l` for the last launch only) pulls the file from
-the box and ranks the causes by stage, by the page that was open and by day.
+past 2902 µs. The slow-frame log (`audio: slow frame`, > 10 ms) splits the
+frame into render and params and names the slowest param, not the last.
 
 ## Measured on device (2026-10-10, schwung 1.7.3)
 
@@ -282,14 +245,12 @@ Still open:
   each at every open (the dlopen-ing loads), `chain_host` 17 ms. Parity with
   the shim, startup only, under the fade-in. Moving loads off the audio thread
   is an engine change: WP11.
-- **Speaker EQ (R8)** — done (schwung pin v1.8.2). movy-host compiles
-  `src/host/speaker_eq.c` from the pin (U7,
-  [schwung#642](https://github.com/charlesvestal/schwung/pull/642)) and runs it
-  on the DAC block after the mirror (`host/speaker.c`), gated like the shim:
-  features.json `speaker_eq` auto/off/on, Auto only on a REPORTED speaker held
-  3 s. It writes schwung's `jack_state` on every CC 115 but never reads it to
-  engage. Measured 2026-10-31 (8 opens in the device tier): XMOS does NOT
-  repeat CC 115 when movy-host opens, so Auto engages only after a replug
-  (log: `speaker eq: jack reports ...`); Spkr EQ On is the way round it.
+- **Speaker EQ (R8).** Under the shim MoveOriginal's speaker enhancer, and
+  schwung's emulation of it, colour the built-in speaker. movy-host has
+  neither: a MANUAL limitation for now. schwung's emulation is a static block
+  in `schwung_shim.c`; copying it would be vendoring, so the path is an
+  upstream extraction into `src/host/speaker_eq.c` (U7,
+  [schwung#642](https://github.com/charlesvestal/schwung/pull/642)) that
+  movy-host compiles from the pin once a tag carries it.
 - Not done by a person yet: opening movy-sa from the Tools menu by hand, a
   listening check, and a real power-button press (the tier only dry-runs it).

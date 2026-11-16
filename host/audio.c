@@ -9,7 +9,6 @@
 #include "audio.h"
 #include "display.h"
 #include "frame_stats.h"
-#include "glitch.h"
 #include "handover.h"
 #include "inject_ring.h"
 #include "ui_ring.h"
@@ -22,11 +21,11 @@
 #include "mirror.h"
 #include "movy_host.h"
 #include "param_queue.h"
-#include "speaker.h"
 #include "surface_keys.h"
 #include "vtable.h"
 
 #define FADE_FRAMES ((int)(0.5 * SCHWUNG_SAMPLE_RATE / SCHWUNG_AUDIO_FRAMES))
+#define SLOW_FRAME_US 10000
 #define PARAMS_PER_FRAME 8
 /* The engine's status into the UI's snapshot every Nth block (WP10). Every
  * block cost ~49 us of audio-thread work (the engine formats ~1.5 KB of text),
@@ -51,7 +50,6 @@ static int gather_input(uint8_t *map, uint8_t notes[][4], int max) {
     for (int i = 0; i < SCHWUNG_MIDI_IN_MAX; i++) {
         uint8_t *e = in + i * 8;
         if (!(e[0] | e[1] | e[2] | e[3])) continue;
-        speaker_in(e);   /* the hardware's jack report only, never an injected one */
         if (midi_in_feed(e, now) && n < max) memcpy(notes[n++], e, 4);
     }
     mirror_in(in, SCHWUNG_MIDI_IN_MAX * 8);
@@ -84,13 +82,7 @@ static void *audio_main(void *arg) {
 
     int16_t buf[SCHWUNG_AUDIO_FRAMES * 2];
     uint8_t out[MIDI_OUT_PER_FRAME][4], notes[64][4];
-    int fade = 0, status_div = 0, unlogged = 0;
-    /* Whether the frame before this transfer was over budget: a late transfer
-     * it explains is already on its glitch line. */
-    int prev_over = 0;
-    uint64_t prev_work = 0;
-    mh_log_limit_t glitch_limit = { 0, 0 };
-    static char detail[512];
+    int fade = 0, status_div = 0;
     while (!g_stop) {
         /* F0 00 21 1D 01 01 39 02 F7: what stock Move sends for every power-button event. Unanswered,
          * the hardware reports the button once per launch and then goes quiet. */
@@ -107,9 +99,7 @@ static void *audio_main(void *arg) {
         memset(map + SCHWUNG_OFF_OUT_MIDI, 0, SCHWUNG_MIDI_OUT_MAX * 4);
         __atomic_add_fetch(&g_frame, 1, __ATOMIC_RELEASE);
         uint64_t t0 = mh_now_us();
-        if (frame_stats_transfer(tp, t0) && !prev_over && mh_log_limit(&glitch_limit, t0 / 1000, GLITCH_LINES_PER_S))
-            mh_log("audio: late transfer %llu with no over-budget work before it (work %llu us, transfer %llu us)",
-                   (unsigned long long)g_frame, (unsigned long long)prev_work, (unsigned long long)(t0 - tp));
+        frame_stats_transfer(tp, t0);
 
         display_serve(map);
         int nn = gather_input(map, notes, 64);
@@ -127,7 +117,6 @@ static void *audio_main(void *arg) {
             if (handover_armed()) { log_ring_flush_raw(STDERR_FILENO); handover_exec(MH_HANDOVER_CHAIN); }
             _exit(4);
         }
-        uint64_t tio = mh_now_us();
         engine_frame_begin();
         for (int i = 0; i < nn; i++) engine_on_midi(notes[i] + 1, 3, notes[i][0] >> 4 == 2);
         int served = pq_service(engine_service, NULL, PARAMS_PER_FRAME);
@@ -138,18 +127,11 @@ static void *audio_main(void *arg) {
             status_div = 0;
             engine_publish_status(pq_served());
         }
-        /* Read inside the lock, and only once the frame is already over: the
-         * engine formats it, and a good frame must not pay for that. */
-        int over = glitch_over(mh_now_us() - t0);
-        if (over) engine_block_detail(detail, sizeof detail);
         engine_frame_end();
 
         int16_t *dst = (int16_t *)(map + SCHWUNG_OFF_OUT_AUDIO);
-        if (!rendered) { memset(dst, 0, sizeof buf); fade = 0; prev_over = 0; continue; }
+        if (!rendered) { memset(dst, 0, sizeof buf); fade = 0; continue; }
         mirror_audio(buf, SCHWUNG_AUDIO_FRAMES);
-        /* After the mirror, which streams what Move's master bus would: the
-         * EQ voices the built-in speaker, not a recording of the mix. */
-        speaker_process(buf, SCHWUNG_AUDIO_FRAMES);
         /* Fade in from silence: the hardware may still carry whatever the
          * previous owner left, and a full-scale first block is a click. */
         if (fade < FADE_FRAMES) {
@@ -163,18 +145,10 @@ static void *audio_main(void *arg) {
         /* Render and params apart, and the params' slowest key rather than the
          * last: a chain load is released inside render, and the key serviced
          * last in a slow frame was rarely the one that made it slow (WP11). */
-        prev_work = work;
-        prev_over = glitch_over(work);
-        if (prev_over && !mh_log_limit(&glitch_limit, t0 / 1000, GLITCH_LINES_PER_S)) unlogged++;
-        else if (prev_over) {
-            static char line[768];
-            glitch_t g = { g_frame, (uint32_t)work, (uint32_t)(tio - t0), (uint32_t)(tr - tio), (uint32_t)render_us,
-                           nn, served, engine_slowest_key(), (uint32_t)engine_slowest_us(), audio_late_frames(),
-                           over ? detail : NULL, unlogged };
-            glitch_format(line, sizeof line, &g);
-            mh_log("%s", line);
-            unlogged = 0;
-        }
+        if (work > SLOW_FRAME_US)
+            mh_log("audio: slow frame %llu: %llu us (render %llu us; %d notes; %d params, slowest %s %llu us)",
+                   (unsigned long long)g_frame, (unsigned long long)work, (unsigned long long)render_us, nn, served,
+                   served ? engine_slowest_key() : "-", (unsigned long long)engine_slowest_us());
     }
     return NULL;
 }

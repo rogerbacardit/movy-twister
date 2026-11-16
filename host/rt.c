@@ -1,6 +1,5 @@
 #define _GNU_SOURCE
 #include <dirent.h>
-#include <malloc.h>
 #include <sched.h>
 #include <spawn.h>
 #include <stdio.h>
@@ -26,32 +25,14 @@ static uint64_t g_next_ms;
 static int helper_usable(void);
 static int run_helper(void);
 
-static rlim_t address_space(void) {
-    struct rlimit rl;
-    return getrlimit(RLIMIT_AS, &rl) == 0 ? rl.rlim_cur : RLIM_INFINITY;
-}
-
 /* Before the audio thread exists: locking memory faults in every page under
  * the process's mm lock, which stalled a live audio thread 85 ms (measured).
- * As ableton the limit is too low, so the helper raises it first, and lifts
- * the address-space cap with it (rt.h says why) before any chain forks. */
+ * As ableton the limit is too low, so the helper raises it first. */
 void rt_init(void) {
-    /* Set, not left to glibc: its threshold ratchets up to the size of every
-     * mmapped block freed, and a frozen loop is megabytes. Past the first thaw
-     * loops came from the helper threads' arenas, which keep what is freed, so
-     * under mlockall every loop ever held stayed locked RAM. Setting it also
-     * turns the ratchet off: every block this big is its own mapping, and
-     * freeing it hands the RAM back. */
-    mallopt(M_MMAP_THRESHOLD, MH_MMAP_THRESHOLD);
     snprintf(g_helper, sizeof g_helper, "%s/bin/heal", g_mh_module_dir);
     g_locked = mlockall(MCL_CURRENT | MCL_FUTURE) == 0;
-    if (rt_helper_wanted(g_locked, address_space()) && helper_usable()) run_helper();
-    if (!g_locked) g_locked = mlockall(MCL_CURRENT | MCL_FUTURE) == 0;
-    const char *mem = g_locked ? "locked" : "NOT locked (degraded)";
-    rlim_t as = address_space();
-    if (as == RLIM_INFINITY) mh_log("rt: memory %s, address space unlimited", mem);
-    else mh_log("rt: memory %s, address space capped at %llu MB (fork-mode modules may not boot)", mem,
-                (unsigned long long)(as >> 20));
+    if (!g_locked && helper_usable() && run_helper() == 0) g_locked = mlockall(MCL_CURRENT | MCL_FUTURE) == 0;
+    mh_log("rt: memory %s", g_locked ? "locked" : "NOT locked (degraded)");
 }
 
 const char *rt_state(void) {

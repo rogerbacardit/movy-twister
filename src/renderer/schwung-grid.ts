@@ -15,6 +15,7 @@ import { isMovyOwnComponent, isVirtualPageComponent } from '../chain/config.js';
 import { virtualSourceFor } from '../seq/virtual-page-sources.js';
 import { ownComponentSourceFor } from '../chain/own-component-source.js';
 import { mlog } from '../log.js';
+import type { PageParamSource } from './schwung-page-source.js';
 
 /* One SchwungPage per (track, component). */
 const pages = new Map<string, SchwungPage>();
@@ -52,11 +53,7 @@ export function schwungPageFor(trackIndex: number, componentKey: string,
          * own comment in chain/config.ts) — resolved before `componentPort`
          * for the same reason a virtual component is: there is a translation
          * to do that a bare port cannot do for itself. */
-        const source = isVirtualPageComponent(componentKey)
-            ? virtualSourceFor(componentKey)
-            : isMovyOwnComponent(componentKey)
-                ? ownComponentSourceFor(trackIndex, componentKey)
-                : componentPort(trackIndex, componentKey);
+        const source = pageSourceFor(trackIndex, componentKey);
         if (!source) return pages.get(id) ?? deadPage(componentKey);
         p = createSchwungPage(source, componentKey,
                               modulatedOf ?? null, automationOf ?? null, trackIndex);
@@ -79,8 +76,6 @@ function deadPage(componentKey: string): SchwungPage {
         changePage() {}, goToPage() {}, presetStep: () => false, keyAt: () => null, targetAt: () => null,
         labelAt: () => null, knobParamInfo: () => null, knobLevels: () => new Array(8).fill(null),
         marks: () => 0,
-        liveSig: () => '',
-        presetSig: () => '',
         animating: () => STILL, peekOpen: () => false, render() {}, chrome: () => ({ header: null, footer: null, pageLabel: null, padScoped: false }), regularKnobAt: () => false,
         knobTurn() {}, knobTouch() {}, click: () => null, back: () => null,
         focusVoice: () => false, focusWritten() {}, picker: () => null, claimsBottomBand: () => false,
@@ -108,3 +103,14 @@ export function schwungGridDrop(trackIndex: number, componentKey: string): void 
 /* WHETHER SCHWUNG IS DRIVING IS NOT ASKED HERE: `app/page-owner.ts` is the
  * only caller of `schwungPageFor` (`browser-test/logic/page-owner.mjs` greps
  * for a second one). */
+
+/** Where a component's params live — the one answer the page and any direct
+ *  writer (midi/ext-param.ts) share. Virtual and movy-own components first:
+ *  each has a translation a bare port cannot do (see schwungPageFor). */
+export function pageSourceFor(trackIndex: number, componentKey: string): PageParamSource | null {
+    return isVirtualPageComponent(componentKey)
+        ? virtualSourceFor(componentKey)
+        : isMovyOwnComponent(componentKey)
+            ? ownComponentSourceFor(trackIndex, componentKey)
+            : componentPort(trackIndex, componentKey);
+}

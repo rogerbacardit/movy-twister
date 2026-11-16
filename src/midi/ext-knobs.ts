@@ -4,53 +4,49 @@
  */
 
 import { appState } from '../app/state.js';
-import { platform } from '../platform/index.js';
 import { pageOwnerOf } from '../app/page-owner.js';
 import { onMidiMessageInternal, knobModel } from './router.js';
-import { createExtKnobState, extKnobActions, TW_ASSIGNED } from './ext-knob-map.js';
+import { createExtKnobState, extKnobActions, isTwisterCc } from './ext-knob-map.js';
+import { armTwisterFollow } from './ext-follow.js';
+import { extBaseForget, extKnobReset, extKnobTurn } from './ext-param.js';
 
 const state = createExtKnobState();
 
 /* A Twister forgets its ring colours on reconnect, and nothing tells us it
  * reconnected — so the rings are repainted whenever CCs resume after a quiet
- * spell. Cheap: 32 messages, at most once per gap. */
+ * spell. */
 const WAKE_GAP_MS = 10000;
 let lastCcMs = 0;
-
-/* Channel 2 CC n sets encoder n's colour (hue 1-126); channel 3 CC n its
- * animation byte, where 17..47 is RGB brightness (off..full) and 65..95 the
- * indicator's. Assigned encoders are green, the rest dark, so the controller
- * shows which encoders do something. */
-const TW_GREEN = 50;
-
-function paintTwister(): void {
-    const assigned = new Set(TW_ASSIGNED);
-    for (let enc = 0; enc < 16; enc++) {
-        if (assigned.has(enc)) {
-            platform.externalSend([0x0B, 0xB1, enc, TW_GREEN]);
-            platform.externalSend([0x0B, 0xB2, enc, 47]);
-            platform.externalSend([0x0B, 0xB2, enc, 95]);
-        } else {
-            platform.externalSend([0x0B, 0xB2, enc, 17]);
-            platform.externalSend([0x0B, 0xB2, enc, 65]);
-        }
-    }
-}
 
 /* Step the preset list of the module the knobs edit, from whatever page is on
  * screen — the page layer lands on the preset door, steps, and comes back. */
 function presetTurn(delta: number): void {
-    const page = pageOwnerOf(knobModel()).page;
-    if (page && page.presetStep(delta)) appState.dirty = true;
+    const owner = pageOwnerOf(knobModel());
+    if (owner.page && owner.page.presetStep(delta)) {
+        extBaseForget(owner.ref);    /* the new preset is what a push returns to */
+        appState.dirty = true;
+    }
 }
 
 export function onExternalControlChange(data: number[]): void {
-    const now = Date.now();
-    if (now - lastCcMs > WAKE_GAP_MS) paintTwister();
-    lastCcMs = now;
     const ch = (data[0] & 0x0F) + 1;
+    /* Only the Twister's own CCs wake it: a KeyStep on the same hub sends CCs
+     * all the time, and counting them kept the gap from ever opening (or
+     * armed a follow with no Twister there). */
+    if (isTwisterCc(ch, data[1] & 0x7F)) {
+        const now = Date.now();
+        if (now - lastCcMs > WAKE_GAP_MS) {
+            /* A reconnect: the follow repaints the controller (midi/ext-colors.ts),
+             * then the rings follow the parameters, and the absolute decoder
+             * counts from where each ring was put (midi/ext-follow.ts). */
+            armTwisterFollow((cc, v) => state.abs.set('tw' + cc, v));
+        }
+        lastCcMs = now;
+    }
     for (const a of extKnobActions(state, ch, data[1] & 0x7F, data[2] & 0x7F)) {
         if (a.kind === 'cc') onMidiMessageInternal([0xB0, a.cc, a.value]);
+        else if (a.kind === 'knob') extKnobTurn(a.knob, a.delta, a.pos);
+        else if (a.kind === 'reset') extKnobReset(a.knob);
         else presetTurn(a.delta);
     }
 }

@@ -38,10 +38,9 @@ import {
 } from '../../dist/esm/seq/prefs.js';
 import {
     flagsPageState, flagsPageActive, flagsPageJog, resetFlagsPage,
-    flagsRowCount, backupsRowSelected, clickRowSelected, linkRowSelected, migrateRowSelected, actionRowSelected,
+    flagsRowCount, backupsRowSelected, clickRowSelected, migrateRowSelected, actionRowSelected,
 } from '../../dist/esm/seq/flags-page.js';
-import { linkSettingOn, linkSettingToggle, linkSettingTurn, linkSettingLabel, resetLinkSetting } from '../../dist/esm/seq/link-setting.js';
-import { buildFlagsPageVM, flagsKnobLevel } from '../../dist/esm/seq/flags-page-vm.js';
+import { buildFlagsPageVM } from '../../dist/esm/seq/flags-page-vm.js';
 import { schwungPageFor,
          schwungGridReload, schwungGridDrop } from '../../dist/esm/renderer/schwung-grid.js';
 import {
@@ -54,7 +53,7 @@ import { wrapWords } from '../../dist/esm/renderer/wrap.js';
 import { fontWidth } from '../../dist/esm/font/index.js';
 import { W } from '../../dist/esm/renderer/layout.js';
 import { DETENT_DIV } from '../../dist/esm/seq/detent.js';
-import { readPrefModuleBlacklist, readPrefClickDb, readPrefLink } from '../../dist/esm/seq/prefs.js';
+import { readPrefModuleBlacklist, readPrefClickDb } from '../../dist/esm/seq/prefs.js';
 import { clickVolumeTurn, clickVolumeLabel, resetClickVolume } from '../../dist/esm/seq/click-volume.js';
 import { openParamPage, closeParamPage, paramPageActive } from '../../dist/esm/seq/param-page.js';
 import { VIEW_FLAGS, VIEW_CHAIN, VIEW_MAIN_PARAMS } from '../../dist/esm/app/state.js';
@@ -257,8 +256,6 @@ export {
     wrapWords, HINT_W, HINT_LINES, DETENT_DIV, fontWidth, W,
     serializeUiState, applyUiState, resetUiState,
     readPrefModuleBlacklist, readPrefClickDb, clickVolumeTurn, clickVolumeLabel, resetClickVolume,
-    readPrefLink, linkSettingOn, linkSettingToggle, linkSettingTurn, linkSettingLabel, resetLinkSetting, linkRowSelected,
-    flagsKnobLevel,
     buildCpuPageVM, buildSendColumns, FULL_SCALE_US, USABLE_BLOCK, scaleFor, scaleLabel,
     openParamPage, closeParamPage, paramPageActive,
     perfPhase, perfPhaseEnd, perfProbeTick,

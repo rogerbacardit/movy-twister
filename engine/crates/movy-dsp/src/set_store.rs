@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
  * directory. Nothing here is a secret, and the alternative is a Set only one
  * half of movy can save. */
 const DIR_MODE: u32 = 0o777;
-pub(crate) const FILE_MODE: u32 = 0o666;
+const FILE_MODE: u32 = 0o666;
 
 /// `mkdir -p`, left writable by both halves.
 pub(crate) fn ensure_dir(path: &Path) -> Result<(), String> {
@@ -171,10 +171,6 @@ impl SetStore {
                   self.shadow_path(uuid, 1), self.shadow_path(uuid, 2)] {
             let _ = fs::remove_file(p);
         }
-        /* Frozen loops are state too: left behind, every open of the blank
-         * Set read them only to open live, and a seed into it skipped the
-         * source's loops because a manifest was already there. */
-        crate::freeze_files::remove(&self.set_dir(uuid));
     }
 
     /// Copy-on-inherit: Move's Copy/Paste makes "X Copy" with no movy state of
@@ -184,14 +180,7 @@ impl SetStore {
     pub fn seed(&self, dst: &str, src: &str) -> bool {
         let Some(state) = self.read_best(src) else { return false };
         let chains = self.read_chains(src).unwrap_or_else(|| "0\n".to_string());
-        if self.write(dst, &state.payload, 1, &chains).is_err() {
-            return false;
-        }
-        /* The frozen loops travel with the Set: a rename (a new Set leaving its
-         * pending id) or a duplicate would otherwise open its frozen tracks
-         * unfrozen. A copy that fails costs only that. */
-        crate::freeze_files::copy(&self.set_dir(src), &self.set_dir(dst));
-        true
+        self.write(dst, &state.payload, 1, &chains).is_ok()
     }
 }
 
@@ -372,21 +361,5 @@ mod tests {
         let s = tmp("seedmiss");
         assert!(!s.seed("dst", "nope"));
         assert!(!s.set_dir("dst").exists());
-    }
-
-    /* Reviewed: a blanked Set kept its freeze files. Every later open read
-     * the orphaned WAVs only to open live, and a seed into it skipped the
-     * source's loops because a manifest was already there. */
-    #[test]
-    fn blanking_a_set_removes_its_frozen_loops() {
-        let s = tmp("blank-freeze");
-        s.write("u", GOOD, 1, CHAINS).unwrap();
-        let d = s.set_dir("u");
-        fs::create_dir_all(d.join("freeze")).unwrap();
-        fs::write(d.join(crate::freeze_files::MANIFEST), "x").unwrap();
-        fs::write(d.join("freeze").join("t3s0.wav"), "x").unwrap();
-        s.blank_files("u");
-        assert!(!d.join(crate::freeze_files::MANIFEST).exists(), "the manifest stayed");
-        assert!(!d.join("freeze").exists(), "the WAVs stayed");
     }
 }

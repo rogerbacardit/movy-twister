@@ -19,12 +19,10 @@ import { probeBridgeTick } from './probe-bridge.js';
 import { readPrefModuleBlacklist } from './prefs.js';
 import { pushMasterVolume } from '../mixer/master-volume.js';
 import { pushClickVolume } from './click-volume.js';
-import { pushLinkSetting } from './link-setting.js';
 import { resetPadRoute, syncPadRoute } from '../track/pad-route.js';
 import { resetExtRoute, syncExtRoute } from '../track/ext-route.js';
 import { resetWatchPush, syncWatch } from './watch.js';
 import { parseStatus, resetEngineStatus } from './engine-status.js';
-import { resetLocalWrites, stampLocalWrites } from './local-writes.js';
 import { resetNoteView } from './note-view.js';
 import { resetStepPiano } from './step-piano.js';
 import { requestLabelSync } from './label-sync.js';
@@ -97,7 +95,6 @@ export function seqCmdFlush(): void {
     if (!engineReady() || cmdQueue.length === 0) return;
     paramSet('cmd', cmdQueue.join(';'));
     cmdQueue.length = 0;
-    stampLocalWrites(engineMark);
 }
 
 export function seqEngineTick(): void {
@@ -130,7 +127,7 @@ function readSnapshot(): void {
     parseCountdown = PARSE_TICKS;
     lastSnapSeq = snap.seq;
     lastServed = snap.served;
-    parseStatus(snap.text, snap.served);
+    parseStatus(snap.text);
 }
 
 function boot(): void {
@@ -153,7 +150,6 @@ function boot(): void {
     paramSet('chblock', readPrefModuleBlacklist().join(','));
     pushMasterVolume(paramSet);
     pushClickVolume(paramSet);
-    pushLinkSetting(paramSet);
     /* Only the UI knows the install paths, so it hands them over once the
      * engine answers. Refreshing the private copy and dlopening the chain host
      * both happen inside this set, off the render path. */
@@ -176,7 +172,6 @@ export function resetSeqEngine(): void {
     lastSnapSeq = 0;
     parseCountdown = 0;
     lastServed = -1;
-    resetLocalWrites();
     resetEngineStatus();
     resetNoteView();
     resetStepPiano();

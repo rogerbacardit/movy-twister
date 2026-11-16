@@ -15,37 +15,6 @@ import { run as run_model_params } from './logic/model-params.mjs';
 import { run as run_knob_input } from './logic/knob-input.mjs';
 import { run as run_declarations } from './logic/declarations.mjs';
 import { run as run_drums } from './logic/drums.mjs';
-import { run as run_ai_role } from './logic/ai-role.mjs';
-import { run as run_ai_job } from './logic/ai-job.mjs';
-import { run as run_ai_preview } from './logic/ai-preview.mjs';
-import { run as run_ai_gestures } from './logic/ai-gestures.mjs';
-import { run as run_gen_bench } from './logic/gen-bench.mjs';
-import { run as run_gen_theory } from './logic/gen-theory.mjs';
-import { run as run_gen_style } from './logic/gen-style.mjs';
-import { run as run_gen_double } from './logic/gen-double.mjs';
-import { run as run_gen_create } from './logic/gen-create.mjs';
-import { run as run_gen_drift } from './logic/gen-drift.mjs';
-import { run as run_gen_scene_b } from './logic/gen-scene-b.mjs';
-import { run as run_gen_quality } from './logic/gen-quality.mjs';
-import { run as run_gen_paths } from './logic/gen-paths.mjs';
-import { run as run_gen_band } from './logic/gen-band.mjs';
-import { run as run_gen_evolve } from './logic/gen-evolve.mjs';
-import { run as run_gen_variety } from './logic/gen-variety.mjs';
-import { run as run_gen_layers } from './logic/gen-layers.mjs';
-import { run as run_gen_voicing } from './logic/gen-voicing.mjs';
-import { run as run_gen_maps } from './logic/gen-maps.mjs';
-import { run as run_gen_follow } from './logic/gen-follow.mjs';
-import { run as run_gen_audition } from './logic/gen-audition.mjs';
-import { run as run_gen_quantize } from './logic/gen-quantize.mjs';
-import { run as run_ai_new_clip } from './logic/ai-new-clip.mjs';
-import { run as run_ai_retune } from './logic/ai-retune.mjs';
-import { run as run_gen_engine } from './logic/gen-engine.mjs';
-import { run as run_gen_merges } from './logic/gen-merges.mjs';
-import { run as run_gen_layout } from './logic/gen-layout.mjs';
-import { run as run_gen_kit_voices } from './logic/gen-kit-voices.mjs';
-import { run as run_ai_session_undo } from './logic/ai-session-undo.mjs';
-import { run as run_ai_preview_knobs } from './logic/ai-preview-knobs.mjs';
-import { run as run_ai_sessions } from './logic/ai-sessions.mjs';
 import { run as run_host_param } from './logic/host-param.mjs';
 import { run as run_platform_caps } from './logic/platform-caps.mjs';
 import { run as run_master_chain } from './logic/master-chain.mjs';
@@ -60,9 +29,6 @@ import { run as run_set_session } from './logic/set-session.mjs';
 import { run as run_set_settling } from './logic/set-settling.mjs';
 import { run as run_seq_leds } from './logic/seq-leds.mjs';
 import { run as run_mute_solo } from './logic/mute-solo.mjs';
-import { run as run_freeze } from './logic/freeze.mjs';
-import { run as run_freeze_doors } from './logic/freeze-doors.mjs';
-import { run as run_load_errors } from './logic/load-errors.mjs';
 import { run as run_step_entry } from './logic/step-entry.mjs';
 import { run as run_automation } from './logic/automation.mjs';
 import { run as run_keyboard } from './logic/keyboard.mjs';
@@ -89,6 +55,7 @@ import { run as run_note_view } from './logic/note-view.mjs';
 import { run as run_step_piano } from './logic/step-piano.mjs';
 import { run as run_external_midi } from './logic/external-midi.mjs';
 import { run as run_ext_knobs } from './logic/ext-knobs.mjs';
+import { run as run_midi_in } from './logic/midi-in.mjs';
 import { run as run_track_watch } from './logic/track-watch.mjs';
 import { run as run_tracks_refs } from './logic/tracks-refs.mjs';
 import { run as run_tracks_chain } from './logic/tracks-chain.mjs';
@@ -103,7 +70,6 @@ import { run as run_schwung_canvas_page } from './logic/schwung-canvas-page.mjs'
 import { run as run_page_freshness } from './logic/page-freshness.mjs';
 import { run as run_page_batch } from './logic/page-batch.mjs';
 import { run as run_page_automation } from './logic/page-automation.mjs';
-import { run as run_page_live_extras } from './logic/page-live-extras.mjs';
 import { run as run_schwung_page_undo } from './logic/schwung-page-undo.mjs';
 import { run as run_drum_automation } from './logic/drum-automation.mjs';
 import { run as run_drum_focus } from './logic/drum-focus.mjs';
@@ -144,37 +110,6 @@ const SUITES = [
     run_knob_input,
     run_declarations,
     run_drums,
-    run_ai_role,
-    run_ai_job,
-    run_ai_preview,
-    run_ai_gestures,
-    run_gen_bench,
-    run_gen_theory,
-    run_gen_style,
-    run_gen_double,
-    run_gen_create,
-    run_gen_drift,
-    run_gen_scene_b,
-    run_gen_quality,
-    run_gen_paths,
-    run_gen_band,
-    run_gen_evolve,
-    run_gen_variety,
-    run_gen_layers,
-    run_gen_voicing,
-    run_gen_maps,
-    run_gen_follow,
-    run_gen_audition,
-    run_gen_quantize,
-    run_gen_engine,
-    run_gen_merges,
-    run_gen_layout,
-    run_gen_kit_voices,
-    run_ai_session_undo,
-    run_ai_preview_knobs,
-    run_ai_sessions,
-    run_ai_new_clip,
-    run_ai_retune,
     run_host_param,
     run_platform_caps,
     run_master_chain,
@@ -189,9 +124,6 @@ const SUITES = [
     run_set_settling,
     run_seq_leds,
     run_mute_solo,
-    run_freeze,
-    run_freeze_doors,
-    run_load_errors,
     run_step_entry,
     run_automation,
     run_keyboard,
@@ -218,6 +150,7 @@ const SUITES = [
     run_step_piano,
     run_external_midi,
     run_ext_knobs,
+    run_midi_in,
     run_track_watch,
     run_tracks_refs,
     run_tracks_chain,
@@ -232,7 +165,6 @@ const SUITES = [
     run_page_freshness,
     run_page_batch,
     run_page_automation,
-    run_page_live_extras,
     run_schwung_page_undo,
     run_drum_automation,
     run_drum_focus,

@@ -24,7 +24,6 @@ SCHWUNG_FILES=(
     src/host/js_display.c src/host/js_display.h
     src/host/js_host_common.c src/host/js_host_common.h
     src/host/unified_log.c src/host/unified_log.h
-    src/host/speaker_eq.c src/host/speaker_eq.h
     src/host/plugin_api_v1.h
     src/host/shadow_constants.h src/host/scene_morph.h
     src/host/shadow_midi_inject_writer.h src/host/ui_midi_ring.h
@@ -53,7 +52,7 @@ FLOOR=$(grep -o "SCHWUNG_FLOOR = '[^']*'" "$DIR/src/renderer/schwung-floor.ts" |
 # "+" marks a build from a tree whose host/ differs from HEAD, untracked
 # files included — a dirty host must never print as the commit it is not.
 MOVY_SHA="$(git -C "$DIR" rev-parse --short HEAD)$([[ -z "$(git -C "$DIR" status --porcelain -- host standalone)" ]] || echo +)"
-CFLAGS=(-I"$DIR/link" -O2 -g -Wall -Wextra -Wno-unused-parameter -Wno-cast-function-type -std=gnu11 -pthread
+CFLAGS=(-O2 -g -Wall -Wextra -Wno-unused-parameter -Wno-cast-function-type -std=gnu11 -pthread
         -DSCHWUNG_TAG="\"$TAG\"" -DMOVY_COMMIT="\"$MOVY_SHA\"" -DSCHWUNG_FLOOR="\"$FLOOR\""
         -I"$DIR/host" -I"$SRC/src" -I"$SRC/src/host" -I"$SRC/$QJS_DIR")
 # The test bus's UI_EVAL runs arbitrary JS in the UI: dev builds only.
@@ -71,7 +70,7 @@ fi
 mkdir -p "$DIST"
 # shellcheck disable=SC2086
 "$CC" "${CFLAGS[@]}" $SOURCES \
-    "$SRC/src/host/js_display.c" "$SRC/src/host/js_host_common.c" "$SRC/src/host/unified_log.c" "$SRC/src/host/speaker_eq.c" \
+    "$SRC/src/host/js_display.c" "$SRC/src/host/js_host_common.c" "$SRC/src/host/unified_log.c" \
     -L"$SRC/$QJS_DIR" -lquickjs -lm -ldl -lrt -lpthread \
     -rdynamic -o "$DIST/movy-host"   # -rdynamic: the crash backtrace names functions
 "$CC" -O2 -Wall -Wextra -std=gnu11 -I"$DIR/host" "$DIR/host/heal/heal.c" -o "$DIST/movy-heal"

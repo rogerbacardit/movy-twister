@@ -27,7 +27,8 @@ const clampPct = (v: unknown): number =>
 
 type PrefsFile = {
     defaultQuant?: unknown; fileDirs?: unknown; moduleBlacklist?: unknown;
-    fullVelocity?: unknown; masterVolume?: unknown; clickDb?: unknown; genLevel?: unknown; link?: unknown;
+    fullVelocity?: unknown; masterVolume?: unknown; clickDb?: unknown;
+    midiIn?: unknown;
 };
 
 function readPrefs(): PrefsFile {
@@ -106,15 +107,6 @@ export function writePrefClickDb(db: number): void {
     writePrefs((p) => { p.clickDb = clampClickDb(db); });
 }
 
-/* Ableton Link (Settings → LINK). Off unless the file says exactly true. */
-export function readPrefLink(): boolean {
-    return readPrefs().link === true;
-}
-
-export function writePrefLink(on: boolean): void {
-    writePrefs((p) => { p.link = on; });
-}
-
 /* Modules that must keep every instance on one render lane (chain_pin).
  *
  * A hazard list, not a setting: it is edited by hand in prefs.json when a
@@ -162,4 +154,15 @@ export function writePrefFileDir(key: string, dir: string): void {
         for (let i = 0; i < keys.length - MAX_FILE_DIRS; i++) delete dirs[keys[i]];
         p.fileDirs = dirs;
     });
+}
+
+/* Each track's MIDI IN channel (track/midi-in.ts). Machine-level, not per
+ * set: the channels describe the rig plugged into USB-A (a KeyStep Pro's
+ * tracks), which is the same whichever set is open (user, 2026-11-16). */
+export function readPrefMidiIn(): unknown {
+    return readPrefs().midiIn;
+}
+
+export function writePrefMidiIn(channels: number[]): void {
+    writePrefs((p) => { p.midiIn = channels.slice(); });
 }

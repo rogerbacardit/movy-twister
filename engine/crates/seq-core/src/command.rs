@@ -5,7 +5,7 @@
 //! tolerate newer UIs.
 
 use crate::engine::{Engine, OutEvent};
-use crate::track::{CLIPS_PER_TRACK, NUM_TRACKS};
+use crate::track::NUM_TRACKS;
 
 /// Apply one batched command string. MIDI side effects (e.g. note-offs from
 /// a stop) are pushed into `out`.
@@ -112,8 +112,6 @@ pub fn is_undoable_edit(verb: &str) -> bool {
         | "clen" | "cscl" | "ctr" | "cq" | "dbl" | "loop" | "ltog" | "pst"
         // whole-clip gestures
         | "clipdel" | "clipdelat" | "clipdup" | "clippaste"
-        // an AI preview option written over a clip (engine/ai_clip.rs)
-        | "aiclip" | "aiload"
         // automation edits
         | "aset" | "asetr" | "aclr" | "aclrs" | "aclrstep"
         // set-level settings
@@ -156,8 +154,6 @@ pub fn is_control_verb(verb: &str) -> bool {
         | "capclr" | "capdone"
         // undo machinery
         | "usnap" | "uswap" | "ucommit" | "udrop" | "uclr"
-        // AI preview stash bookkeeping: copies, no musical change
-        | "aistash" | "aiclr"
         // batch container (never reaches apply_op as a verb)
         | "cmd"
     )
@@ -168,23 +164,16 @@ fn apply_op(engine: &mut Engine, op: &str, out: &mut Vec<OutEvent>) {
     let verb = it.next().unwrap_or("");
     let mut next = || it.next().and_then(|s| s.parse::<i64>().ok());
 
-    /* A frozen track's clip is its loop's source (engine/freeze_lock.rs). */
-    let args: Vec<i64> = op.split_whitespace().skip(1).map_while(|s| s.parse().ok()).collect();
-    if engine.freeze_refuses(verb, &args) {
-        return;
-    }
     if clears_capture(verb) {
         engine.capture_clear();
     }
 
     match verb {
-        /* Through Link's door (engine/link.rs): alone it is play/stop/bpm as
-         * before; with peers Play lands on the session's next bar. */
-        "play" => engine.play_requested(),
-        "stop" => engine.stop_requested(out),
+        "play" => engine.play(),
+        "stop" => engine.stop(out),
         "bpm" => {
             if let Some(v) = next() {
-                engine.tempo_requested(v.clamp(0, u32::MAX as i64) as u32);
+                engine.clock.set_bpm_x100(v.clamp(0, u32::MAX as i64) as u32);
             }
         }
         "swing" => {
@@ -452,47 +441,6 @@ fn apply_op(engine: &mut Engine, op: &str, out: &mut Vec<OutEvent>) {
                 engine.delete_range(t as usize, s0.clamp(0, 255) as u16, s1.clamp(0, 255) as u16, lane);
             }
         }
-        // aiclip <t> <slot> <lenSteps> <scaleNum> <scaleDen> <quant> <notes>
-        // — notes is ONE token, `tick.gate.pitch.vel,...` or `-`.
-        "aiclip" => {
-            if let (Some(t), Some(s), Some(l), Some(n), Some(d), Some(q)) =
-                (next(), next(), next(), next(), next(), next())
-            {
-                let notes = crate::engine::parse_ai_notes(it.next().unwrap_or("-"));
-                let (t_, s_) = (t.max(0) as usize, s.max(0) as usize);
-                let was = engine.tracks.get(t_).and_then(|k| k.clips.get(s_)).map_or(0, |c| c.length_ticks());
-                engine.ai_replace_clip(&crate::engine::AiClipWrite {
-                    track: t.max(0) as usize,
-                    slot: s.max(0) as usize,
-                    len_steps: l.clamp(0, u16::MAX as i64) as u16,
-                    scale_num: n.clamp(1, 255) as u8,
-                    scale_den: d.clamp(1, 255) as u8,
-                    quant: q.clamp(0, 100) as u8,
-                    notes: &notes,
-                });
-                if t_ < NUM_TRACKS && s_ < CLIPS_PER_TRACK {
-                    engine.align_after_resize(t_, s_, was);
-                }
-            }
-        }
-        // aistash <t> <slot> <k> / aiload <t> <slot> <k> / aiclr [<t> <slot>]
-        "aistash" | "aiload" => {
-            if let (Some(t), Some(s), Some(k)) = (next(), next(), next()) {
-                let (t, s, k) = (t.max(0) as usize, s.max(0) as usize, k.max(0) as usize);
-                if verb == "aistash" { engine.ai_stash_clip(t, s, k) } else if t < NUM_TRACKS && s < CLIPS_PER_TRACK {
-                    let was = engine.tracks[t].clips[s].length_ticks();
-                    engine.ai_load_clip(t, s, k);
-                    engine.align_after_resize(t, s, was);
-                }
-            }
-        }
-        "aiclr" => {
-            let clip = match (next(), next()) {
-                (Some(t), Some(s)) => Some((t.max(0) as usize, s.max(0) as usize)),
-                _ => None,
-            };
-            engine.ai_clear_stash(clip);
-        }
         "clipdup" => {
             if let Some(t) = next() {
                 engine.duplicate_clip(t as usize);
@@ -600,10 +548,7 @@ fn apply_op(engine: &mut Engine, op: &str, out: &mut Vec<OutEvent>) {
         "dbl" => {
             if let Some(t) = next() {
                 if (t as usize) < NUM_TRACKS {
-                    let t = t as usize;
-                    let (slot, was) = (engine.tracks[t].active_clip, engine.tracks[t].active().length_ticks());
-                    engine.tracks[t].active_mut().double_loop();
-                    engine.align_after_resize(t, slot, was);
+                    engine.tracks[t as usize].active_mut().double_loop();
                 }
             }
         }
@@ -1285,20 +1230,6 @@ mod tests {
              is_undoable_edit (a user edit undo must restore) or to \
              is_control_verb (transport/view/bookkeeping)"
         );
-    }
-
-    /// Freeze's lock (engine/freeze_lock.rs) refuses every edit to a frozen
-    /// track's clips: a new clip edit verb that is undoable is one it must
-    /// know about. The exceptions are set-level, or resolve their track
-    /// themselves (`capsel` writes into the capture's own track).
-    #[test]
-    fn every_undoable_edit_is_known_to_the_freeze_lock() {
-        let missing: Vec<String> = dispatched_verbs()
-            .into_iter()
-            .filter(|v| is_undoable_edit(v) && !crate::engine::freeze_lock_verb(v))
-            .filter(|v| !["mute", "bpm", "swing", "capsel"].contains(&v.as_str()))
-            .collect();
-        assert!(missing.is_empty(), "clip edits the freeze lock lets through: {missing:?}");
     }
 
     #[test]

@@ -5,8 +5,7 @@ import { moduleReadKey, MASTER_FX_SLOTS, type ChainSlot } from '../chain/config.
 import { releaseAllLive } from '../keyboard/release.js';
 import { captureLfoAssignments, captureModuleState, dumpModuleParams } from '../undo/module-dump.js';
 import { mlog } from '../log.js';
-import { beginEdit, endEdit, CLOSE } from '../undo/group.js';
-import { addModuleOp } from '../undo/group-ops.js';
+import { addModuleOp, beginEdit, endEdit, CLOSE } from '../undo/group.js';
 import { platform } from '../platform/index.js';
 
 const MODULES_BASE = '/data/UserData/schwung/modules';

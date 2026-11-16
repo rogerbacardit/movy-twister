@@ -24,9 +24,6 @@ await esbuild.build({
          * dist/esm/renderer/schwung-lib.js to import. */
         resolve(root, 'src/renderer/schwung-lib.ts'),
         resolve(root, 'src/renderer/schwung-page.ts'),
-        /* The worn-encoder filter's module state, driven by the logic suite
-         * (knob-input.mjs) at the level the opt-in lives at. */
-        resolve(root, 'src/midi/knob-direction.ts'),
         /* The delegated page's read cache (SP-26): an entry point so the logic
          * suite can drive the stale-write hazard at the level it lives at,
          * rather than racing Schwung's settle window through the page. */
@@ -89,14 +86,6 @@ await esbuild.build({
         resolve(root, 'src/platform/index.ts'),
         /* The movy-host platform, asserted on its own (platform-caps.mjs). */
         resolve(root, 'src/platform/standalone.ts'),
-        /* AI MIDI (plans/2026-10-26-ai-midi-plan.md): one entry for every
-         * src/ai module the ai-* suites drive directly. */
-        resolve(root, 'src/ai/index.ts'),
-        /* The algorithmic generators (plans/2026-10-27-algorithmic-generators-
-         * design.md): one entry for the gen-* suites and the bench. */
-        resolve(root, 'src/gen/index.ts'),
-        /* The Set phase, so the ai-* suites can stand in a ready Set. */
-        resolve(root, 'src/seq/set-session.ts'),
         /* Move-only features the platform-caps suite asserts switch off. */
         resolve(root, 'src/model/page-rotation.ts'),
         resolve(root, 'src/model/config-hierarchy.ts'),
@@ -289,22 +278,6 @@ await esbuild.build({
         resolve(root, 'src/seq/duplicate.ts'),
         resolve(root, 'src/seq/voice-copy.ts'),
         resolve(root, 'src/seq/session.ts'),
-        /* Freeze's UI half (status fields, double tap, guard): an entry point
-         * so browser-test/logic/freeze.mjs drives it directly. */
-        resolve(root, 'src/seq/freeze.ts'),
-        resolve(root, 'src/seq/freeze-pads.ts'),
-        resolve(root, 'src/seq/freeze-busy.ts'),
-        resolve(root, 'src/seq/freeze-toast.ts'),
-        resolve(root, 'src/seq/load-errors.ts'),
-        resolve(root, 'src/seq/freeze-wave.ts'),
-        resolve(root, 'src/seq/frozen-view-vm.ts'),
-        resolve(root, 'src/seq/track-menu.ts'),
-        resolve(root, 'src/seq/freeze-screen.ts'),
-        resolve(root, 'src/seq/frozen-playhead.ts'),
-        resolve(root, 'src/renderer/playhead-column.ts'),
-        resolve(root, 'src/seq/loop-strip.ts'),
-        resolve(root, 'src/renderer/freeze-toast-view.ts'),
-        resolve(root, 'src/mixer/pad-mutes.ts'),
         resolve(root, 'src/seq/song.ts'),
         resolve(root, 'src/seq/persist-blob.ts'),
         resolve(root, 'src/seq/persist-store.ts'),
@@ -350,6 +323,13 @@ await esbuild.build({
         /* The external knob controller's mapping, pure — driven by the
          * logic suite (ext-knobs.mjs) without a router behind it. */
         resolve(root, 'src/midi/ext-knob-map.ts'),
+        resolve(root, 'src/midi/ext-param-steps.ts'),
+        resolve(root, 'src/midi/ext-follow.ts'),
+        resolve(root, 'src/midi/ext-colors.ts'),
+        resolve(root, 'src/midi/ext-out.ts'),
+        /* A track's MIDI IN and its track menu, driven by midi-in.mjs. */
+        resolve(root, 'src/track/midi-in.ts'),
+        resolve(root, 'src/seq/track-menu.ts'),
         resolve(root, 'src/track/chain-persist.ts'),
         resolve(root, 'src/track/chains-file.ts'),
         resolve(root, 'src/track/chain-payload.ts'),
@@ -384,13 +364,10 @@ await esbuild.build({
         resolve(root, 'src/seq/step-params-contract.ts'),
         resolve(root, 'src/seq/drum-sync.ts'),
         resolve(root, 'src/seq/quant.ts'),
-        resolve(root, 'src/seq/clip-quant.ts'),
         resolve(root, 'src/seq/prefs.ts'),
         resolve(root, 'src/seq/click-volume.ts'),
-        resolve(root, 'src/seq/link-setting.ts'),
         resolve(root, 'src/seq/quant-overlay.ts'),
         resolve(root, 'src/renderer/cpu-view.ts'),
-        resolve(root, 'src/renderer/frozen-view.ts'),
         resolve(root, 'src/seq/cpu-page.ts'),
         resolve(root, 'src/seq/cpu-page-vm.ts'),
         resolve(root, 'src/seq/cpu-scale.ts'),

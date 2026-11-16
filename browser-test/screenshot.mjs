@@ -34,7 +34,7 @@ const UPDATE     = process.argv.includes('--update');
 
 const PRESETS = [
     'keys_view', 'browse_view', 'session_booting', 'session_loading', 'session_modules',
-    'session_sounds', 'session_preparing', 'session_failed', 'session_failed_mismatch', 'versions_empty',
+    'session_preparing', 'session_failed', 'session_failed_mismatch', 'versions_empty',
     'versions_list', 'versions_confirm', 'sets_list', 'sets_long_names', 'sets_confirm',
     'chain_synth', 'chain_empty', 'chain_jog_toast', 'knobs_jog_toast', 'chain_t2',
     'chain_t4', 'lfo_chain', 'mix_page_chain', 'master_send_slot', 'master_send_empty',
@@ -42,11 +42,10 @@ const PRESETS = [
     'step_indicator', 'step_rec_header', 'loop_strip_midclip', 'loop_strip_outside',
     'note_view_bass', 'note_view_chords', 'note_view_drums', 'note_view_plus', 'note_view_dense', 'note_view_wide',
     'song_band', 'song_band_overflow', 'song_band_end',
-    'quant-overlay-three', 'quant-overlay-two', 'flags-top', 'flags-scrolled', 'gen_preview_knob', 'gen_preview_name',
-    'ai_preview_orig', 'ai_preview_opt1', 'ai_preview_opt3', 'ai_preview_var8', 'ai_preview_scrolled', 'ai_hold_progress_50', 'ai_hold_variation_50', 'ai_hold_double_50', 'ai_hold_newclip_50',
+    'quant-overlay-three', 'quant-overlay-two', 'flags-top', 'flags-scrolled',
     'cpu-movy-tracks', 'cpu-unsplit-module', 'cpu-overscale',
-    'cpu-empty', 'cpu-sends', 'cpu-sends-quiet', 'cpu-master', 'cpu-frozen', 'leave_modal',
-    'power_modal', 'track_menu', 'track_menu_unfreeze', 'frozen_view', 'frozen_view_cut', 'freezing_view', 'freeze_big_toast', 'capture_select', 'capture_fixed', 'undo_toast', 'redo_toast',
+    'cpu-empty', 'cpu-sends', 'cpu-sends-quiet', 'cpu-master', 'leave_modal',
+    'power_modal', 'capture_select', 'capture_fixed', 'undo_toast', 'redo_toast',
     'undo_empty', 'undo_unavailable', 'clip-undo-toast', 'track_volume_unity',
     'track_volume_quiet', 'track_volume_min', 'track_volume_max', 'master_volume',
     'font_5x3_all', 'font_small_all', 'font_big_all_1', 'font_big_all_2', 'page_body',
@@ -103,10 +102,9 @@ const BASE = {
     note_view_bass: 'test8', note_view_chords: 'test8', note_view_drums: 'test8',
     note_view_plus: 'test8', note_view_dense: 'test8', note_view_wide: 'test8',
                                 'quant-overlay-three': 'test8', 'quant-overlay-two': 'test8',
-    'flags-top': 'test8', 'flags-scrolled': 'test8', gen_preview_knob: 'test8',
-    ai_preview_orig: 'test8', ai_preview_opt1: 'test8', ai_preview_opt3: 'test8', ai_preview_var8: 'test8', ai_preview_scrolled: 'test8', ai_hold_progress_50: 'test8', ai_hold_variation_50: 'test8', ai_hold_double_50: 'test8', ai_hold_newclip_50: 'test8',
+    'flags-top': 'test8', 'flags-scrolled': 'test8',
                                                                             lfo_chain: 'test8',         lfo_assign_toast: 'test8',
-    leave_modal: 'test8', power_modal: 'test8', track_menu: 'test8', track_menu_unfreeze: 'test8', frozen_view: 'test8', frozen_view_cut: 'test8', freezing_view: 'test8', freeze_big_toast: 'test8',
+    leave_modal: 'test8', power_modal: 'test8',
     master_volume: 'test8',
     track_volume_unity: 'test8', track_volume_quiet: 'test8',
     track_volume_min: 'test8', track_volume_max: 'test8',
@@ -179,8 +177,6 @@ const { drawJogToast }     = await import('../dist/esm/renderer/overlay.js');
 const { drawLeaveModal }   = await import('../dist/esm/renderer/leave-modal-view.js');
 const { drawCaptureOverlay } = await import('../dist/esm/renderer/capture-overlay.js');
 const { drawQuantOverlay } = await import('../dist/esm/renderer/quant-overlay.js');
-const { drawPreviewStrip, drawHoldProgress } = await import('../dist/esm/ai/index.js');
-const { seqToast, drawSeqToast } = await import('../dist/esm/seq/render.js');
 const { drawStepPiano } = await import('../dist/esm/renderer/step-piano.js');
 const { stepPianoVM, resetStepPiano } = await import('../dist/esm/seq/step-piano.js');
 const { editStepDown, resetStepEdit } = await import('../dist/esm/seq/step-edit.js');
@@ -188,11 +184,6 @@ const { renderFlagsView } = await import('../dist/esm/renderer/flags-view.js');
 const { renderSetsView }  = await import('../dist/esm/renderer/sets-view.js');
 const { buildSetsPageVM } = await import('../dist/esm/seq/sets-page-vm.js');
 const { renderCpuView }   = await import('../dist/esm/renderer/cpu-view.js');
-const { renderFrozenView } = await import('../dist/esm/renderer/frozen-view.js');
-const { drawFreezeToast } = await import('../dist/esm/renderer/freeze-toast-view.js');
-const { paintPlayheadColumn } = await import('../dist/esm/renderer/playhead-column.js');
-const frozenVmMod = await import('../dist/esm/seq/frozen-view-vm.js');
-const freeze = await import('../dist/esm/seq/freeze.js');
 const { buildCpuPageVM }  = await import('../dist/esm/seq/cpu-page-vm.js');
 const { buildFlagsPageVM } = await import('../dist/esm/seq/flags-page-vm.js');
 const { flagsPageState, resetFlagsPage, flagsRowCount } = await import('../dist/esm/seq/flags-page.js');
@@ -248,7 +239,7 @@ const { appState }                     = await import('../dist/esm/app/state.js'
 const { keyboardState }                = await import('../dist/esm/keyboard/state.js');
 const { resetStepRec, stepRecDownAt } = await import('../dist/esm/seq/step-rec.js');
 const { stepRecTick }      = await import('../dist/esm/seq/step-rec-view.js');
-const { drawSeqHeader, resetSeqHeader, seqHeaderAnnounce, drawLoopStrip, drawSongBand, resetSongBand } =
+const { drawSeqHeader, resetSeqHeader, drawLoopStrip, drawSongBand, resetSongBand } =
     await import('../dist/esm/seq/render.js');
 const { noteViewTick, resetNoteView, seedNoteViewForTest } = await import('../dist/esm/seq/note-view.js');
 const { NOTE_VIEW_SCENES } = await import('./fixtures/note-view-scenes.mjs');
@@ -378,19 +369,18 @@ function applyView(preset) {
          * the Set's sequencer state. */
         case 'session_booting':  lastRender = () => renderLoadingView('booting', ''); lastRender(); break;
         case 'session_loading':  lastRender = () => renderLoadingView('loading', ''); lastRender(); break;
-        /* The three stages of settling: the modules arriving one per audio
-         * callback, then their saved sounds being applied, then the UI's own
-         * catch-up. */
-        case 'session_modules':  lastRender = () => renderLoadingView('settling', '', { step: 'modules', loaded: 3, total: 8 }); lastRender(); break;
-        case 'session_sounds':   lastRender = () => renderLoadingView('settling', '', { step: 'sounds', loaded: 0, total: 0 }); lastRender(); break;
-        case 'session_preparing': lastRender = () => renderLoadingView('settling', '', { step: 'preparing', loaded: 0, total: 0 }); lastRender(); break;
+        /* The two halves of settling: the Set is loaded but its modules are
+         * still arriving one per audio callback, then the tail where their
+         * payloads land. */
+        case 'session_modules':  lastRender = () => renderLoadingView('settling', '', 7); lastRender(); break;
+        case 'session_preparing': lastRender = () => renderLoadingView('settling', '', 0); lastRender(); break;
         case 'session_failed':
-            lastRender = () => renderLoadingView('failed', 'SET FILE UNREADABLE', null, 'set');
+            lastRender = () => renderLoadingView('failed', 'SET FILE UNREADABLE', 0, 'set');
             lastRender(); break;
         /* The other failure, and it must not look like the one above: nothing
          * is wrong with the set, and no button here wipes anything. */
         case 'session_failed_mismatch':
-            lastRender = () => renderLoadingView('failed', 'ENGINE MISMATCH', null, 'engine');
+            lastRender = () => renderLoadingView('failed', 'ENGINE MISMATCH', 0, 'engine');
             lastRender(); break;
         case 'versions_empty':
             lastRender = () => renderVersionsView(
@@ -514,86 +504,6 @@ function applyView(preset) {
             lastRender();
             break;
         }
-        /* The preview (design §5.2): the candidate in the note view, the
-         * selector in the bottom band with the option showing boxed. */
-        case 'ai_preview_orig': case 'ai_preview_opt1': case 'ai_preview_opt3': case 'ai_preview_var8': case 'ai_preview_scrolled': {
-            const sc = NOTE_VIEW_SCENES.note_view_chords;
-            const idx = { ai_preview_orig: 0, ai_preview_opt1: 1, ai_preview_opt3: 3, ai_preview_var8: 6, ai_preview_scrolled: 9 }[preset];
-            /* Variation's six, the last one showing; scrolled: option 9 of 14, past the six picks. */
-            const labels = preset === 'ai_preview_scrolled' ? Array.from({ length: 14 }, (_, i) => String(i + 1))
-                : preset === 'ai_preview_var8' ? ['1', '2', '3', '4', '5', '6'] : ['1', '2', '3'];
-            const vis = preset === 'ai_preview_scrolled' ? 6 : labels.length;
-            resetSeqState(); resetSeqHeader(); resetNoteView();
-            seqState.loopMode = true;
-            seqState.loopStart = sc.loopStart; seqState.lenSteps = sc.lenSteps;
-            seqState.barOffset = sc.barOffset;
-            seqState.playing = true; seqState.posTick = sc.posTick;
-            seqState.noteHash = preset;
-            seedNoteViewForTest(sc.notes);
-            lastRender = () => { clear_screen(); noteViewTick(true); drawPreviewStrip(idx, labels, vis); };
-            lastRender();
-            break;
-        }
-        /* An algorithmic option's knob held (design §5): its name and value
-         * in the top strip, the note view below it, six options in the band. */
-        case 'gen_preview_knob': {
-            const sc = NOTE_VIEW_SCENES.note_view_chords;
-            resetSeqState(); resetSeqHeader(); resetNoteView();
-            seqState.loopMode = true;
-            seqState.loopStart = sc.loopStart; seqState.lenSteps = sc.lenSteps;
-            seqState.barOffset = sc.barOffset;
-            seqState.playing = true; seqState.posTick = sc.posTick;
-            seqState.noteHash = preset;
-            seedNoteViewForTest(sc.notes);
-            seqHeaderAnnounce('HARMONY', 196, 'IV SEQ');
-            lastRender = () => { clear_screen(); drawSeqHeader(); noteViewTick(true); drawPreviewStrip(2, ['1', '2', '3', '4', '5', '6']); };
-            lastRender();
-            break;
-        }
-        /* The jog held in the preview: the generator behind option 3 named
-         * in the top strip, as a held knob is. */
-        case 'gen_preview_name': {
-            const sc = NOTE_VIEW_SCENES.note_view_chords;
-            resetSeqState(); resetSeqHeader(); resetNoteView();
-            seqState.loopMode = true;
-            seqState.loopStart = sc.loopStart; seqState.lenSteps = sc.lenSteps;
-            seqState.barOffset = sc.barOffset;
-            seqState.playing = true; seqState.posTick = sc.posTick;
-            seqState.noteHash = preset;
-            seedNoteViewForTest(sc.notes);
-            seqHeaderAnnounce('GENERATOR: TURNAROUND', 196);
-            lastRender = () => { clear_screen(); drawSeqHeader(); noteViewTick(true); drawPreviewStrip(3, ['1', '2', '3', '4', '5', '6']); };
-            lastRender();
-            break;
-        }
-        /* Shift + Step 16 held half way to Smart Quantize. */
-        case 'ai_hold_progress_50': {
-            resetSeqState();
-            lastRender = () => { renderKnobsView(model.getViewModel()); drawHoldProgress(0.5, 'SMART QUANTIZE'); };
-            lastRender();
-            break;
-        }
-        /* Shift + Step 14 held half way to a Variation. */
-        case 'ai_hold_variation_50': {
-            resetSeqState();
-            lastRender = () => { renderKnobsView(model.getViewModel()); drawHoldProgress(0.5, 'VARIATION'); };
-            lastRender();
-            break;
-        }
-        /* Shift + Step 15 held half way to Smart Double. */
-        case 'ai_hold_double_50': {
-            resetSeqState();
-            lastRender = () => { renderKnobsView(model.getViewModel()); drawHoldProgress(0.5, 'SMART DOUBLE'); };
-            lastRender();
-            break;
-        }
-        /* Shift + Step 14 held on a track with nothing to vary: a New Clip. */
-        case 'ai_hold_newclip_50': {
-            resetSeqState();
-            lastRender = () => { renderKnobsView(model.getViewModel()); drawHoldProgress(0.5, 'NEW CLIP'); };
-            lastRender();
-            break;
-        }
         /* The Settings page. Two states, because the selection band and the
          * hint that follows it are what the page IS — `top` has the selection
          * on BACKUPS, `scrolled` on the LAST row. */
@@ -620,10 +530,7 @@ function applyView(preset) {
         case 'cpu-sends-quiet':
         /* movy's own master chain holding a module: a fourth FX column joins
          * the send region at the narrow pitch, labelled `M`. */
-        case 'cpu-master':
-        /* Tracks 1 and 3 frozen: their columns carry the F and the loop's real,
-         * tiny cost instead of the synth's. */
-        case 'cpu-frozen': {
+        case 'cpu-master': {
             /* Every column inside the 1 ms floor, so `cpu-overscale` is the
              * only baseline where the scale has had to GROW — otherwise the two
              * scenes differ by nothing and neither pins it. */
@@ -649,7 +556,6 @@ function applyView(preset) {
              * what pins that a chain which spiked and then went quiet still
              * shows what it did — the dash alone would hide it. */
             rows[8] = '0/0/620';
-            if (preset === 'cpu-frozen') { rows[0] = '2/2/3'; rows[2] = '1/1/2'; }
             if (preset === 'cpu-empty') {
                 seqState.cpuCost = ''; seqState.cpuWall = ''; seqState.cpuMask = '';
             } else {
@@ -662,14 +568,7 @@ function applyView(preset) {
                 preset === 'cpu-sends' || preset === 'cpu-master' ? '760/1180,190/240,-'
                 : preset === 'cpu-sends-quiet' ? '0/1180,-,-'
                 : '-,-,-';
-            /* The frozen mask is set only around this scene's own render, so no
-             * later scene inherits a frozen track. */
-            const frz = preset === 'cpu-frozen' ? '5' : '0';
-            lastRender = () => {
-                freeze.freezeStatusField('frz', frz);
-                renderCpuView(buildCpuPageVM());
-                freeze.freezeStatusField('frz', '0');
-            };
+            lastRender = () => renderCpuView(buildCpuPageVM());
             lastRender();
             break;
         }
@@ -716,47 +615,6 @@ function applyView(preset) {
             showChain(1, false);
             const base = lastRender;
             lastRender = () => { base(); drawLeaveModal(['Power off', 'Cancel'], 0, 'Power off?'); };
-            lastRender();
-            break;
-        }
-        /* Shift + track button: the track menu, drawn like Settings. */
-        case 'track_menu':
-        case 'track_menu_unfreeze': {
-            const un = preset === 'track_menu_unfreeze';
-            const vm = { rows: [{ name: (un ? 'UNFREEZE' : 'FREEZE') + ' T3', value: un ? 'CONFIRM?' : '>', selected: true }],
-                         selected: 0, hint: un ? 'Click again: play stops, the synth comes back.' : 'Records every clip. Saves CPU.' };
-            lastRender = () => renderFlagsView(vm, 'T3');
-            lastRender();
-            break;
-        }
-        /* A frozen track: the waveform of the clip it plays (a four-beat
-         * pattern with decaying hits), the playhead, the slot bar. A Loop-mode
-         * cut shows only the part that plays. Then the big toast a knob touch
-         * or a jog press brings up. */
-        /* A Loop-mode cut leaves the first half of the bar unplayed (the strip
-         * has the same geometry). The playhead is the strip's, an inverted
-         * column through the wave. While freezing, the recorded part grows.
-         * Recorded silence is a flat line, so the recorded stretch reads whole. */
-        case 'frozen_view':
-        case 'frozen_view_cut':
-        case 'freezing_view':
-        case 'freeze_big_toast': {
-            const cut = preset === 'frozen_view_cut';
-            const rec = preset === 'freezing_view';
-            const cols = Array.from({ length: 128 }, (_, x) => {
-                if ((cut && x < 64) || (rec && x >= 80)) return -1;   // not recorded: blank
-                if (!rec && x >= 112) return 0;                       // a silent tail: a flat line
-                const ph = (x * 4 / 128) % 1;
-                return Math.round(40 + 200 * Math.exp(-ph * 6) * (1 - 0.15 * Math.floor(x * 4 / 128)));
-            });
-            const vm = { label: 'T4', name: 'OBXD', slot: 1, slotCount: 6, cols, empty: false, recording: rec };
-            const px = cut ? 100 : rec ? 80 : 40;
-            const draw = () => {
-                renderFrozenView(vm);
-                paintPlayheadColumn(px, frozenVmMod.WAVE_TOP, frozenVmMod.WAVE_BOT, frozenVmMod.waveSpans(vm, px), true);
-                if (rec) drawJogToast('FREEZING T4 2/3 60%');
-            };
-            lastRender = preset === 'freeze_big_toast' ? () => { draw(); drawFreezeToast('T4'); } : draw;
             lastRender();
             break;
         }

@@ -10,6 +10,7 @@ import { openSchwungEditor, schwungEditorActive, schwungEditorJog,
          schwungEditorCommit, schwungEditorCancel } from '../renderer/schwung-editor.js';
 import { openSchwungDive } from '../browser/schwung-dive.js';
 import { canvasDiveTakes } from './canvas-dive-input.js';
+import { extBaseNote } from './ext-param.js';
 
 /*
  * WHICH PARAMETER IS UNDER KNOB k — one answer, for every gesture.
@@ -48,8 +49,7 @@ import { mixerJog, mixerKnobTouch, mixerKnobTurn } from '../seq/mixer-input.js';
 import { noteViewActive } from '../seq/note-view.js';
 import { clipPageActive, clipPageRelease } from '../seq/clip-page.js';
 import { clickVolumeTurn } from '../seq/click-volume.js';
-import { backupsRowSelected, clickRowSelected, flagsPageActive, flagsPageJog, linkRowSelected, migrateRowSelected } from '../seq/flags-page.js';
-import { linkSettingToggle, linkSettingTurn } from '../seq/link-setting.js';
+import { backupsRowSelected, clickRowSelected, flagsPageActive, flagsPageJog, migrateRowSelected } from '../seq/flags-page.js';
 import { migrateRowClick } from '../seq/migrate-action.js';
 import { setsPageActive, setsPageBack, setsPageClick, setsPageJog } from '../seq/sets-page.js';
 import { textEntry, textEntryActive } from '../renderer/text-entry-lib.js';
@@ -60,7 +60,7 @@ import { closeParamPage, paramPageActive } from '../seq/param-page.js';
 import { CHAIN_SLOTS, MASTER_FX_SLOTS, LAST_CHAIN_INDEX, LAST_MASTER_INDEX,
          LFO_CHAIN_INDEX, MASTER_LFO_INDEX, isLfoSlot, isMasterLfoSlot } from '../chain/config.js';
 import { keyboardState } from '../keyboard/state.js';
-import { browserState, browsedTrack } from '../browser/state.js';
+import { browserState } from '../browser/state.js';
 import { noteOn, noteOff, changeOctave } from '../keyboard/handler.js';
 import { soundingPitch, soundingTrack } from '../keyboard/held-notes.js';
 import { releaseAllLive } from '../keyboard/release.js';
@@ -81,16 +81,7 @@ import { holdTouch, holdRelease, holdTurnCancel, assignActive, assignCycle, assi
 import { masterScope, trackScope } from '../lfo/scope.js';
 import { deleteActive, markDeleteActed } from '../seq/edit-ops.js';
 import { seqToast } from '../seq/render.js';
-import { aiRunningInput } from '../ai/job.js';
-import { aiPreviewActive } from '../ai/preview.js';
-import { previewInput } from '../ai/preview-input.js';
-import { leaveModalActive, openLeaveModal, closeLeaveModal, leaveModalMove, leaveModalConfirm, leaveModalPass,
-         } from '../app/leave-modal.js';
-import { freezeCancelCapture, freezeGuard, freezeBusy } from '../seq/freeze.js';
-import { openTrackMenu } from '../seq/track-menu.js';
-import { trackMenuMidi } from '../seq/track-menu-input.js';
-import { freezeSwallows } from '../seq/freeze-busy.js';
-import { isMixSlot } from '../chain/config.js';
+import { leaveModalActive, openLeaveModal, closeLeaveModal, leaveModalMove, leaveModalConfirm, leaveModalPass } from '../app/leave-modal.js';
 import {
     quantOverlayActive, quantOverlayAction, quantOverlayJog, quantOverlayHold,
     dismissQuantOverlay,
@@ -101,9 +92,10 @@ import { jogHintTouch } from '../app/jog-hint.js';
 import { MASTER_CC, volumeTrackDown, volumeTrackUp, volumeTouch, volumeKnobDelta } from '../mixer/track-volume.js';
 import { masterVolumeKnob, masterVolumeTouch } from '../mixer/master-volume.js';
 import { toggleSolo } from '../mixer/track-mutes.js';
+import { openTrackMenu } from '../seq/track-menu.js';
+import { trackMenuMidi } from '../seq/track-menu-input.js';
 import { mlog } from '../log.js';
 import { platform } from '../platform/index.js';
-import { knobDirectionHeld } from './knob-direction.js';
 
 const PAD_MIN        = MovePads[0];
 const PAD_MAX        = MovePads[MovePads.length - 1];
@@ -176,25 +168,6 @@ function masterChainActive(): boolean {
         && appState.currentView !== VIEW_FILE_BROWSE;
 }
 
-/* The track whose chain the knobs / jog click would edit, or -1 for none a
- * freeze can stand behind. Not in Session mode: the master chain is on screen
- * there. In the module browser, the track it was opened on (`browsedTrack`):
- * a send or master FX slot belongs to no track, so a send FX can be picked
- * while a frozen track is focused. Not on the MIX slot: level, pan and sends
- * are the engine's mixer, which a frozen track keeps. */
-function chainEditTrack(): number {
-    if (seqState.sessionMode) return -1;
-    if (appState.currentView === VIEW_BROWSE || appState.currentView === VIEW_FILE_BROWSE) return browsedTrack();
-    const t = appState.activeTrack.index;
-    return isMixSlot(appState.trackChainIndex[t]) ? -1 : t;
-}
-
-/** Refused (and the big toast shown) when that chain is a frozen track's. */
-function frozenChainRefuses(): boolean {
-    const t = chainEditTrack();
-    return t >= 0 && freezeGuard(t);
-}
-
 /* The master slot grid is on screen (jog scrolls slots, click adds/drills). */
 function masterGridActive(): boolean { return masterChainActive() && !appState.masterDetail; }
 
@@ -242,22 +215,6 @@ export function onMidiMessageInternal(data: number[]): void {
         }
     } else refusedThisBoot = false;
 
-    /* A freeze being recorded: every press but Back is swallowed, releases
-     * pass (seq/freeze-busy.ts). */
-    if (freezeBusy(Date.now())) {
-        /* Back is the one way out, taken here: below, the sequencer's router
-         * and the pages each have a use for Back of their own. */
-        if ((data[0] & 0xF0) === 0xB0 && data[1] === MoveBack && data[2] > 0) {
-            freezeCancelCapture();
-            appState.dirty = true;
-            return;
-        }
-        if (freezeSwallows(data)) { appState.dirty = true; return; }
-    }
-
-    /* The track menu (Shift + track button) owns input while it is open. */
-    if (trackMenuMidi(data)) { appState.dirty = true; return; }
-
     /* Schwung's keyboard (the Sets page's rename) owns every control while it
      * is up, releases included — it tracks its own presses, a pad would
      * otherwise play under a screen that is typing, and Back is its cancel. */
@@ -282,15 +239,6 @@ export function onMidiMessageInternal(data: number[]): void {
     // no undo — a step button that both dismissed this and wrote a note into
     // the clip you just captured is not a trade worth offering. Releases fall
     // through so no handler is left holding a button that never came up.
-    /* A knob count the worn-encoder filter holds back is consumed before ANY
-     * knob consumer sees it (midi/knob-direction.ts; off unless opted in). */
-    if (knobDirectionHeld(data)) return;
-    /* An AI request in flight owns the device: only Back (cancel) does
-     * anything, and releases still pass (ai/job.ts). */
-    if (aiRunningInput(data)) return;
-    /* The AI preview keeps the jog (switch/commit), Back (commit) and idles
-     * the knobs; everything else edits the clip underneath. */
-    if (previewInput(data)) { appState.dirty = true; return; }
     /* A module's fullscreen canvas (DR32's engine picker) owns the jog
      * assembly, Back and the knobs while it is up — canvas-dive-input.ts. */
     if (canvasDiveTakes(data)) { appState.dirty = true; return; }
@@ -346,6 +294,9 @@ export function onMidiMessageInternal(data: number[]): void {
         }
     }
 
+    /* The track menu owns the controls while it is up (seq/track-menu-input.ts). */
+    if (trackMenuMidi(data)) { appState.dirty = true; return; }
+
     if (seqHandleMidi(data, appState.shiftHeld)) return;
     const status = data[0];
     const d1     = data[1];
@@ -392,9 +343,6 @@ export function onMidiMessageInternal(data: number[]): void {
             return;
         }
         if (clipPageActive()) {
-            /* The clip page edits the frozen clip itself (speed, length,
-             * transpose, quantize): refused before it is touched. */
-            if (d1 < 4 && d2 > 0 && freezeGuard(appState.activeTrack.index)) { appState.dirty = true; return; }
             if (d1 < 4) {
                 /* SP-53: Clip Params has no per-track model to re-pin against
                  * (its owner is the same fixed component whoever is touching
@@ -420,12 +368,6 @@ export function onMidiMessageInternal(data: number[]): void {
             /* SP-54: gated to the 5 real cells so knobs 5-7 (blank) never
              * reach a component with no such keys. */
             if (d1 < 5) stepParamsOwner().page?.knobTouch(d1, d2 > 0);
-            appState.dirty = true;
-            return;
-        }
-        /* A frozen track's chain is unloaded: a touch says so (the big toast)
-         * and goes no further. The MIX slot is the engine's mixer and works. */
-        if (d2 > 0 && frozenChainRefuses()) {
             appState.dirty = true;
             return;
         }
@@ -502,10 +444,9 @@ export function onMidiMessageInternal(data: number[]): void {
 
     /* Main encoder (jog) touch: note=9. Arms the hint only — it appears a
      * beat later (jogHintTick), so grabbing the jog to scroll shows nothing.
-     * The repaint is needed only when the release takes a visible hint away.
-     * In the generator preview the touch itself names the generator showing. */
+     * The repaint is needed only when the release takes a visible hint away. */
     if ((status & 0xF0) === 0x90 && d1 === JOG_TOUCH) {
-        if (appState.currentView === VIEW_CHAIN || appState.currentView === VIEW_KNOBS || aiPreviewActive()) {
+        if (appState.currentView === VIEW_CHAIN || appState.currentView === VIEW_KNOBS) {
             if (jogHintTouch(d2 > 0)) appState.dirty = true;
         }
         return;
@@ -666,7 +607,6 @@ export function onMidiMessageInternal(data: number[]): void {
             return;
         }
         if (clipPageActive()) {
-            if (k < 4 && freezeGuard(appState.activeTrack.index)) return;
             if (k < 4) {
                 clipParamsOwner().page?.knobTurn(k, delta);
                 appState.dirty = true;
@@ -674,11 +614,9 @@ export function onMidiMessageInternal(data: number[]): void {
             return;
         }
         if (flagsPageActive()) {
-            // Knob 1 edits the selected row: CLICK VOLUME's level, LINK's
-            // on/off. Everything else is consumed anyway, so a stray turn
-            // cannot reach the module underneath.
+            // Only CLICK VOLUME takes a knob (1). Everything else is consumed
+            // anyway, so a stray turn cannot reach the module underneath.
             if (k === 0 && clickRowSelected() && clickVolumeTurn(delta)) appState.dirty = true;
-            if (k === 0 && linkRowSelected() && linkSettingTurn(delta)) appState.dirty = true;
             return;
         }
         if (cpuPageActive()) {
@@ -696,9 +634,6 @@ export function onMidiMessageInternal(data: number[]): void {
         mlog('knobCC k=' + k + ' d2=' + d2 + ' delta=' + delta);
         const model = knobModel();
         const track = appState.activeTrack.index;
-        /* A frozen track's chain is unloaded: an edit would go nowhere and the
-         * unfreeze would bring the old sound back. Say so instead. */
-        if (frozenChainRefuses()) return;
         /*
          * THE LANE MUST TARGET THE PARAMETER THAT IS ACTUALLY UNDER THE KNOB.
          *
@@ -711,6 +646,7 @@ export function onMidiMessageInternal(data: number[]): void {
          */
         const owner = pageOwnerOf(model);
         const info = owner.knobParamInfo(k);
+        extBaseNote(owner, k, info);    /* what a Twister push returns to (midi/ext-param.ts) */
         if (info && handleAutomationKnob(track, k, info, delta,
                 mappingFor(info, (key, val) => portFor(track).setParam(key, val)))) {
             return;
@@ -749,7 +685,7 @@ export function onMidiMessageInternal(data: number[]): void {
             /* Snapshot before switching so the hold-release closure returns
              * exactly here. beginTrackSwitch also closes the global Main/Clip
              * Params pages, which a track button always leaves. */
-            /* Shift + track button: that track's menu (Freeze / Unfreeze,
+            /* Shift + track button: that track's menu (MIDI IN,
              * seq/track-menu.ts), without switching to it. */
             if (appState.shiftHeld) {
                 openTrackMenu(track);
@@ -872,11 +808,6 @@ export function onMidiMessageInternal(data: number[]): void {
             appState.dirty = true;
             return;
         }
-        if (flagsPageActive() && linkRowSelected()) {
-            linkSettingToggle();
-            appState.dirty = true;
-            return;
-        }
         if (flagsPageActive() && backupsRowSelected()) {
             openVersionsPage();
             appState.dirty = true;
@@ -884,12 +815,6 @@ export function onMidiMessageInternal(data: number[]): void {
         }
         if (flagsPageActive() && migrateRowSelected()) {
             migrateRowClick(currentSetUuid());
-            appState.dirty = true;
-            return;
-        }
-        /* A frozen track's chain is unloaded: the click would open the module
-         * browser on an empty slot. Say why instead (seq/freeze.ts). */
-        if (frozenChainRefuses()) {
             appState.dirty = true;
             return;
         }

@@ -3,7 +3,6 @@
 //! seq-core; this layer only parses params, drains engine events into host
 //! MIDI sends, and renders the metronome click.
 
-mod block_prof;
 mod click;
 mod pad_latency;
 mod ffi;
@@ -17,7 +16,6 @@ mod chain_digest;
 mod chain_idle;
 mod midi_out;
 mod chain_host;
-mod chain_load_check;
 mod chain_slots;
 mod chain_pin;
 mod chain_colo;
@@ -45,16 +43,6 @@ mod set_lib_jobs;
 mod version_index;
 mod version_retain;
 mod version_store;
-mod freeze;
-mod chain_reaper;
-mod freeze_bank;
-mod freeze_mem;
-mod freeze_files;
-mod link_shm;
-pub(crate) mod link_bridge;
-use freeze::{LoopAt, LoopMap};
-use freeze_bank::{ClipJob, Outcome as FreezeOutcome};
-use seq_core::track::CLIPS_PER_TRACK;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use chain_slots::ChainSlots;
@@ -151,21 +139,12 @@ pub(crate) fn parse_mix(val: &str) -> Option<crate::mixer::TrackMix> {
 }
 
 const DEFAULT_BPM_X100: u32 = 12000;
-const ENGINE_VERSION: &str = "0.121.0";
+const ENGINE_VERSION: &str = "0.103.0";
 
 /* Blocks between autosaves. The callback runs at ~344 Hz, so this is ~2 s —
  * flash on this device is not free and the sequencer is dirty constantly while
  * a user is working. */
 const SAVE_BLOCKS: u64 = 688;
-/// The autosave's share of one block for reading module states
-/// (chain_state::SerializeJob); at least one is read per block regardless.
-const SAVE_BUDGET: std::time::Duration = std::time::Duration::from_micros(300);
-/// ~1 s: how long an open's frozen read waits for the previous Set's loops
-/// to be freed before it reads anyway (`frozen_due`).
-const FROZEN_WAIT_BLOCKS: u32 = 344;
-/// The recording waveform's refresh cap, ~20 Hz: each refresh costs the UI a
-/// frame-boundary get (`frzpk_`), and the screen draws 128 columns.
-const WAVE_BLOCKS: u32 = 17;
 
 /// A track's chain. **`ch<N>` IS track N** — one host, no offset. Tracks 0..3
 /// were schwung shadow slots until the one-time migration in
@@ -214,36 +193,11 @@ struct Instance {
     /// `persist-store.ts` made the same comparison with `lastGoodPayload`.
     last_saved: Option<(String, String)>,
     set_uuid: String,
-    /// The Set whose bytes the engine holds: `set_uuid` until an open lands,
-    /// then that one. A freeze's files belong to the Set it was recorded in;
-    /// saved under `set_uuid` mid-open they overwrote the incoming Set's own
-    /// frozen loops.
-    held_uuid: String,
     set_gen: u32,
     /// An open (or blank) was asked for and its bytes are not in the engine
     /// yet. `set_uuid` already names the new Set, so an autosave now would
     /// write the PREVIOUS sequence under it.
     open_pending: bool,
-    /// The UI's chain document for the Set being opened, held until the
-    /// open lands: the UI sends it right after `set open`, and its loads
-    /// would run before the Set's frozen tracks are known — a frozen track's
-    /// synth loaded (0.3-0.5 s on this thread) only for `freeze_install` to
-    /// retire it again. Applied in the block the open lands (or fails), just
-    /// before the restore, so `freeze_install` takes those loads back before
-    /// one runs. While held it counts as a pending load (`chpend`): the UI
-    /// sends the chains' saved state once the loads drain (set-settle.ts), and
-    /// a 0 then would deliver it before a single chain exists.
-    held_chains: Option<String>,
-    /// The open's second half: the Set (`held_uuid` when asked) whose manifest
-    /// names frozen tracks, and the chains document it opened with. Its loops
-    /// are not read with the Set: the engine still held the previous Set's
-    /// then, and both sat in locked RAM at once. The landing holds those
-    /// tracks' loads (chain_slots `freeze_hold`); once the previous loops are
-    /// freed the saver is asked (`ReadFrozen`), and the answer is installed or
-    /// the held chains load.
-    frozen_due: Option<(String, String)>,
-    frozen_asked: bool,
-    frozen_wait: u32,
     /// How many Set payloads this engine has APPLIED — not requested, not read
     /// off disk: applied, on this thread, by `service_set`.
     ///
@@ -260,47 +214,8 @@ struct Instance {
     /// `sbad` so the UI can name the failure from the poll it already makes,
     /// instead of reading the state files itself. Cleared by the next open.
     set_bad: String,
-    /// A freeze running with the transport started FOR it (it was stopped):
-    /// the output is silent until that capture ends, then the transport stops
-    /// again. The owner's choice (plans/2026-10-23-stems-freeze-export-wifi.md).
-    freeze_silent: Option<usize>,
-    /// Per freezing track whose heard clip is in: where its loop was when the
-    /// playhead was lent to the next capture, so it can be heard (and the
-    /// playhead given back) in phase. Clock ticks.
-    freeze_anchor: [Option<HeardAnchor>; chain_slots::MOVY_CHAINS],
-    /// Each frozen clip's waveform overview, computed by the saver
-    /// (freeze_files.rs), and a counter the UI watches (`frzp`).
-    freeze_peaks: Vec<[Option<Vec<u8>>; CLIPS_PER_TRACK]>,
-    freeze_peaks_seq: u32,
-    freeze_wave_sig: Option<(usize, u8, u16)>,
-    /// The block `frzp` last moved for a recording waveform (`WAVE_BLOCKS`).
-    freeze_wave_at: u64,
     /// Next block at which an autosave may run. Rate limits flash writes.
     save_at: u64,
-    /// An autosave being read, a few module states per block (SAVE_BUDGET).
-    save_job: Option<chain_state::SerializeJob>,
-}
-
-/// Where a heard loop was when its track's playhead was lent to a capture
-/// (`service_freeze_events`): it keeps running on the clock from there.
-#[derive(Clone, Copy, Debug)]
-struct HeardAnchor {
-    slot: usize,
-    /// Position inside the window, and the clock, at the hand-over.
-    rel: f64,
-    clock: f64,
-    win_start: f64,
-    win_len: f64,
-}
-
-impl HeardAnchor {
-    fn rel_at(&self, clock: f64) -> f64 {
-        (self.rel + clock - self.clock).rem_euclid(self.win_len)
-    }
-
-    fn at(&self, clock: f64) -> LoopAt {
-        LoopAt { pos: self.win_start + self.rel_at(clock), win_start: self.win_start, win_len: self.win_len }
-    }
 }
 
 impl Instance {
@@ -320,23 +235,11 @@ impl Instance {
             saver: None,
             last_saved: None,
             set_uuid: String::new(),
-            held_uuid: String::new(),
             set_gen: 0,
             open_pending: false,
-            held_chains: None,
-            frozen_due: None,
-            frozen_asked: false,
-            frozen_wait: 0,
             set_bad: String::new(),
-            freeze_silent: None,
-            freeze_anchor: [None; chain_slots::MOVY_CHAINS],
-            freeze_peaks: (0..chain_slots::MOVY_CHAINS).map(|_| Default::default()).collect(),
-            freeze_peaks_seq: 0,
-            freeze_wave_sig: None,
-            freeze_wave_at: 0,
             set_applied: 0,
             save_at: 0,
-            save_job: None,
             probe_gen: 0,
         }
     }
@@ -394,11 +297,12 @@ impl Instance {
              * there: the release that would have done so now reaches another track. */
             "extmap" => match self.ext.set_map(val) {
                 Err(()) => host::log("extmap: refused a malformed map"),
-                Ok(Some(left)) => {
-                    self.chains.on_midi(left, &[0xE0, 0, 0x40], MOVE_MIDI_SOURCE_INTERNAL);
-                    self.chains.on_midi(left, &[0xB0, 1, 0], MOVE_MIDI_SOURCE_INTERNAL);
+                Ok(left) => {
+                    for c in left {
+                        self.chains.on_midi(c, &[0xE0, 0, 0x40], MOVE_MIDI_SOURCE_INTERNAL);
+                        self.chains.on_midi(c, &[0xB0, 1, 0], MOVE_MIDI_SOURCE_INTERNAL);
+                    }
                 }
-                Ok(None) => {}
             },
             /* `clickdb <0..11>` — metronome boost over the default level. The
              * UI pushes it on every engine boot, since a re-dlopened engine
@@ -411,9 +315,6 @@ impl Instance {
                 }
             }
             "clickaud" => self.click.trigger(true),
-            /* `link <0|1>` — Settings → LINK. Pushed by the UI on every engine
-             * boot and on every click; the bridge hands it to movy-link. */
-            "link" => self.chains.link.set_enabled(val.trim() == "1"),
             /* `padvel <0|1>` — Full Velocity (Shift + Step 10). The engine has to
              * be told because it is the one building the note-on: for a movy
              * track the UI does not send pad notes at all, so applying it only
@@ -566,39 +467,6 @@ impl Instance {
              * dropped in silence — then the next save read back what had
              * survived and wrote the shrunken set to disk. One document can be
              * acknowledged, and retried whole when it is not. */
-            /* Freeze (freeze_bank.rs): `frz` <track> captures two passes of the
-             * track's active clip and freezes it, `unfrz` <track> reloads its
-             * chain, `frzx` <track> cancels a capture. The outcome comes back
-             * on the status line (`frz=`, `frzc=`, `frze=`). */
-            "frz" => {
-                if let Ok(t) = val.trim().parse::<usize>() {
-                    if let Err(code) = self.freeze_track(t) {
-                        self.chains.freeze_refused(t, code);
-                    }
-                }
-            }
-            "unfrz" => {
-                if let Ok(t) = val.trim().parse::<usize>() {
-                    /* The reload blocks the audio thread for 0.3-0.5 s (module
-                     * loads run there), so with the transport running it stops
-                     * first, as Live's unfreeze does. The dialog has already
-                     * said so (leave-modal.ts); here it holds for every caller. */
-                    if self.chains.freeze_thaw(t) && self.engine.playing {
-                        self.engine.stop(&mut self.out);
-                    }
-                }
-            }
-            "frzx" => {
-                if let Ok(t) = val.trim().parse::<usize>() {
-                    /* The playhead goes back NOW: a block with the job gone
-                     * and the playhead still lent would play the unheard clip
-                     * through the chain, no longer silenced. */
-                    if self.chains.freeze_cancel(t) {
-                        self.service_freeze_events();
-                    }
-                }
-            }
-            "chains" if self.open_pending => self.held_chains = Some(val.to_string()),
             "chains" => {
                 if !self.chains.set_chain_set(val) {
                     host::log("chains: malformed set document ignored");
@@ -650,13 +518,7 @@ impl Instance {
                          * blank is the blank. Saved under the new id here, which
                          * makes the job's own seed the fallback for an engine
                          * holding nothing — a re-`dlopen`ed one. */
-                        set_saver::Job::Rename { from, to } => {
-                            if self.held_uuid == *from {
-                                self.held_uuid = to.clone();
-                            }
-                            if let Some((due, _)) = self.frozen_due.as_mut().filter(|(u, _)| u == from) {
-                                *due = to.clone();
-                            }
+                        set_saver::Job::Rename { to, .. } => {
                             self.set_uuid = to.clone();
                             carry = self.save_in_hand(to.clone(), false);
                         }
@@ -770,9 +632,6 @@ impl Instance {
 
     fn get_param(&mut self, key: &str) -> Option<String> {
         match key {
-            /* movy-host's glitch line (host/glitch.c), read on the audio thread
-             * right after a block that ran over budget — never on a good one. */
-            "blockprof" => Some(self.chains.block_report()),
             /* A pure read: movy-host reads this after every block to publish
              * its snapshot (WP10). `unop` is the latest group the engine found
              * changed nothing; the UI pushed it optimistically and retracts it
@@ -787,8 +646,7 @@ impl Instance {
                  * is the one thing it already reads every few ticks. */
                 s.push_str(&format!(" chgen={} chact={} chslp={} chpend={}",
                     self.chains.generation(), self.chains.active_count(),
-                    self.chains.asleep_count(),
-                    self.chains.pending_loads() + usize::from(self.held_chains.is_some())));
+                    self.chains.asleep_count(), self.chains.pending_loads()));
                 /* Rides the same poll, for the same reason: the CPU page
                  * repaints from `status` and must not buy an IPC of its own. */
                 s.push_str(&self.chains.cost_status());
@@ -805,20 +663,8 @@ impl Instance {
                 /* An unreadable open, named by uuid: a status taken before the
                  * next open reached this thread still says which Set it means. */
                 s.push_str(&format!(" sbad={}", if self.set_bad.is_empty() { "-" } else { &self.set_bad }));
-                s.push_str(&self.chains.freeze_status());
-                /* A module that refused its load (Amino's fifth instance) leaves
-                 * the track silent; this is the only place the UI can learn why. */
-                s.push_str(&self.chains.load_status());
-                s.push_str(&self.chains.link.status());
-                s.push_str(&self.engine.freeze_lock.status());
-                s.push_str(&format!(" frzp={}", self.freeze_peaks_seq));
                 Some(s)
             }
-            /* `frzpk_<track>_<slot>`: a frozen clip's waveform, as
-             * `<rec_start_steps> <rec_len_steps> <hex peaks>` — the window it was
-             * recorded over, so the UI can show only the part its current
-             * window plays. Asked on `frzp` changes only. */
-            k if k.starts_with("frzpk_") => self.freeze_peaks_get(k),
             /* The UI compares this `uuid` against the Set it believes is open
              * and re-sends `open` when they differ. That comparison is what
              * replaces restore-gate.ts: a command nobody acknowledged is simply
@@ -845,12 +691,6 @@ impl Instance {
             "alabels" => Some(self.engine.auto_labels()),
             /* Fetched only when status `nh=` moves (engine/note_view.rs). */
             "notes" => Some(self.engine.note_view_list()),
-            /* AI MIDI: one track's clips, read once per AI request
-             * (engine/ai_clip.rs). Per track so a full Set never nears
-             * PQ_VALUE_CAP. */
-            k if k.starts_with("ait:") => {
-                k[4..].parse::<usize>().ok().map(|t| self.engine.ai_track_dump(t))
-            }
             /* The lane BASES, in `alabels`' own shape. Read on the same
              * sync: the UI mirrors every base it sends, so this answers
              * only for the lanes it never sent — the ones a restored Set
@@ -973,37 +813,12 @@ impl Instance {
         Some(set_saver::Job::Save { uuid, payload, gen: self.set_gen, chains })
     }
 
-    /// A freeze or thaw since the last block: the Set's freeze files follow
-    /// (the WAV of a track just frozen, then the manifest). `true` when there
-    /// were files to save.
-    fn save_freeze_files(&mut self) -> bool {
-        let t_frz = std::time::Instant::now();
-        let Some((manifest, wavs)) = self.chains.take_freeze_files() else { return false };
-        /* The chain's saved settings must be the snapshot the manifest
-         * fingerprints (freeze_files.rs `chain_print`): a synth whose state
-         * moves on its own left chains.json with the last save's blob, and
-         * the next open found "another sound" and opened the track live.
-         * A freeze or thaw is an edit of the Set. */
-        self.engine.dirty = true;
-        let us = t_frz.elapsed().as_micros();
-        if us >= 1000 {
-            host::log(&format!("freeze: files took {us} us on the audio thread"));
-        }
-        if let (false, Some(saver)) = (self.held_uuid.is_empty(), &self.saver) {
-            saver.submit(set_saver::Job::Freeze { uuid: self.held_uuid.clone(), manifest, wavs });
-        }
-        true
-    }
-
     fn service_set(&mut self) {
         let Some(saver) = &self.saver else { return };
 
         let (loaded, failed) = saver.take_handoff();
         if let Some(uuid) = failed {
             self.set_bad = uuid;
-            if let Some(doc) = self.held_chains.take() {
-                self.chains.set_chain_set(&doc);
-            }
         }
         if let Some((payload, chains, gen)) = loaded {
             /* persist::load resets before applying, so a failed open leaves the
@@ -1011,25 +826,11 @@ impl Instance {
             if seq_core::persist::load(&mut self.engine, &payload) {
                 self.engine.dirty = false;
             }
-            if let Some(doc) = self.held_chains.take() {
-                self.chains.set_chain_set(&doc);
-            }
             if !chain_state::restore(&mut self.chains, &chains) && !chains.is_empty() {
                 host::log("set: malformed chains.json ignored");
             }
-            /* The Set's frozen tracks (freeze_files.rs): their loads, queued by
-             * the restore just now, are held before a single one runs, and the
-             * loops come in a later block (`frozen_due`). */
-            self.freeze_peaks.iter_mut().for_each(|p| *p = Default::default());
-            self.freeze_peaks_seq = self.freeze_peaks_seq.wrapping_add(1);
-            let due = saver.take_frozen_due().filter(|(_, mask)| *mask != 0);
-            self.chains.freeze_hold(due.as_ref().map_or(0, |(_, mask)| *mask));
-            self.frozen_due = due.map(|(uuid, _)| (uuid, chains));
-            self.frozen_asked = false;
-            self.frozen_wait = 0;
             self.set_gen = gen;
             self.open_pending = false;
-            self.held_uuid = self.set_uuid.clone();
             /* The payload is IN the engine as of this line, so the labels it
              * carried are answerable now and not before. Bumped even when
              * `persist::load` refused the bytes: the previous Set then still
@@ -1044,68 +845,6 @@ impl Instance {
             self.save_at = self.blocks + SAVE_BLOCKS;
         }
 
-        if let Some((uuid, chains)) = &self.frozen_due {
-            if !self.frozen_asked {
-                /* The previous Set's loops went to the freeze helper when this
-                 * one landed; asked once they are freed, or after a second
-                 * regardless (a helper that never answers must not cost the
-                 * Set its frozen tracks). */
-                self.frozen_wait += 1;
-                if self.chains.freeze_frees_done() || self.frozen_wait >= FROZEN_WAIT_BLOCKS {
-                    saver.submit(set_saver::Job::ReadFrozen { uuid: uuid.clone() });
-                    self.frozen_asked = true;
-                }
-            } else if let Some((read, frozen)) = saver.take_frozen() {
-                /* An answer for another Set is a stale one, from an open since
-                 * replaced; this one's is still to come. */
-                let mine = read == *uuid && read == self.held_uuid;
-                for f in frozen {
-                    if !mine {
-                        self.chains.freeze_discard(f);
-                        continue;
-                    }
-                    let t = f.track;
-                    let peaks: Vec<(usize, Vec<u8>)> = f.clips.iter().map(|c| (c.slot, c.peaks.clone())).collect();
-                    let windows = self.engine.clip_windows(t);
-                    let mut clips = [None; CLIPS_PER_TRACK];
-                    for (slot, w) in windows.iter().enumerate() {
-                        clips[slot] = w.and_then(|w| Some((self.engine.clip_fingerprint(t, slot)?, w)));
-                    }
-                    if self.chains.freeze_install(f, chains, clips) {
-                        for (slot, p) in peaks {
-                            if let Some(e) = self.freeze_peaks.get_mut(t).and_then(|r| r.get_mut(slot)) {
-                                *e = Some(p);
-                            }
-                        }
-                        self.freeze_peaks_seq = self.freeze_peaks_seq.wrapping_add(1);
-                    }
-                }
-                if mine {
-                    self.chains.freeze_unhold();
-                    for t in 0..seq_core::track::NUM_TRACKS.min(chain_slots::MOVY_CHAINS) {
-                        let w = self.chains.freeze_windows(t);
-                        self.engine.freeze_lock.set_track(t, w);
-                    }
-                    self.frozen_due = None;
-                }
-            }
-        } else if let Some((_, frozen)) = saver.take_frozen() {
-            for f in frozen {
-                self.chains.freeze_discard(f); // for an open since replaced by one with none
-            }
-        }
-
-        for (uuid, t, slot, p) in saver.take_peaks() {
-            if uuid == self.held_uuid {
-                if let Some(e) = self.freeze_peaks.get_mut(t).and_then(|r| r.get_mut(slot)) {
-                    *e = Some(p);
-                    self.freeze_peaks_seq = self.freeze_peaks_seq.wrapping_add(1);
-                }
-            }
-        }
-        self.save_freeze_files();
-        let Some(saver) = &self.saver else { return };
-
         /* The engine's own dirty flag decides when to save. Nothing reads state
          * out of the engine to find out, which matters because that read used
          * to CLEAR the flag: a write we then failed to complete was an edit
@@ -1113,188 +852,33 @@ impl Instance {
         /* Not while an open is in flight: see `open_pending`. The flag stays
          * set, so the edit is saved once the Set is in — or dropped by the
          * load, which is right, since it belonged to the Set being left. */
-        if self.open_pending {
-            // An open in flight: a half-read document of the Set being left
-            // must not be finished. Its edit is owed again (the dirty flag
-            // was cleared when the read began), in case the open fails and
-            // that Set stays.
-            if self.save_job.take().is_some() {
-                self.engine.dirty = true;
-            }
-            return;
-        }
-        if self.save_job.is_none() && self.engine.dirty && self.blocks >= self.save_at {
-            /* Cleared when the read STARTS: an edit made while it runs marks
-             * the engine dirty again and is the next save's. */
+        if !self.open_pending && self.engine.dirty && self.blocks >= self.save_at {
+            let payload = seq_core::persist::serialize(&self.engine);
+            let chains = chain_state::serialize(&mut self.chains);
             self.engine.dirty = false;
             self.save_at = self.blocks + SAVE_BLOCKS;
-            self.save_job = Some(chain_state::SerializeJob::new(&self.chains));
-        }
-        let Some(job) = self.save_job.as_mut() else { return };
-        let t_ser = std::time::Instant::now();
-        let Some(chains) = job.step(&mut self.chains, SAVE_BUDGET) else { return };
-        self.save_job = None;
-        let payload = seq_core::persist::serialize(&self.engine);
-        /* What is left on the audio thread: the last slice of the chain read
-         * and the sequencer state. Logged when it still costs a block's worth. */
-        let us = t_ser.elapsed().as_micros();
-        if us >= 1000 {
-            host::log(&format!("save: final serialize step took {us} us on the audio thread"));
-        }
-        /* Identical bytes are not a save. The dirty flag says an edit was
-         * OFFERED, not that anything came of it — a knob moved and moved
-         * back, or a Set that has only just been loaded. */
-        let changed = self.last_saved.as_ref()
-            .is_none_or(|(p, c)| *p != payload || *c != chains);
-        if changed {
-            self.set_gen += 1;
-            saver.submit(set_saver::Job::Save {
-                uuid: self.set_uuid.clone(),
-                payload: payload.clone(),
-                gen: self.set_gen,
-                chains: chains.clone(),
-            });
-            self.last_saved = Some((payload, chains));
-        }
-    }
-
-    /// Start freezing track `t`: every clip of it (plans/2026-11-08-freeze-
-    /// all-clips-design.md). Playing, the clip it plays is recorded first and
-    /// heard; the rest follow unheard (`freeze_events`). Stopped, the
-    /// transport is started for this track alone, one clip after another,
-    /// with the output silenced (`freeze_silent`). Refused: a muted track
-    /// (the capture would record silence), one recording (the take is not
-    /// finished), one whose clips run at a speed that does not divide them,
-    /// and — the transport running — a track that plays nothing.
-    fn freeze_track(&mut self, t: usize) -> Result<(), &'static str> {
-        let track = self.engine.tracks.get(t).ok_or("nochain")?;
-        if track.muted {
-            return Err("muted");
-        }
-        if self.engine.recording_on(t) {
-            return Err("rec");
-        }
-        let heard = if self.engine.playing { Some(track.playing_slot.ok_or("notplaying")?) } else { None };
-        let windows = self.engine.clip_windows(t);
-        let (bpm, rate) = (self.engine.clock.bpm_x100(), host::sample_rate());
-        let mut clips = Vec::with_capacity(CLIPS_PER_TRACK);
-        let mut prints = [None; CLIPS_PER_TRACK];
-        for (slot, w) in windows.iter().enumerate() {
-            let Some(win) = *w else { continue };
-            let len = self.engine.freeze_len_ticks(t, slot).ok_or("speed")?;
-            let map = LoopMap::new(len, bpm, rate).ok_or("noclip")?;
-            prints[slot] = self.engine.clip_fingerprint(t, slot);
-            clips.push(ClipJob { slot, map, win });
-        }
-        if clips.is_empty() || heard.is_some_and(|h| windows.get(h).copied().flatten().is_none()) {
-            return Err(if clips.is_empty() { "noclip" } else { "notplaying" });
-        }
-        self.chains.freeze_begin(t, heard, &clips, prints)?;
-        self.freeze_anchor[t] = None;
-        /* Playing, the track's launches wait for the freeze from the start: a
-         * scene or the song moving the heard clip would cancel it. */
-        if heard.is_some() {
-            self.engine.freeze_lock.set_swapped(t, true);
-        }
-        self.sync_freeze_lock();
-        if heard.is_none() {
-            if !self.engine.play_alone_slot(t, clips[0].slot) {
-                self.chains.freeze_cancel(t);
-                let _ = self.chains.take_freeze_event(t);
-                self.sync_freeze_lock();
-                return Err("noclip");
-            }
-            self.freeze_silent = Some(t);
-        }
-        Ok(())
-    }
-
-    /// The sequencer's freeze lock follows the bank (engine/freeze_lock.rs):
-    /// every clip window of a freezing, frozen or thawing track. Once per
-    /// block, and after an open installs frozen tracks.
-    fn sync_freeze_lock(&mut self) {
-        for t in 0..seq_core::track::NUM_TRACKS.min(chain_slots::MOVY_CHAINS) {
-            let w = self.chains.freeze_windows(t);
-            self.engine.freeze_lock.set_track(t, w);
-        }
-    }
-
-    /// After the chains rendered: move each freezing track's playhead the
-    /// way its freeze says. A clip done hands the playhead to the next clip
-    /// (playing: remembering where the heard loop is; stopped: from the
-    /// start, alone); the end of a freeze, or a cancel, gives it back to the
-    /// heard clip in phase.
-    fn service_freeze_events(&mut self) {
-        for t in 0..chain_slots::MOVY_CHAINS {
-            let Some(ev) = self.chains.take_freeze_event(t) else { continue };
-            match ev {
-                FreezeOutcome::ClipDone { slot, next } => {
-                    if self.freeze_silent == Some(t) {
-                        self.engine.stop(&mut self.out);
-                        if !self.engine.play_alone_slot(t, next) {
-                            self.chains.freeze_cancel(t);
-                        }
-                        continue;
-                    }
-                    if self.freeze_anchor[t].is_none() {
-                        if let Some(p) = self.engine.loop_position(t).filter(|p| p.slot == slot) {
-                            self.freeze_anchor[t] = Some(HeardAnchor { slot, rel: p.pos - p.win_start,
-                                clock: self.engine.clock_ticks_f64(), win_start: p.win_start, win_len: p.win_len });
-                        }
-                    }
-                    self.engine.freeze_swap_in(t, next, &mut self.out);
-                }
-                FreezeOutcome::Cancelled(freeze_bank::Cancel::SetChanged) => {
-                    self.freeze_anchor[t] = None;
-                    self.engine.freeze_lock.set_swapped(t, false);
-                }
-                _ => {
-                    if let Some(a) = self.freeze_anchor[t].take() {
-                        let rel = a.rel_at(self.engine.clock_ticks_f64());
-                        self.engine.freeze_swap_out(t, Some(a.slot), rel.floor() as u64, &mut self.out);
-                    }
-                    /* Never left set: launches would wait for good. */
-                    self.engine.freeze_lock.set_swapped(t, false);
-                }
+            /* Identical bytes are not a save. The dirty flag says an edit was
+             * OFFERED, not that anything came of it — a knob moved and moved
+             * back, or a Set that has only just been loaded. */
+            let changed = self.last_saved.as_ref()
+                .is_none_or(|(p, c)| *p != payload || *c != chains);
+            if changed {
+                self.set_gen += 1;
+                saver.submit(set_saver::Job::Save {
+                    uuid: self.set_uuid.clone(),
+                    payload: payload.clone(),
+                    gen: self.set_gen,
+                    chains: chains.clone(),
+                });
+                self.last_saved = Some((payload, chains));
             }
         }
-    }
-
-    /// `frzpk_<track>_<slot>` (see `get_param`).
-    fn freeze_peaks_get(&self, key: &str) -> Option<String> {
-        let mut it = key.strip_prefix("frzpk_")?.split('_').map(|v| v.parse::<usize>().ok());
-        let (t, slot) = (it.next()??, it.next()??);
-        let w = self.engine.freeze_lock.window(t, slot)?;
-        let tps = seq_core::TICKS_PER_STEP;
-        /* The capture's own drawing first: live while it records, ready the
-         * moment a clip is done; the saver's for a loop read from disk. */
-        let hex: String = match self.chains.freeze_wave(t, slot) {
-            Some(w) => w.iter().map(|p| format!("{p:02x}")).collect(),
-            None => self.freeze_peaks.get(t)?.get(slot)?.as_ref()?.iter().map(|p| format!("{p:02x}")).collect(),
-        };
-        Some(format!("{} {} {hex}", w.start_ticks / tps, w.len_ticks / tps))
     }
 
     fn render(&mut self, out_audio: &mut [i16]) {
-        /* Tests only: a render drains the process-global MIDI queue and
-         * publishes the global clock, so the tests that check either one
-         * under its lock must never see a render from a neighbour mid-way.
-         * Taken here, once, in the one order (queue, then clock), rather than
-         * in every test that renders an instance. */
-        #[cfg(test)]
-        let _locks = (
-            crate::midi_out::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner()),
-            host_vtable::CLOCK_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner()),
-        );
-        use block_prof::Stage;
-        let mut lap = std::time::Instant::now();
         self.blocks += 1;
-        let frames = (out_audio.len() / 2) as u32;
-        let (snap, out_us, _) = self.chains.link.begin_block(self.engine.clock.bpm_x100());
-        self.engine.link_block(&snap, out_us, frames, &mut self.out);
-        self.engine.advance_block(frames, &mut self.out);
-        let req = *self.engine.link.requests();
-        self.chains.link.write_requests(&req);
+        self.engine
+            .advance_block((out_audio.len() / 2) as u32, &mut self.out);
         /* Before the chains render: a synced chain LFO reads this block's
          * position through the vtable movy hands its chains. */
         host_vtable::publish_clock(
@@ -1304,43 +888,12 @@ impl Instance {
         move_info::publish_metronome(self.engine.metronome);
         self.drain_out();
         self.click.render(out_audio);
-        self.chains.prof.lap(Stage::Seq, &mut lap);
         /* At most ONE queued module load per block. This is the blocking call —
          * it dlopens — and releasing one per callback is what stops a twelve
          * chain restore stacking into a single block (see load_queue). */
         self.service_set();
-        self.chains.prof.lap(Stage::Set, &mut lap);
         self.chains.service_loads();
-        /* Every track's loop position at the end of this block, for the
-         * tracks that are frozen or being captured (freeze_bank.rs). */
-        self.sync_freeze_lock();
-        let engine = &self.engine;
-        let muted = engine.tracks.iter().enumerate().fold(0u32, |m, (t, k)| m | ((k.muted as u32) << t));
-        let (anchors, clock) = (&self.freeze_anchor, engine.clock_ticks_f64());
-        self.chains.freeze_frame(|t| engine.loop_position(t),
-                                 |t| anchors[t].map(|a| a.at(clock)),
-                                 muted, engine.clock.bpm_x100());
-        self.chains.prof.lap(Stage::Load, &mut lap);
         self.chains.render(out_audio);
-        self.service_freeze_events();
-        /* The screen redraws a recording waveform when `frzp` moves: when the
-         * write position reaches another of its 128 columns, at most every
-         * WAVE_BLOCKS, and at once when a clip (or the job) starts or ends. */
-        let sig = self.chains.freeze_progress().map(|(t, d, at)| (t, d, (at as u32 * 128 / 1000) as u16));
-        let clip_moved = sig.map(|(t, d, _)| (t, d)) != self.freeze_wave_sig.map(|(t, d, _)| (t, d));
-        if clip_moved || (sig != self.freeze_wave_sig && self.blocks >= self.freeze_wave_at + WAVE_BLOCKS as u64) {
-            self.freeze_wave_sig = sig;
-            self.freeze_wave_at = self.blocks;
-            self.freeze_peaks_seq = self.freeze_peaks_seq.wrapping_add(1);
-        }
-        if let Some(t) = self.freeze_silent {
-            // The silent pass: nothing of it is heard, click included.
-            out_audio.fill(0);
-            if !self.chains.freeze_capturing(t) {
-                self.engine.stop(&mut self.out);
-                self.freeze_silent = None;
-            }
-        }
         let chains = &self.chains;
         self.padlat.after_render(self.blocks, |c| chains.peak(c));
     }
@@ -1385,9 +938,7 @@ unsafe extern "C" fn create_instance(
 ) -> *mut c_void {
     guard(core::ptr::null_mut(), || {
         let dir = cstr(module_dir).to_string();
-        let mut instance = Box::new(Instance::new());
-        // Only the instance movy-host loads talks to movy-link; tests stay inert.
-        instance.chains.link = link_bridge::LinkBridge::open();
+        let instance = Box::new(Instance::new());
         host::log(&format!(
             "movy-dsp v{ENGINE_VERSION}: create_instance dir={dir} rate={}",
             host::sample_rate()
@@ -1434,11 +985,7 @@ unsafe extern "C" fn on_midi(instance: *mut c_void, msg: *const u8, len: c_int, 
             if source == MOVE_MIDI_SOURCE_EXTERNAL {
                 if let Some(i) = inst(instance) {
                     let chains = &mut i.chains;
-                    i.ext.route(status, d1, d2, |c, m| {
-                        if chains.freeze_admits(c, &m) {
-                            chains.on_midi(c, &m, MOVE_MIDI_SOURCE_INTERNAL);
-                        }
-                    });
+                    i.ext.route(status, d1, d2, |c, m| chains.on_midi(c, &m, MOVE_MIDI_SOURCE_INTERNAL));
                 }
                 return;
             }
@@ -1448,9 +995,7 @@ unsafe extern "C" fn on_midi(instance: *mut c_void, msg: *const u8, len: c_int, 
                         i.padlat.note_on(i.blocks, chain);
                     }
                     let m = if on { [0x90, pitch, vel] } else { [0x80, pitch, 0] };
-                    if i.chains.freeze_admits(chain, &m) {
-                        i.chains.on_midi(chain, &m, MOVE_MIDI_SOURCE_INTERNAL);
-                    }
+                    i.chains.on_midi(chain, &m, MOVE_MIDI_SOURCE_INTERNAL);
                     return;
                 }
             }
@@ -1558,27 +1103,6 @@ pub unsafe extern "C" fn move_plugin_init_v2(
     host::log(&format!("movy-dsp v{ENGINE_VERSION}: init"));
     &PLUGIN_API
 }
-
-#[cfg(test)]
-mod tests_support {
-    pub fn saver_tmp(name: &str) -> String {
-        let d = std::env::temp_dir().join(format!("movy-gate-{name}"));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        d.to_str().unwrap().to_string()
-    }
-}
-
-#[cfg(test)]
-#[cfg(test)]
-#[path = "lib_save_tests.rs"]
-mod save_tests;
-#[cfg(test)]
-#[path = "lib_link_tests.rs"]
-mod link_tests;
-#[cfg(test)]
-#[path = "lib_freeze_tests.rs"]
-mod freeze_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1870,20 +1394,6 @@ mod tests {
         assert!(busy.contains(" chpend=2"), "queued loads are reported: {busy}");
     }
 
-    /* movy-host's glitch line reads this after an over-budget block, and greps
-     * nothing: the stage names are what a person reads in debug.log. */
-    #[test]
-    fn blockprof_names_every_stage_and_the_chains() {
-        let mut inst = Instance::new();
-        let mut out = vec![0i16; 256];
-        inst.render(&mut out);
-        let p = inst.get_param("blockprof").expect("blockprof");
-        for stage in ["seq=", "set=", "load=", "mod=", "plan=", "render=", "mix=", "send=", "master=", "top="] {
-            assert!(p.contains(stage), "{stage} missing: {p}");
-        }
-        assert!(p.ends_with("top=-"), "no chain rendered, none named: {p}");
-    }
-
     /* The page rides the poll the UI already makes. A dedicated get_param would
      * buy one blocking round trip per repaint for numbers `status` can carry in
      * 250 bytes, and `SHADOW_PARAM_VALUE_LEN` is 65536. */
@@ -1942,7 +1452,10 @@ mod tests {
      * Asserted through the saver's own status rather than a counter, because a
      * counter would have to be added to production code to be readable. */
     fn saver_tmp(name: &str) -> String {
-        super::tests_support::saver_tmp(name)
+        let d = std::env::temp_dir().join(format!("movy-gate-{name}"));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d.to_str().unwrap().to_string()
     }
 
     /* Without a saver there is nothing to ask, and the UI must be able to tell

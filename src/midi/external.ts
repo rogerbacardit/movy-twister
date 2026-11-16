@@ -9,20 +9,20 @@ import { drumConfigFor } from '../track/pad-route.js';
 import { extDrumPitch } from '../track/ext-route.js';
 import { seqNotePadPlayed, seqNotePadReleased } from '../seq/router-pads.js';
 import { EXT_KEY_BASE, extHold, extRelease } from './external-ledger.js';
-import { freezeBusy, freezeGuard } from '../seq/freeze.js';
 import { onExternalControlChange } from './ext-knobs.js';
+import { trackForChannel } from '../track/midi-in.js';
 
 export function onMidiMessageExternal(data: number[]): void {
     if (!data || data.length < 3) return;
     const type = data[0] & 0xF0, note = data[1] & 0x7F, vel = data[2];
     if (type === 0xB0) { onExternalControlChange(data); return; }
-    const key = EXT_KEY_BASE + note;
+    /* Keyed by channel too: the same key on two channels is two notes, on
+     * two tracks once channels are claimed (track/midi-in.ts). */
+    const ch = (data[0] & 0x0F) + 1;
+    const key = EXT_KEY_BASE + (ch - 1) * 128 + note;
     if (type === 0x90 && vel > 0) {
-        const track = appState.activeTrack.index;
-        /* Not into a frozen clip, and nothing while a freeze is recorded (the
-         * engine refuses both too: freeze_lock.rs, ext_route.rs). */
-        if (freezeBusy(Date.now())) return;
-        if (freezeGuard(track)) { appState.dirty = true; return; }
+        const claimed = trackForChannel(ch);
+        const track = claimed >= 0 ? claimed : appState.activeTrack.index;
         const drum = drumConfigFor(track);
         const pitch = drum ? extDrumPitch(note, drum) : note;
         if (pitch < 0) return;

@@ -100,13 +100,6 @@ let lastKey = '';
  * whole module is about. */
 let lastPeek = false;
 let lastMarks = 0;
-/* A preset name lands on a later fill with no value moving (schwung-page-preset.ts). */
-let lastPreset = '';
-/* A widget's live extra keys (Schwung #668), and whether their last move is
- * still owed a frame: a change the cap turned away is drawn on a later tick,
- * not lost because the value then held still. */
-let lastLive = '';
-let liveDue = false;
 
 /* SP-48. One instance for the one drawn page's lifetime, same reasoning as
  * `levels`/`lastKey` above. It keeps only the last frame it let a stream
@@ -144,9 +137,6 @@ export function pollDrawnPage(owner: PageOwner, nowFn: () => number = Date.now):
         levels.fill(null);
         lastPeek = false;
         lastMarks = 0;
-        lastPreset = '';
-        lastLive = '';
-        liveDue = false;
         return true;
     }
 
@@ -194,20 +184,7 @@ export function pollDrawnPage(owner: PageOwner, nowFn: () => number = Date.now):
     if (peek !== lastPeek) { lastPeek = peek; moved = true; }
     const marks = page.marks();
     if (marks !== lastMarks) { lastMarks = marks; moved = true; }
-    const preset = typeof page.presetSig === 'function' ? page.presetSig() : '';
-    if (preset !== lastPreset) { lastPreset = preset; moved = true; }
 
-    /* A LIVE WIDGET VALUE IS DRAWN LIKE A CANVAS PAGE. The Ducker's meter
-     * follows a 100 ms duck: at the 5 Hz a stream is capped to it would skip
-     * whole ducks, so it takes the canvas frame rate (`CANVAS_FRAME_MS`). */
-    const live = page.liveSig();
-    if (live !== lastLive) { lastLive = live; liveDue = true; }
-
-    if (!moved) {
-        const now = nowFn();
-        const a = page.animating(now);
-        moved = animCap(liveDue ? { moving: a.moving, streaming: a.streaming, canvas: true } : a, now);
-    }
-    if (moved) liveDue = false;
+    if (!moved) { const now = nowFn(); moved = animCap(page.animating(now), now); }
     return moved;
 }

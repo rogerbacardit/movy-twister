@@ -22,10 +22,8 @@ import { doubleLoop } from './loop-mode.js';
 import { seqToast } from './render.js';
 import { seqState, setFullVelocity } from './state.js';
 import { nextQuantCandidate } from './quant.js';
-import { writeClipQuant } from './clip-quant.js';
 import { armQuantOverlay } from './quant-overlay.js';
 import { watchedTrack } from './watch.js';
-import { mlog } from '../log.js';
 
 /* Shift + step button = Move's shifted step functions. Step 10 toggles Full
  * Velocity; further entries (Double Loop = Step 15, Quantize = Step 16) land
@@ -79,11 +77,11 @@ export function shiftStepFunction(step: number): void {
  * (0 / set default / 100) and show the panel. One gesture key for the whole
  * audition, so pressing through 0 -> 70 -> 100 is a single undo back to where
  * you started rather than three; the panel is the feedback, so no toast. */
-export function cycleQuantize(): void {
+function cycleQuantize(): void {
     const track = watchedTrack();
     const next = nextQuantCandidate(seqState.clipQuant, seqState.defaultQuant);
-    mlog('quant: cycle t' + track + ' ' + seqState.clipQuant + '->' + next + ' def ' + seqState.defaultQuant);
     beginGesture('quant:' + track, 'CLIP QUANT', trackLabel(track));
-    writeClipQuant(track, next);
+    seqState.clipQuant = next;
+    seqCmd('cq ' + track + ' ' + next);
     armQuantOverlay(Date.now());
 }

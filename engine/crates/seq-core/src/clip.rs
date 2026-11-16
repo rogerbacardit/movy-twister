@@ -10,9 +10,6 @@ pub const MAX_BARS: u16 = 16;
 pub const MAX_STEPS: u16 = MAX_BARS * STEPS_PER_BAR as u16;
 /// Hard cap on notes per clip (davebox used 512; same budget).
 pub const MAX_NOTES: usize = 512;
-/// Longest gate an edit may store: the longest clip there can be. What a note
-/// actually sounds for is shorter wherever playback cuts it (`max_gate_at`).
-pub const MAX_GATE: u32 = MAX_STEPS as u32 * TICKS_PER_STEP;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Note {
@@ -324,27 +321,20 @@ impl Clip {
     /// Set the loop window from a bar-aligned start and length (clamped to
     /// 16 bars total and at least one bar).
     pub fn set_loop(&mut self, start_steps: u16, len_steps: u16) {
-        (self.loop_start_steps, self.length_steps) = self.loop_after(start_steps, len_steps);
-    }
-
-    /// The `(start, length)` in steps that `set_loop` would leave: what a
-    /// frozen clip's lock checks before it lets a cut through.
-    pub fn loop_after(&self, start_steps: u16, len_steps: u16) -> (u16, u16) {
         let bar = STEPS_PER_BAR as u16;
-        let start = ((start_steps / bar) * bar).min(MAX_STEPS - bar);
-        (start, len_steps.max(bar).min(MAX_STEPS - start))
+        let start = (start_steps / bar) * bar;
+        let len = len_steps.max(bar);
+        let start = start.min(MAX_STEPS - bar);
+        self.loop_start_steps = start;
+        self.length_steps = len.min(MAX_STEPS - start);
     }
 
     /// Set the loop length in steps from the LENGTH knob, preserving
     /// `loop_start_steps`. Clamped to [1, MAX_STEPS - loop_start_steps]. Unlike
     /// `set_loop`, this is step-granular (not bar-aligned).
     pub fn set_clip_length(&mut self, steps: u16) {
-        self.length_steps = self.clip_length_after(steps);
-    }
-
-    /// The length `set_clip_length` would leave.
-    pub fn clip_length_after(&self, steps: u16) -> u16 {
-        steps.clamp(1, MAX_STEPS - self.loop_start_steps)
+        let max = MAX_STEPS - self.loop_start_steps;
+        self.length_steps = steps.clamp(1, max);
     }
 
     /// Double the loop: copy the window's notes into the following window and
@@ -416,10 +406,12 @@ impl Clip {
             return;
         }
         self.extend_to_step(step);
-        // The inherited span is stored whole, like any length edit: playback
-        // cuts it where it meets its own next occurrence or the loop end.
-        let (tick, gate) = inherit.then(|| self.step_footprint(step)).flatten()
-            .unwrap_or((step as u32 * TICKS_PER_STEP, TICKS_PER_STEP));
+        let (tick, gate) = match inherit.then(|| self.step_footprint(step)).flatten() {
+            // Capped like any length edit: an inherited span must not run the
+            // new note through its own next occurrence.
+            Some((t, g)) => (t, g.min(self.max_gate_at(t, pitch))),
+            None => (step as u32 * TICKS_PER_STEP, TICKS_PER_STEP),
+        };
         self.notes.push(Note {
             tick,
             gate,
@@ -586,47 +578,57 @@ impl Clip {
 
     /// Lengthen/shorten gates, capped so a note never overruns the next note
     /// of the same pitch (native rule), and never past the clip end.
-    /// Grow or shrink matching notes' gates. Starts from what the note PLAYS,
-    /// so a turn on a note longer than its room moves the heard length at once.
     pub fn adjust_length(&mut self, s0: u16, s1: u16, lane: Option<u8>, delta: i32) {
-        for i in 0..self.notes.len() {
-            let n = self.notes[i];
-            if !Clip::note_matches(&n, s0, s1, lane) {
+        let clip_end = self.length_ticks();
+        // Snapshot (tick,pitch) so the cap can scan without borrow conflicts.
+        let others: Vec<(u32, u8)> = self.notes.iter().map(|n| (n.tick, n.pitch)).collect();
+        for n in &mut self.notes {
+            if !Clip::note_matches(n, s0, s1, lane) {
                 continue;
             }
-            let heard = n.gate.min(self.max_gate_at(n.tick, n.pitch)) as i64;
-            self.notes[i].gate = (heard + delta as i64).clamp(1, MAX_GATE as i64) as u32;
+            let mut cap = clip_end.saturating_sub(n.tick);
+            for &(t, p) in &others {
+                if p == n.pitch && t > n.tick {
+                    cap = cap.min(t - n.tick);
+                }
+            }
+            let g = (n.gate as i32 + delta).clamp(1, cap.max(1) as i32);
+            n.gate = g as u32;
         }
     }
 
-    /// Length in whole steps (rounded up, min 1) the note anchored at `step`
-    /// SOUNDS for, or 0 if no note there. Uses the first matching pitch.
+    /// Length in whole steps (rounded up, min 1) of the note anchored at `step`,
+    /// or 0 if no note there. Uses the first matching pitch.
     pub fn note_len_steps_at(&self, step: u16) -> u16 {
         self.notes
             .iter()
             .find(|n| n.step == step)
-            .map(|n| {
-                let g = n.gate.min(self.max_gate_at(n.tick, n.pitch));
-                ((g + TICKS_PER_STEP - 1) / TICKS_PER_STEP).max(1) as u16
-            })
+            .map(|n| ((n.gate + TICKS_PER_STEP - 1) / TICKS_PER_STEP).max(1) as u16)
             .unwrap_or(0)
     }
 
-    /// Set the gate of matching notes to an absolute tick length. Stored as
-    /// asked, not capped at the next same-pitch note or the loop end: playback
-    /// cuts it there, so deleting the blocker or moving the loop gives the
-    /// length back instead of leaving the clamp behind.
+    /// Set the gate of matching notes to an absolute tick length, capped at the
+    /// clip end and the next same-pitch note (mirrors adjust_length's caps).
     pub fn set_length(&mut self, s0: u16, s1: u16, lane: Option<u8>, ticks: u32) {
+        let clip_end = self.length_ticks();
+        let others: Vec<(u32, u8)> = self.notes.iter().map(|n| (n.tick, n.pitch)).collect();
         for n in &mut self.notes {
-            if Clip::note_matches(n, s0, s1, lane) {
-                n.gate = ticks.clamp(1, MAX_GATE);
+            if !Clip::note_matches(n, s0, s1, lane) {
+                continue;
             }
+            let mut cap = clip_end.saturating_sub(n.tick);
+            for &(t, p) in &others {
+                if p == n.pitch && t > n.tick {
+                    cap = cap.min(t - n.tick);
+                }
+            }
+            n.gate = ticks.clamp(1, cap.max(1));
         }
     }
 
-    /// How long the first note at (step, lane) can sound — the room playback
-    /// leaves it (`max_gate_at`). 0 when no such note. The UI ends the length
-    /// knob here.
+    /// Maximum gate (ticks) the first note at (step, lane) may grow to before it
+    /// hits the next same-pitch note or the clip end — the same cap `set_length`
+    /// applies. 0 when no such note. Lets the UI show "blocked by next note".
     pub fn held_note_max_gate(&self, step: u16, lane: Option<u8>) -> u32 {
         let Some(n) = self.notes.iter().find(|n| Clip::note_matches(n, step, step, lane)) else {
             return 0;
@@ -634,16 +636,14 @@ impl Clip {
         self.max_gate_at(n.tick, n.pitch)
     }
 
-    /// How long a note of `pitch` starting at `tick` can sound before it
-    /// reaches its own next occurrence or the loop end — the cut the scheduler
-    /// makes. Both bounds are the loop WINDOW's: `tick` is absolute, so the end
-    /// is `loop_end_ticks`, and a same-pitch note past it never plays, so it
-    /// blocks nothing.
+    /// How long a note of `pitch` starting at `tick` may sound before it reaches
+    /// its own next occurrence or the clip end. Shared by the length editor's
+    /// cap and by an added note inheriting a step's span, so the two cannot
+    /// disagree about what "as long as it fits" means.
     fn max_gate_at(&self, tick: u32, pitch: u8) -> u32 {
-        let end = self.loop_end_ticks();
-        let mut cap = end.saturating_sub(tick);
+        let mut cap = self.length_ticks().saturating_sub(tick);
         for o in &self.notes {
-            if o.pitch == pitch && o.tick > tick && o.tick < end {
+            if o.pitch == pitch && o.tick > tick {
                 cap = cap.min(o.tick - tick);
             }
         }
@@ -967,8 +967,8 @@ mod tests {
     }
 
     #[test]
-    fn an_inherited_span_is_cut_at_the_next_note_of_its_own_pitch() {
-        // Stored whole, like any length edit; what it can SOUND for stops at
+    fn an_inherited_span_stops_at_the_next_note_of_its_own_pitch() {
+        // Same cap the length knob applies: the new note must not run through
         // its own next occurrence.
         let mut c = Clip::new();
         c.set_loop(0, 16);
@@ -977,12 +977,12 @@ mod tests {
         assert!(c.toggle_step_pitch(4, 67, 100, true));
 
         let n = *c.notes.iter().find(|n| n.pitch == 67 && n.step == 4).unwrap();
-        assert_eq!((n.tick, n.gate), (96, 96), "did not take the chord's span");
-        assert_eq!(c.held_note_max_gate(4, Some(67)), 48, "ran into its own next occurrence");
+        assert_eq!(n.tick, 96);
+        assert_eq!(n.gate, 48, "ran into its own next occurrence");
     }
 
     #[test]
-    fn an_inherited_span_is_cut_at_the_clip_end() {
+    fn an_inherited_span_stops_at_the_clip_end() {
         // A note left longer than the clip (recorded, then the clip shortened)
         // must not pass that overhang on.
         let mut c = Clip::new();
@@ -991,8 +991,7 @@ mod tests {
         assert!(c.toggle_step_pitch(15, 67, 100, true));
         let n = added(&c, 67);
         assert_eq!(n.tick, 370, "start did not follow the existing note");
-        assert_eq!(n.gate, 100, "did not take the existing note's span");
-        assert_eq!(c.held_note_max_gate(15, Some(67)), 14, "overran the clip");
+        assert_eq!(n.gate, 14, "overran the clip");
     }
 
     #[test]
@@ -1096,50 +1095,14 @@ mod tests {
     }
 
     #[test]
-    fn adjust_length_turns_from_the_heard_length() {
+    fn adjust_length_caps_at_next_same_pitch() {
         let mut c = Clip::new();
         c.toggle_step(0, &[(60, 100)]);   // gate = TICKS_PER_STEP (24)
         c.toggle_step(2, &[(60, 100)]);   // same pitch two steps later
-        c.set_length(0, 0, None, 1000);    // stored long; heard for 48
-        c.adjust_length(0, 0, None, -12);
-        // A shortening turn is heard at once, not after 950 ticks of nothing.
+        c.adjust_length(0, 0, None, 1000); // try to grow hugely
+        // Capped to reach (not pass) the next C at tick 48.
         let first = c.notes.iter().find(|n| n.tick == 0).unwrap();
-        assert_eq!(first.gate, 2 * TICKS_PER_STEP - 12);
-    }
-
-    #[test]
-    fn the_cap_ends_at_the_loop_end_when_the_loop_does_not_start_at_zero() {
-        // The 1/32 bug: the cap took `length_ticks()` as the clip end against an
-        // ABSOLUTE tick, so a note past the first `length_steps` had no room.
-        let mut c = Clip::new();
-        c.set_loop(16, 16);                 // window = steps 16..32
-        c.toggle_step(20, &[(60, 100)]);    // tick 480
-        assert_eq!(c.held_note_max_gate(20, None), 768 - 480);
-        c.set_length(20, 20, None, 8 * TICKS_PER_STEP);
-        assert_eq!(c.note_len_steps_at(20), 8);
-        c.adjust_length(20, 20, None, TICKS_PER_STEP as i32);
-        assert_eq!(c.note_len_steps_at(20), 9);
-    }
-
-    #[test]
-    fn a_same_pitch_note_outside_the_loop_blocks_nothing() {
-        let mut c = Clip::new();
-        c.set_loop(0, 32);
-        c.toggle_step(0, &[(60, 100)]);
-        c.toggle_step(20, &[(60, 100)]);
-        c.set_loop(0, 16);                  // step 20 now never plays
-        assert_eq!(c.held_note_max_gate(0, None), 16 * TICKS_PER_STEP);
-    }
-
-    #[test]
-    fn a_length_past_its_blocker_comes_back_when_the_blocker_goes() {
-        let mut c = Clip::new();
-        c.toggle_step(0, &[(60, 100)]);
-        c.toggle_step(4, &[(60, 100)]);
-        c.set_length(0, 0, None, 8 * TICKS_PER_STEP);
-        assert_eq!(c.note_len_steps_at(0), 4, "heard past its own next note");
-        c.delete_range(4, 4, None);
-        assert_eq!(c.note_len_steps_at(0), 8, "the asked-for length was lost");
+        assert_eq!(first.gate, 2 * TICKS_PER_STEP);
     }
 
     #[test]
