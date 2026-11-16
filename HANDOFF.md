@@ -38,3 +38,16 @@ Pendientes y dudas:
 - Para probar en el Move (v0.37.0) hay que portar el cambio también a la v0.37.0: `ui.js` + `dsp.so`, con el mismo ENGINE_VERSION.
 
 El usuario tiene dudas sobre la implementación: empezar por escucharlas.
+
+## 2026-11-16: los aros del Twister siguen al parámetro
+- Problema: el Twister de fábrica es absoluto (0–127). Al llegar a su tope dejaba de mandar mensajes y el parámetro del Move no llegaba al final.
+- Arreglo en el `ui.js` del Move: `twisterFollow(levels)` se llama desde `updateKnobLEDsFrom` y manda el valor de cada knob al Twister (canal 1, CC 8–15). También pone `absLast` a ese valor. Solo empieza a mandar después de recibir el primer CC del Twister. `paintTwister` vuelve a mandarlo todo.
+- Copia local: `ui-device-con-sync.js`. Copia de seguridad en el Move: `/data/UserData/schwung/backup-movy-ui-twister-antes-de-sync.js`.
+- Falta pasarlo al repo `schwung-movy` (ext-knobs.ts) si funciona en el Move.
+
+## 2026-11-16: pulsar encoders 9–16 = volver al valor del preset
+- `twBaseNote` (en el manejador de giros de knob, tanto del Move como del Twister) guarda el primer valor de cada parámetro en `twBase`, con la clave `track:componentKey:ioKey`.
+- `twBaseForget` borra esos valores al cambiar de preset: con el encoder 3 (`extPresetTurn`) o con el knob 1 en la página de presets.
+- `twResetKnob`: al pulsar en el canal 2 los CC 8–15, escribe el valor guardado con `setParam` en la misma fuente que usa la página (virtual, propia de Movy o `componentPort`). El valor guardado no se borra tras el reset. Deja una línea `twReset` en el log.
+- Limitación: un preset cargado por el navegador (jog) no borra los valores guardados.
+- PROBADO Y FUNCIONA en el Move (2026-11-16), junto con los aros que siguen al parámetro. Copia local: `ui-device-con-sync.js`. La copia de seguridad de antes de ambos cambios sigue en el Move: `/data/UserData/schwung/backup-movy-ui-twister-antes-de-sync.js`.
