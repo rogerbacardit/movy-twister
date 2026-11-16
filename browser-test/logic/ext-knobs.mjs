@@ -78,6 +78,11 @@ export async function run() {
     eq('an enum wires its index', sp.wireOf(en3, 2), '2');
     eq('an enum that wires names sends the name', sp.wireOf({ ...en3, wiresNames: true }, 1), 'B');
     eq('an int wires a whole number', sp.wireOf({ type: 'int', min: 0, max: 4 }, 3.0), '3');
+    const fl = { type: 'float', value: 0.3, min: 0, max: 1 };
+    eq('a continuous ring 0 is the minimum', sp.continuousAt(fl, 0), 0);
+    eq('a continuous ring 127 is the maximum', sp.continuousAt(fl, 127), 1);
+    eq('a continuous ring is linear over the range', sp.continuousAt({ ...fl, min: 20, max: 20020 }, 63.5), 10020);
+    eq('a wide int lands on whole numbers', sp.continuousAt({ type: 'int', min: 0, max: 127 }, 64), 64);
 
     /* The rings leave a knob alone while it is being turned (midi/ext-follow.ts). */
     const fo = await import('../../dist/esm/midi/ext-follow.js');
@@ -96,6 +101,26 @@ export async function run() {
         fo.twisterFollow([0.5, null, null, null, null, null, null, null], 1500);
         drain();
         eq('it is resynced once it rests', sent.join(' '), '8=64');
+
+        /* An idle page renders no frame after the turn: the tick resyncs it. */
+        sent.length = 0;
+        fo.twisterFollow([0.7, null, null, null, null, null, null, null], 1600);
+        drain();
+        sent.length = 0;
+        fo.twisterTouched(0, 1700);
+        fo.twisterFollow([0.7, null, null, null, null, null, null, null], 1750);
+        fo.twisterFollowRest(1800);
+        drain();
+        eq('no resync while the hold lasts', sent.join(' '), '');
+        fo.twisterFollowRest(2060);
+        drain();
+        eq('a resting ring is resynced with no new frame', sent.join(' '), '8=89');
+        fo.twisterFollowRest(2500);
+        drain();
+        eq('and only once', sent.join(' '), '8=89');
+        fo.twisterFollow([0.5, null, null, null, null, null, null, null], 2600);
+        drain();   /* back to the ring the checks below start from */
+        sent.length = 0;
 
         /* The assigned rings wear the active track's colour (midi/ext-colors.ts). */
         const co = await import('../../dist/esm/midi/ext-colors.js');

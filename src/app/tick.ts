@@ -45,6 +45,7 @@ import type { PageChrome } from '../renderer/schwung-page-chrome.js';
 import { renderFileBrowseView } from '../renderer/file-browse-view.js';
 import { updateKnobLEDsFrom, updateSingleKnobLED } from '../renderer/knob-leds.js';
 import { twisterOutFlush } from '../midi/ext-out.js';
+import { twisterFollowRest } from '../midi/ext-follow.js';
 import { seqEngineTick, takeLabelSync, requestLabelSync } from '../seq/engine.js';
 import { drumSyncTick, resetDrumSync } from '../seq/drum-sync.js';
 import { bindLanes } from '../seq/lane-mapping.js';
@@ -395,6 +396,7 @@ export function tick(): void {
     tickBody();
     /* Outside tickBody so none of its early returns stalls the queue: what this
      * tick painted leaves this tick, paced (midi/ext-out.ts). */
+    twisterFollowRest();   /* a resting Twister ring is resynced, frame or not */
     twisterOutFlush();
     /* Outside tickBody so its early returns are still accounted for. */
     perfProbeTick();

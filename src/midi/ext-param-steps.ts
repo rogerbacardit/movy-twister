@@ -37,6 +37,16 @@ export function valueAt(info: StepInfo, n: number, pos: number): number {
     return info.type === 'enum' ? zone : Math.round(info.min) + zone;
 }
 
+/** A continuous parameter at ring position 0-127: the whole travel is the
+ *  whole range, linear like Schwung's knob level (normalizedOf), so the ring
+ *  the follow puts back (midi/ext-follow.ts) is exactly where it continues.
+ *  Relative steps were range/200 each — 128 of them crossed only 64 %. */
+export function continuousAt(info: StepInfo, pos: number): number {
+    const t = Math.max(0, Math.min(127, pos)) / 127;
+    const v = info.min + t * (info.max - info.min);
+    return info.type === 'int' ? Math.round(v) : v;
+}
+
 /** The string a module's set_param takes for `value`. */
 export function wireOf(info: StepInfo, value: number): string {
     if (info.type === 'enum') {

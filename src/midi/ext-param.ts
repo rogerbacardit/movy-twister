@@ -14,7 +14,7 @@ import { appState } from '../app/state.js';
 import { pageOwnerOf, type PageOwner, type PageRef } from '../app/page-owner.js';
 import { pageSourceFor } from '../renderer/schwung-grid.js';
 import { onMidiMessageInternal, knobModel } from './router.js';
-import { stepCount, valueAt, wireOf, type StepInfo } from './ext-param-steps.js';
+import { stepCount, valueAt, continuousAt, wireOf, type StepInfo } from './ext-param-steps.js';
 import { twisterTouched } from './ext-follow.js';
 import { mlog } from '../log.js';
 
@@ -51,23 +51,26 @@ function write(ref: PageRef, info: StepInfo & { ioKey: string }, value: number):
     appState.dirty = true;
 }
 
-/** A Twister knob turned: steps for a continuous parameter, the ring's
- *  position for a stepped one. */
+/** A Twister knob turned: the ring's position picks the value — a zone for a
+ *  stepped parameter, the matching point of the range for a continuous one.
+ *  Only a knob with no ranged parameter (the preset list) still steps. */
 export function extKnobTurn(knob: number, delta: number, pos: number): void {
     twisterTouched(knob);
     const owner = pageOwnerOf(knobModel());
     const info = owner.ref && owner.page ? owner.knobParamInfo(knob) : null;
     const n = stepCount(info);
-    if (!n || !owner.ref) {
+    const ranged = !!info && info.type !== 'enum' && isFinite(info.min) && isFinite(info.max)
+        && info.max > info.min;
+    if (!owner.ref || (!n && !ranged)) {
         onMidiMessageInternal([0xB0, MoveKnob1 + knob, delta >= 0 ? delta : 128 + delta]);
         return;
     }
     extBaseNote(owner, knob, info);
-    const v = valueAt(info, n, pos);
+    const v = n ? valueAt(info, n, pos) : continuousAt(info, pos);
     /* The page re-reads the value a few ticks later, so until then info.value
      * is the old one: without `zoneSent` every CC in between rewrote it. */
     const zone = idOf(owner.ref, info.ioKey) + '=' + v;
-    if (v === Math.round(info.value)) { zoneSent[knob] = ''; return; }
+    if (v === (n ? Math.round(info.value) : info.value)) { zoneSent[knob] = ''; return; }
     if (zoneSent[knob] === zone) return;
     zoneSent[knob] = zone;
     write(owner.ref, info, v);
