@@ -713,6 +713,14 @@ function writePrefFileDir(key, dir) {
     p.fileDirs = dirs;
   });
 }
+function readPrefMidiIn() {
+  return readPrefs().midiIn;
+}
+function writePrefMidiIn(channels) {
+  writePrefs((p) => {
+    p.midiIn = channels.slice();
+  });
+}
 
 // src/model/constants.ts
 var MODULE_LOAD_TICKS = 344;
@@ -2104,8 +2112,8 @@ var krautdrums_default = {
   name: "KrautDrums",
   drum: {
     padCount: 16,
-    padNoteStart: 68,
-    rawMidi: true
+    padNoteStart: 36,
+    rawMidi: false
   },
   banks: [
     {
@@ -5571,18 +5579,18 @@ function advanceSample(ctl, lib3) {
 // src/renderer/schwung-page-contract.ts
 var RELOAD_POLL_TICKS = 16;
 function createPageContract(ctl, port, componentKey2, cache2, hier, lib3, trackIndex) {
-  let loaded = false;
+  let loaded2 = false;
   let attempts = 0;
   let waitingSince2 = Date.now();
   let sinceRetry = 0;
   function refreshLoaded() {
     if (ctl.contractUnresolved) return;
     const has = !!(ctl.pages && ctl.pages.length);
-    if (has === loaded) return;
-    loaded = has;
+    if (has === loaded2) return;
+    loaded2 = has;
     if (has) mlog("page ready ck=" + componentKey2 + " ms=" + (Date.now() - waitingSince2));
     else waitingSince2 = Date.now();
-    if (!loaded) {
+    if (!loaded2) {
       attempts = 0;
       sinceRetry = 0;
     }
@@ -5611,7 +5619,7 @@ function createPageContract(ctl, port, componentKey2, cache2, hier, lib3, trackI
   const IDLE_RETRY_TICKS = MODULE_LOAD_TICKS;
   let sinceReload = 0;
   function tick2() {
-    if (!loaded) {
+    if (!loaded2) {
       sinceRetry++;
       const urgent = attempts < RETRY_LIMIT;
       if (sinceRetry >= (urgent ? RETRY_TICKS : IDLE_RETRY_TICKS)) {
@@ -5619,7 +5627,7 @@ function createPageContract(ctl, port, componentKey2, cache2, hier, lib3, trackI
         if (urgent) attempts++;
         reload();
       }
-      if (!loaded) return;
+      if (!loaded2) return;
     }
     if (++sinceReload >= RELOAD_POLL_TICKS) {
       sinceReload = 0;
@@ -5639,7 +5647,7 @@ function createPageContract(ctl, port, componentKey2, cache2, hier, lib3, trackI
     perfPhaseEnd();
     advanceSample(ctl, lib3);
   }
-  return { reload, tick: tick2, isReady: () => loaded };
+  return { reload, tick: tick2, isReady: () => loaded2 };
 }
 
 // src/renderer/schwung-page-decorations.ts
@@ -9335,37 +9343,6 @@ function restoreMutes(o) {
   base = Array.isArray(o?.base) ? Array.from({ length: TRACK_COUNT }, (_, t) => o.base[t] === 1) : null;
 }
 
-// src/track/midi-in.ts
-var MIDI_IN_SEL = 0;
-var MIDI_IN_MAX = 16;
-var midiIn = new Array(TRACK_COUNT).fill(MIDI_IN_SEL);
-var clamp2 = (v) => typeof v === "number" && isFinite(v) ? Math.max(MIDI_IN_SEL, Math.min(MIDI_IN_MAX, v | 0)) : MIDI_IN_SEL;
-function trackMidiIn(track) {
-  return midiIn[track] ?? MIDI_IN_SEL;
-}
-function setTrackMidiIn(track, ch) {
-  if (track >= 0 && track < TRACK_COUNT) midiIn[track] = clamp2(ch);
-}
-function stepTrackMidiIn(track, dir) {
-  setTrackMidiIn(track, trackMidiIn(track) + (dir > 0 ? 1 : -1));
-}
-function midiInLabel(ch) {
-  return ch === MIDI_IN_SEL ? "SEL" : "CH " + ch;
-}
-function trackForChannel(ch) {
-  if (ch < 1 || ch > MIDI_IN_MAX) return -1;
-  return midiIn.indexOf(ch);
-}
-function midiInSnapshot() {
-  return midiIn.slice();
-}
-function restoreMidiIn(v) {
-  for (let t = 0; t < TRACK_COUNT; t++) midiIn[t] = Array.isArray(v) ? clamp2(v[t]) : MIDI_IN_SEL;
-}
-function resetMidiIn() {
-  midiIn.fill(MIDI_IN_SEL);
-}
-
 // src/seq/ui-state.ts
 var clampInt = (v, lo, hi, dflt) => typeof v === "number" && isFinite(v) ? Math.max(lo, Math.min(hi, v | 0)) : dflt;
 function serializeUiState() {
@@ -9379,7 +9356,6 @@ function serializeUiState() {
     layout: keyboardState.layout,
     oct: keyboardState.octave.slice(),
     mutes: mutesSnapshot(),
-    midiIn: midiInSnapshot(),
     defaultQuant: seqState.defaultQuant
   });
 }
@@ -9400,7 +9376,6 @@ function applyUiState(blob) {
     keyboardState.mode = clampInt(o.mode, 0, MODE_NAMES.length - 1, 0);
     keyboardState.layout = clampInt(o.layout, 0, layoutNames(keyboardState.mode).length - 1, 0);
     if (o.mutes) restoreMutes(o.mutes);
-    restoreMidiIn(o.midiIn);
     applyDefaultQuant(typeof o.defaultQuant === "number" ? clampInt(o.defaultQuant, 0, 100, readPrefDefaultQuant()) : readPrefDefaultQuant());
   } catch {
   }
@@ -9416,7 +9391,6 @@ function resetUiState() {
   keyboardState.layout = 0;
   resetOctaves();
   resetTrackMutes();
-  resetMidiIn();
   applyDefaultQuant(readPrefDefaultQuant());
 }
 
@@ -10587,6 +10561,44 @@ function syncPadRoute(send2) {
 function resetPadRoute() {
   pushed = "";
   pushedVel = "";
+}
+
+// src/track/midi-in.ts
+var MIDI_IN_SEL = 0;
+var MIDI_IN_MAX = 16;
+var midiIn = new Array(TRACK_COUNT).fill(MIDI_IN_SEL);
+var loaded = false;
+var clamp2 = (v) => typeof v === "number" && isFinite(v) ? Math.max(MIDI_IN_SEL, Math.min(MIDI_IN_MAX, v | 0)) : MIDI_IN_SEL;
+function load() {
+  if (loaded) return;
+  loaded = true;
+  restoreMidiIn(readPrefMidiIn());
+}
+function trackMidiIn(track) {
+  load();
+  return midiIn[track] ?? MIDI_IN_SEL;
+}
+function setTrackMidiIn(track, ch) {
+  load();
+  if (track >= 0 && track < TRACK_COUNT) midiIn[track] = clamp2(ch);
+}
+function saveMidiIn() {
+  load();
+  writePrefMidiIn(midiIn);
+}
+function stepTrackMidiIn(track, dir) {
+  setTrackMidiIn(track, trackMidiIn(track) + (dir > 0 ? 1 : -1));
+}
+function midiInLabel(ch) {
+  return ch === MIDI_IN_SEL ? "SEL" : "CH " + ch;
+}
+function trackForChannel(ch) {
+  load();
+  if (ch < 1 || ch > MIDI_IN_MAX) return -1;
+  return midiIn.indexOf(ch);
+}
+function restoreMidiIn(v) {
+  for (let t = 0; t < TRACK_COUNT; t++) midiIn[t] = Array.isArray(v) ? clamp2(v[t]) : MIDI_IN_SEL;
 }
 
 // src/track/ext-route.ts
@@ -15188,7 +15200,7 @@ function closeTrackMenu() {
 function trackMenuKnob(dir) {
   if (state4.track < 0 || dir === 0) return;
   stepTrackMidiIn(state4.track, dir);
-  markUiStateDirty();
+  saveMidiIn();
 }
 function buildTrackMenuVM() {
   return {
@@ -15563,13 +15575,13 @@ function drawFloorDatum(scaleUs, g, sends) {
   if (!sends) return;
   for (let n = 0; n < SEND_BUSES; n++) fill_rect(SEND_X + n * SEND.pitch + SEND.colW, y, 1, 1, 1);
 }
-function drawCapacity(load, peak) {
+function drawCapacity(load2, peak) {
   fill_rect(0, BAR_Y2, W, 1, 1);
   fill_rect(0, BAR_Y2 + BAR_H - 1, W, 1, 1);
   fill_rect(0, BAR_Y2, 1, BAR_H, 1);
   fill_rect(W - 1, BAR_Y2, 1, BAR_H, 1);
   const inner = W - 2;
-  const fw = Math.round(Math.min(1, Math.max(0, load)) * inner);
+  const fw = Math.round(Math.min(1, Math.max(0, load2)) * inner);
   if (fw > 0) fill_rect(1, BAR_Y2 + 1, fw, BAR_H - 2, 1);
   const px = Math.min(1 + Math.round(Math.min(1, Math.max(0, peak)) * inner), W - 2);
   fill_rect(px, BAR_Y2 + 1, 1, BAR_H - 2, px < 1 + fw ? 0 : 1);
@@ -15609,7 +15621,7 @@ function num(s) {
 function buildCpuPageVM() {
   const triples = seqState.cpuCost ? seqState.cpuCost.split(",") : [];
   const [loadedHex, asleepHex] = (seqState.cpuMask || "0/0").split("/");
-  const loaded = parseInt(loadedHex, 16) || 0;
+  const loaded2 = parseInt(loadedHex, 16) || 0;
   const asleep = parseInt(asleepHex, 16) || 0;
   const [wallStr, peakStr, blockStr] = (seqState.cpuWall || "").split("/");
   const blockUs = num(blockStr) || DEFAULT_BLOCK_US;
@@ -15618,7 +15630,7 @@ function buildCpuPageVM() {
   const columns = [];
   for (let t = 0; t < TRACK_COUNT; t++) {
     const bit = 1 << t;
-    if (!(loaded & bit)) {
+    if (!(loaded2 & bit)) {
       columns.push({ kind: "empty", totalUs: 0, synthUs: 0, peakUs: 0 });
       continue;
     }

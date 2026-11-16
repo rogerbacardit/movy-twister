@@ -21,4 +21,5 @@ external sequencer (KeyStep Pro over USB).
 
 **Guess:** something in the voice or filter state goes bad for a while (a NaN or denormal
 in the ladder filter, or a voice stuck in allocation), and then clears.
-I can test a build or try settings (e.g. voices=1) if that helps.
+Lowering voices to 2 does not help: the dropouts continue. I can test a build or try
+other settings if that helps.

@@ -1,7 +1,7 @@
 From 826b82cf1e8b3bd9accbe3c439d2d3cdb07dda06 Mon Sep 17 00:00:00 2001
 From: rogerbacardit <rogerbacardit@gmail.com>
 Date: Mon, 16 Nov 2026 19:26:19 +0100
-Subject: [PATCH] Twister: stepped params by position, push = preset value,
+Subject: [PATCH 5/7] Twister: stepped params by position, push = preset value,
  track colours, paced output
 
 - Twister knobs 9-16 drive an enum / switch / int of 2-32 values by the

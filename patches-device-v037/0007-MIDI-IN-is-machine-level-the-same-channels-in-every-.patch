@@ -1,0 +1,252 @@
+From fe2709b5479acece00b06d1e9fb885af7af4066f Mon Sep 17 00:00:00 2001
+From: rogerbacardit <rogerbacardit@gmail.com>
+Date: Mon, 16 Nov 2026 21:14:32 +0100
+Subject: [PATCH 7/7] MIDI IN is machine-level: the same channels in every set
+
+The channels describe the rig on USB-A (a KeyStep Pro's tracks), not the
+song, and a new set started all SEL (user, 2026-11-16). They now live in
+prefs.json beside the master volume, loaded on first use and saved on every
+menu turn; a set's UI blob no longer carries or overrides them.
+
+Gate: local suites (logic incl. midi-in.mjs prefs checks, app-loop,
+screenshot, perf, source-rules, host-globals).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ browser-test/logic/midi-in.mjs | 25 ++++++++++++++-----------
+ src/seq/prefs.ts               | 12 ++++++++++++
+ src/seq/track-menu.ts          |  5 ++---
+ src/seq/ui-state.ts            |  8 ++------
+ src/track/midi-in.ts           | 28 +++++++++++++++++++++++++---
+ 5 files changed, 55 insertions(+), 23 deletions(-)
+
+diff --git a/browser-test/logic/midi-in.mjs b/browser-test/logic/midi-in.mjs
+index 3c2ca87e..61e383c3 100644
+--- a/browser-test/logic/midi-in.mjs
++++ b/browser-test/logic/midi-in.mjs
+@@ -5,7 +5,7 @@
+  * Run by browser-test/logic.mjs.
+  */
+ 
+-import { eq, lastMusicalOp, _log } from './harness.mjs';
++import { eq, lastMusicalOp, _log, installMockFs, uninstallMockFs, PREFS_PATH } from './harness.mjs';
+ 
+ export async function run() {
+     _log('\ntrack MIDI IN (channel per track):');
+@@ -19,7 +19,7 @@ export async function run() {
+     const mi = await import('../../dist/esm/track/midi-in.js');
+     const { serializeUiState, applyUiState } = await import('../../dist/esm/seq/ui-state.js');
+     const menu = await import('../../dist/esm/seq/track-menu.js');
+-    const { takeUiDirty } = await import('../../dist/esm/seq/ui-dirty.js');
++    const { readPrefMidiIn } = await import('../../dist/esm/seq/prefs.js');
+ 
+     const engine = installMockEngine();
+     const reset = () => { resetSeqEngine(); resetSeqState(); resetStepRec(); resetSeqChord(); engine.reset(); mi.resetMidiIn(); };
+@@ -55,13 +55,10 @@ export async function run() {
+     eq('an unclaimed channel records on the active track', lastOp(), 'non 0 62 70');
+     ext(0x80, 62, 0);
+ 
+-    /* The Set carries it; an old Set is all SEL. */
+-    const blob = serializeUiState();
+-    mi.resetMidiIn();
+-    applyUiState(blob);
+-    eq('MIDI IN round-trips through the UI blob', mi.trackMidiIn(3), 4);
+-    applyUiState(JSON.stringify({ oct: [4, 4] }));
+-    eq('a Set from before MIDI IN is all SEL', mi.trackMidiIn(3), 0);
++    /* Machine-level: a set neither carries it nor changes it on load. */
++    eq('a set\'s UI blob does not carry MIDI IN', /midiIn/.test(serializeUiState()), false);
++    applyUiState(JSON.stringify({ oct: [4, 4], midiIn: [0, 0, 0, 0] }));
++    eq('loading a set keeps the machine\'s channels', mi.trackMidiIn(3), 4);
+ 
+     /* Steps clamp at SEL and 16. */
+     mi.stepTrackMidiIn(6, -1);
+@@ -72,13 +69,19 @@ export async function run() {
+ 
+     /* The track menu (v0.37: MIDI IN is its one row): knob 1 turns it. */
+     mi.resetMidiIn();
++    installMockFs({ [PREFS_PATH]: JSON.stringify({ masterVolume: 0.5 }) });
+     menu.openTrackMenu(2);
+-    takeUiDirty();
+     eq('the menu opens for T3', menu.buildTrackMenuVM().rows[0].name, 'MIDI IN T3');
+     menu.trackMenuKnob(1); menu.trackMenuKnob(1); menu.trackMenuKnob(1);
+     eq('knob 1 turns the channel', menu.buildTrackMenuVM().rows[0].value, 'CH 3');
+     eq('and it is the track\'s setting', mi.trackMidiIn(2), 3);
+-    eq('a turn marks the Set to be saved', takeUiDirty(), true);
++    const saved = readPrefMidiIn();
++    eq('a turn saves it in the machine prefs', Array.isArray(saved) && saved[2], 3);
++    mi.restoreMidiIn([]);
++    mi.restoreMidiIn(readPrefMidiIn());
++    eq('and it comes back from them', mi.trackMidiIn(2), 3);
++    eq('the other prefs are kept', JSON.parse(globalThis.host_read_file?.(PREFS_PATH) ?? '{}').masterVolume ?? 0.5, 0.5);
++    uninstallMockFs();
+     menu.closeTrackMenu();
+     eq('Back closes the menu', menu.trackMenuActive(), false);
+ 
+diff --git a/src/seq/prefs.ts b/src/seq/prefs.ts
+index 10aac10a..8eaabde4 100644
+--- a/src/seq/prefs.ts
++++ b/src/seq/prefs.ts
+@@ -28,6 +28,7 @@ const clampPct = (v: unknown): number =>
+ type PrefsFile = {
+     defaultQuant?: unknown; fileDirs?: unknown; moduleBlacklist?: unknown;
+     fullVelocity?: unknown; masterVolume?: unknown; clickDb?: unknown;
++    midiIn?: unknown;
+ };
+ 
+ function readPrefs(): PrefsFile {
+@@ -154,3 +155,14 @@ export function writePrefFileDir(key: string, dir: string): void {
+         p.fileDirs = dirs;
+     });
+ }
++
++/* Each track's MIDI IN channel (track/midi-in.ts). Machine-level, not per
++ * set: the channels describe the rig plugged into USB-A (a KeyStep Pro's
++ * tracks), which is the same whichever set is open (user, 2026-11-16). */
++export function readPrefMidiIn(): unknown {
++    return readPrefs().midiIn;
++}
++
++export function writePrefMidiIn(channels: number[]): void {
++    writePrefs((p) => { p.midiIn = channels.slice(); });
++}
+diff --git a/src/seq/track-menu.ts b/src/seq/track-menu.ts
+index e7f8b1b9..66f4609f 100644
+--- a/src/seq/track-menu.ts
++++ b/src/seq/track-menu.ts
+@@ -5,8 +5,7 @@
+  * pressed track WITHOUT switching to it. */
+ 
+ import type { FlagsPageVM } from './flags-page-vm.js';
+-import { midiInLabel, stepTrackMidiIn, trackMidiIn } from '../track/midi-in.js';
+-import { markUiStateDirty } from './ui-dirty.js';
++import { midiInLabel, saveMidiIn, stepTrackMidiIn, trackMidiIn } from '../track/midi-in.js';
+ 
+ const state = { track: -1 };
+ 
+@@ -30,7 +29,7 @@ export function closeTrackMenu(): void {
+ export function trackMenuKnob(dir: number): void {
+     if (state.track < 0 || dir === 0) return;
+     stepTrackMidiIn(state.track, dir);
+-    markUiStateDirty();   // the Set saves it (seq/set-save.ts), or it is gone on close
++    saveMidiIn();   // machine-level: every set, new or old, plays the same channels
+ }
+ 
+ export function buildTrackMenuVM(): FlagsPageVM {
+diff --git a/src/seq/ui-state.ts b/src/seq/ui-state.ts
+index 5e3035d9..610c506c 100644
+--- a/src/seq/ui-state.ts
++++ b/src/seq/ui-state.ts
+@@ -1,5 +1,5 @@
+-/* The per-set UI-only state: tonic, scale, mode, pad layout, per-track octave,
+- * track mutes and each track's MIDI IN. Kept apart from the engine's own serialization because the
++/* The per-set UI-only state: tonic, scale, mode, pad layout, per-track octave
++ * and track mutes. (MIDI IN is machine-level, seq/prefs.ts.) Kept apart from the engine's own serialization because the
+  * engine knows nothing about any of it — it is ferried in its own JSON file
+  * alongside the state blob. */
+ 
+@@ -11,7 +11,6 @@ import { mutesSnapshot, restoreMutes, resetTrackMutes } from '../mixer/track-mut
+ import { seqState } from './state.js';
+ import { seqCmd } from './engine.js';
+ import { readPrefDefaultQuant } from './prefs.js';
+-import { midiInSnapshot, restoreMidiIn, resetMidiIn } from '../track/midi-in.js';
+ 
+ const clampInt = (v: unknown, lo: number, hi: number, dflt: number): number =>
+     typeof v === 'number' && isFinite(v) ? Math.max(lo, Math.min(hi, v | 0)) : dflt;
+@@ -29,7 +28,6 @@ export function serializeUiState(): string {
+         layout: keyboardState.layout,
+         oct:    keyboardState.octave.slice(),
+         mutes:  mutesSnapshot(),
+-        midiIn: midiInSnapshot(),
+         defaultQuant: seqState.defaultQuant,
+     });
+ }
+@@ -54,7 +52,6 @@ export function applyUiState(blob: string): void {
+         keyboardState.mode   = clampInt(o.mode,   0, MODE_NAMES.length - 1, 0);
+         keyboardState.layout = clampInt(o.layout, 0, layoutNames(keyboardState.mode).length - 1, 0);
+         if (o.mutes) restoreMutes(o.mutes);
+-        restoreMidiIn(o.midiIn);
+         /* Absent = a set written before this feature, or a brand new one. Both
+          * adopt the machine default rather than snapping to zero — that is the
+          * whole point of keeping it outside the set. */
+@@ -79,6 +76,5 @@ export function resetUiState(): void {
+     keyboardState.layout = 0;
+     resetOctaves();
+     resetTrackMutes();
+-    resetMidiIn();
+     applyDefaultQuant(readPrefDefaultQuant());
+ }
+diff --git a/src/track/midi-in.ts b/src/track/midi-in.ts
+index a21d8a62..6fa87e18 100644
+--- a/src/track/midi-in.ts
++++ b/src/track/midi-in.ts
+@@ -3,28 +3,47 @@
+  * before this existed. Lets a controller that sends several channels at once
+  * (a KeyStep Pro's four sequencer tracks) play several tracks.
+  *
+- * Per Set: carried in the UI blob beside the octaves (seq/ui-state.ts). The
+- * engine is told through `extmap` (track/ext-route.ts); the recording side
+- * asks `trackForChannel` (midi/external.ts). */
++ * Machine-level, in prefs.json (seq/prefs.ts): the same in every set, new or
++ * old, because it describes the rig on USB-A, not the song. Loaded on first
++ * use and saved on every change. The engine is told through `extmap`
++ * (track/ext-route.ts); the recording side asks `trackForChannel`
++ * (midi/external.ts). */
+ 
+ import { TRACK_COUNT } from './ref.js';
++import { readPrefMidiIn, writePrefMidiIn } from '../seq/prefs.js';
+ 
+ export const MIDI_IN_SEL = 0;
+ export const MIDI_IN_MAX = 16;
+ 
+ const midiIn: number[] = new Array(TRACK_COUNT).fill(MIDI_IN_SEL);
++let loaded = false;
+ 
+ const clamp = (v: unknown): number =>
+     typeof v === 'number' && isFinite(v) ? Math.max(MIDI_IN_SEL, Math.min(MIDI_IN_MAX, v | 0)) : MIDI_IN_SEL;
+ 
++/* Read the prefs once, on first use: after boot, before anything asks. */
++function load(): void {
++    if (loaded) return;
++    loaded = true;
++    restoreMidiIn(readPrefMidiIn());
++}
++
+ export function trackMidiIn(track: number): number {
++    load();
+     return midiIn[track] ?? MIDI_IN_SEL;
+ }
+ 
+ export function setTrackMidiIn(track: number, ch: number): void {
++    load();
+     if (track >= 0 && track < TRACK_COUNT) midiIn[track] = clamp(ch);
+ }
+ 
++/** Persist the current channels (a menu turn). */
++export function saveMidiIn(): void {
++    load();
++    writePrefMidiIn(midiIn);
++}
++
+ /** One knob detent: SEL, 1, 2 … 16, stopping at the ends. */
+ export function stepTrackMidiIn(track: number, dir: number): void {
+     setTrackMidiIn(track, trackMidiIn(track) + (dir > 0 ? 1 : -1));
+@@ -40,6 +59,7 @@ export function midiInLabel(ch: number): string {
+  * channel, one destination, so the engine and the recording always agree.
+  */
+ export function trackForChannel(ch: number): number {
++    load();
+     if (ch < 1 || ch > MIDI_IN_MAX) return -1;
+     return midiIn.indexOf(ch);
+ }
+@@ -53,6 +73,8 @@ export function restoreMidiIn(v: unknown): void {
+     for (let t = 0; t < TRACK_COUNT; t++) midiIn[t] = Array.isArray(v) ? clamp(v[t]) : MIDI_IN_SEL;
+ }
+ 
++/** Back to all SEL in memory (tests; a set load does NOT call this). */
+ export function resetMidiIn(): void {
++    loaded = true;
+     midiIn.fill(MIDI_IN_SEL);
+ }
+-- 
+2.54.0 (Apple Git-157)
+

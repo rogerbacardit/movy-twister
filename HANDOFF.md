@@ -97,3 +97,10 @@ El usuario tiene dudas sobre la implementación: empezar por escucharlas.
 - Siguiente prueba pendiente: el Mini-JV con el Movy ORIGINAL (backups: /data/UserData/schwung/backup-movy-ui-v0.37.0-original.js + backup-movy-20261116-1726/dsp.so). Guardar antes `midiIn` del ui-state.json, porque el original lo borra (ya pasó una vez y se restauró a mano con Movy cerrado).
 - Borrador del reporte: `4-ISSUE-minijv.md`. Sin publicar.
 - Cuidado: otra sesión trabajó a la vez en la rama device-v037 (commit 826b82cf: colores de pista en los aros, cola de salida, pulsar = valor del preset). Usar una sola sesión.
+
+## 2026-11-16 (cierre del día)
+- **MIDI IN pasa a ser global** (commit fe2709b5): se guarda en `prefs.json` de Movy, no en cada Set. Valores del usuario: T1=CH10, T2=CH2, T3=CH3, T4=CH4. Funciona con el KeyStep Pro en cualquier Set.
+- **Krautdrums** (24e41a23): la plantilla de Movy enviaba las notas 68-83 (rawMidi) y el módulo actual espera 36-51. Corregido a padNoteStart 36 con rawMidi false. Esto también hay que reportarlo al autor de Movy.
+- **El Twister NO responde después de reiniciar el Move y moverlo a los altavoces.** Con un diagnóstico (log de los mensajes USB que llegan) se vio que llegan las notas del KeyStep (canal 3) pero CERO mensajes CC del Twister. El Twister hace su animación de encendido. Es un problema físico o de reconocimiento USB, no del código. Pendiente: probar el Twister directo al Move sin hub, o reiniciar el Move con todo conectado.
+- En el Move está desplegado el ui.js limpio (md5 4f1b7b9c, la rama device-v037 en HEAD), con dsp.so f6c3aa1d.
+- Parches: `patches-device-v037/` (0001-0007).

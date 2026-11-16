@@ -1,7 +1,7 @@
 From cd39f267e1957b16ca6a84ed814cd97c1c0c2bdd Mon Sep 17 00:00:00 2001
 From: rogerbacardit <rogerbacardit@gmail.com>
 Date: Mon, 16 Nov 2026 17:32:33 +0100
-Subject: [PATCH 4/4] MIDI IN: a menu turn marks the Set to be saved
+Subject: [PATCH 4/7] MIDI IN: a menu turn marks the Set to be saved
 
 Without it the channel lived until the next close: set-save writes the UI
 blob only when something marked it dirty. Found on device.

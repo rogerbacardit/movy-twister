@@ -1,0 +1,50 @@
+From 24e41a2393e583cf98df6d4ee663a8b2ace5d916 Mon Sep 17 00:00:00 2001
+From: rogerbacardit <rogerbacardit@gmail.com>
+Date: Mon, 16 Nov 2026 20:04:23 +0100
+Subject: [PATCH 6/7] Krautdrums: pads send notes 36-51, the module's current
+ voice map
+
+The bundled template sent the raw Move pad notes (rawMidi, 68-83), but
+Krautdrums now takes its 16 voices on notes 36-51 (52-67 are rhythm
+toggles), so every pad was silent. Same shape as mrdrums: padNoteStart 36,
+rawMidi false. Found on device after a module update.
+
+Gate: local suites (logic, app-loop, fleet-pages, screenshot).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ browser-test/logic/drums.mjs | 2 +-
+ src/modules/krautdrums.json  | 4 ++--
+ 2 files changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/browser-test/logic/drums.mjs b/browser-test/logic/drums.mjs
+index 6fe29a61..b9ae557f 100644
+--- a/browser-test/logic/drums.mjs
++++ b/browser-test/logic/drums.mjs
+@@ -40,7 +40,7 @@ _log('\nTest: drum module detection via loadHierarchy');
+   const vmk = mk.getViewModel();
+   eq('krautdrums: drumPadCount=16', vmk.drumPadCount, 16);
+   eq('krautdrums: drumCurrentPad defaults to 1', vmk.drumCurrentPad, 1);
+-  eq('krautdrums: rawMidi pad 1 is the lit grid pad', vmk.drumCurrentPhysPad, 68);
++  eq('krautdrums: pad 1 is the lit grid pad', vmk.drumCurrentPhysPad, 68);
+ 
+   const plaitsPreset = {
+     'synth:name': 'Plaits',
+diff --git a/src/modules/krautdrums.json b/src/modules/krautdrums.json
+index 41d03495..3e1b7eed 100644
+--- a/src/modules/krautdrums.json
++++ b/src/modules/krautdrums.json
+@@ -3,8 +3,8 @@
+   "name": "KrautDrums",
+   "drum": {
+     "padCount": 16,
+-    "padNoteStart": 68,
+-    "rawMidi": true
++    "padNoteStart": 36,
++    "rawMidi": false
+   },
+   "banks": [
+     {
+-- 
+2.54.0 (Apple Git-157)
+
