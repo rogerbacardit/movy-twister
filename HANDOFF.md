@@ -90,3 +90,10 @@ El usuario tiene dudas sobre la implementación: empezar por escucharlas.
 - `isTwisterCc(ch, cc)` en `ext-knob-map.ts` (canal 1 o 2, CC 0–15): solo esos CC cuentan para el "despertar" de 10 s; los del KeyStep ya no.
 - Tests +9 en `ext-knobs.mjs`; todas las suites locales en verde. Desplegado solo el `ui.js`, sin probar en el Move.
 - COMMIT 826b82cf en `device-v037`, solo en local: todo el trabajo del Twister de esta tarde y los colores. El usuario lo ha probado y funciona. No se ha subido a ningún remoto: `backup` = rogerbacardit/movy-twister (privado; ramas code-snapshot y notes) y `origin` = el repositorio del autor.
+
+## 2026-11-16 (noche, 2): Mini-JV causa parones en Movy. PENDIENTE
+- Síntoma: con el Mini-JV cargado, "slow frame" de unos 38 ms cada ~250 ms (4/s), la CPU se dispara y el audio se corta. Sin el Mini-JV va bien. El JE-8086 también se cargó (3 núcleos) y se quitó.
+- Descartado (medido en el Move): la prioridad RT del hilo del emulador (chrt a FIFO 45 y 69 no cambia nada), el disco (no hay escrituras; el hilo de audio solo espera en ablspi), las consultas de la página (pasa igual en otra pista) y las expansiones (aparcadas y restauradas; las 11 están de vuelta en roms/expansions con su patch_cache.bin).
+- Siguiente prueba pendiente: el Mini-JV con el Movy ORIGINAL (backups: /data/UserData/schwung/backup-movy-ui-v0.37.0-original.js + backup-movy-20261116-1726/dsp.so). Guardar antes `midiIn` del ui-state.json, porque el original lo borra (ya pasó una vez y se restauró a mano con Movy cerrado).
+- Borrador del reporte: `4-ISSUE-minijv.md`. Sin publicar.
+- Cuidado: otra sesión trabajó a la vez en la rama device-v037 (commit 826b82cf: colores de pista en los aros, cola de salida, pulsar = valor del preset). Usar una sola sesión.
