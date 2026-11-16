@@ -19,6 +19,7 @@ export async function run() {
     const mi = await import('../../dist/esm/track/midi-in.js');
     const { serializeUiState, applyUiState } = await import('../../dist/esm/seq/ui-state.js');
     const menu = await import('../../dist/esm/seq/track-menu.js');
+    const { takeUiDirty } = await import('../../dist/esm/seq/ui-dirty.js');
 
     const engine = installMockEngine();
     const reset = () => { resetSeqEngine(); resetSeqState(); resetStepRec(); resetSeqChord(); engine.reset(); mi.resetMidiIn(); };
@@ -72,10 +73,12 @@ export async function run() {
     /* The track menu (v0.37: MIDI IN is its one row): knob 1 turns it. */
     mi.resetMidiIn();
     menu.openTrackMenu(2);
+    takeUiDirty();
     eq('the menu opens for T3', menu.buildTrackMenuVM().rows[0].name, 'MIDI IN T3');
     menu.trackMenuKnob(1); menu.trackMenuKnob(1); menu.trackMenuKnob(1);
     eq('knob 1 turns the channel', menu.buildTrackMenuVM().rows[0].value, 'CH 3');
     eq('and it is the track\'s setting', mi.trackMidiIn(2), 3);
+    eq('a turn marks the Set to be saved', takeUiDirty(), true);
     menu.closeTrackMenu();
     eq('Back closes the menu', menu.trackMenuActive(), false);
 

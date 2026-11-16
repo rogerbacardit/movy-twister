@@ -6,6 +6,7 @@
 
 import type { FlagsPageVM } from './flags-page-vm.js';
 import { midiInLabel, stepTrackMidiIn, trackMidiIn } from '../track/midi-in.js';
+import { markUiStateDirty } from './ui-dirty.js';
 
 const state = { track: -1 };
 
@@ -27,7 +28,9 @@ export function closeTrackMenu(): void {
 
 /** Knob 1 (or the jog) steps the channel. */
 export function trackMenuKnob(dir: number): void {
-    if (state.track >= 0 && dir !== 0) stepTrackMidiIn(state.track, dir);
+    if (state.track < 0 || dir === 0) return;
+    stepTrackMidiIn(state.track, dir);
+    markUiStateDirty();   // the Set saves it (seq/set-save.ts), or it is gone on close
 }
 
 export function buildTrackMenuVM(): FlagsPageVM {
