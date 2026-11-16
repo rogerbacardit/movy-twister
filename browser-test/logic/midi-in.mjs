@@ -5,7 +5,7 @@
  * Run by browser-test/logic.mjs.
  */
 
-import { eq, lastMusicalOp, _log } from './harness.mjs';
+import { eq, lastMusicalOp, _log, installMockFs, uninstallMockFs, PREFS_PATH } from './harness.mjs';
 
 export async function run() {
     _log('\ntrack MIDI IN (channel per track):');
@@ -19,7 +19,7 @@ export async function run() {
     const mi = await import('../../dist/esm/track/midi-in.js');
     const { serializeUiState, applyUiState } = await import('../../dist/esm/seq/ui-state.js');
     const menu = await import('../../dist/esm/seq/track-menu.js');
-    const { takeUiDirty } = await import('../../dist/esm/seq/ui-dirty.js');
+    const { readPrefMidiIn } = await import('../../dist/esm/seq/prefs.js');
 
     const engine = installMockEngine();
     const reset = () => { resetSeqEngine(); resetSeqState(); resetStepRec(); resetSeqChord(); engine.reset(); mi.resetMidiIn(); };
@@ -55,13 +55,10 @@ export async function run() {
     eq('an unclaimed channel records on the active track', lastOp(), 'non 0 62 70');
     ext(0x80, 62, 0);
 
-    /* The Set carries it; an old Set is all SEL. */
-    const blob = serializeUiState();
-    mi.resetMidiIn();
-    applyUiState(blob);
-    eq('MIDI IN round-trips through the UI blob', mi.trackMidiIn(3), 4);
-    applyUiState(JSON.stringify({ oct: [4, 4] }));
-    eq('a Set from before MIDI IN is all SEL', mi.trackMidiIn(3), 0);
+    /* Machine-level: a set neither carries it nor changes it on load. */
+    eq('a set\'s UI blob does not carry MIDI IN', /midiIn/.test(serializeUiState()), false);
+    applyUiState(JSON.stringify({ oct: [4, 4], midiIn: [0, 0, 0, 0] }));
+    eq('loading a set keeps the machine\'s channels', mi.trackMidiIn(3), 4);
 
     /* Steps clamp at SEL and 16. */
     mi.stepTrackMidiIn(6, -1);
@@ -72,13 +69,19 @@ export async function run() {
 
     /* The track menu (v0.37: MIDI IN is its one row): knob 1 turns it. */
     mi.resetMidiIn();
+    installMockFs({ [PREFS_PATH]: JSON.stringify({ masterVolume: 0.5 }) });
     menu.openTrackMenu(2);
-    takeUiDirty();
     eq('the menu opens for T3', menu.buildTrackMenuVM().rows[0].name, 'MIDI IN T3');
     menu.trackMenuKnob(1); menu.trackMenuKnob(1); menu.trackMenuKnob(1);
     eq('knob 1 turns the channel', menu.buildTrackMenuVM().rows[0].value, 'CH 3');
     eq('and it is the track\'s setting', mi.trackMidiIn(2), 3);
-    eq('a turn marks the Set to be saved', takeUiDirty(), true);
+    const saved = readPrefMidiIn();
+    eq('a turn saves it in the machine prefs', Array.isArray(saved) && saved[2], 3);
+    mi.restoreMidiIn([]);
+    mi.restoreMidiIn(readPrefMidiIn());
+    eq('and it comes back from them', mi.trackMidiIn(2), 3);
+    eq('the other prefs are kept', JSON.parse(globalThis.host_read_file?.(PREFS_PATH) ?? '{}').masterVolume ?? 0.5, 0.5);
+    uninstallMockFs();
     menu.closeTrackMenu();
     eq('Back closes the menu', menu.trackMenuActive(), false);
 

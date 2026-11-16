@@ -1,5 +1,5 @@
-/* The per-set UI-only state: tonic, scale, mode, pad layout, per-track octave,
- * track mutes and each track's MIDI IN. Kept apart from the engine's own serialization because the
+/* The per-set UI-only state: tonic, scale, mode, pad layout, per-track octave
+ * and track mutes. (MIDI IN is machine-level, seq/prefs.ts.) Kept apart from the engine's own serialization because the
  * engine knows nothing about any of it — it is ferried in its own JSON file
  * alongside the state blob. */
 
@@ -11,7 +11,6 @@ import { mutesSnapshot, restoreMutes, resetTrackMutes } from '../mixer/track-mut
 import { seqState } from './state.js';
 import { seqCmd } from './engine.js';
 import { readPrefDefaultQuant } from './prefs.js';
-import { midiInSnapshot, restoreMidiIn, resetMidiIn } from '../track/midi-in.js';
 
 const clampInt = (v: unknown, lo: number, hi: number, dflt: number): number =>
     typeof v === 'number' && isFinite(v) ? Math.max(lo, Math.min(hi, v | 0)) : dflt;
@@ -29,7 +28,6 @@ export function serializeUiState(): string {
         layout: keyboardState.layout,
         oct:    keyboardState.octave.slice(),
         mutes:  mutesSnapshot(),
-        midiIn: midiInSnapshot(),
         defaultQuant: seqState.defaultQuant,
     });
 }
@@ -54,7 +52,6 @@ export function applyUiState(blob: string): void {
         keyboardState.mode   = clampInt(o.mode,   0, MODE_NAMES.length - 1, 0);
         keyboardState.layout = clampInt(o.layout, 0, layoutNames(keyboardState.mode).length - 1, 0);
         if (o.mutes) restoreMutes(o.mutes);
-        restoreMidiIn(o.midiIn);
         /* Absent = a set written before this feature, or a brand new one. Both
          * adopt the machine default rather than snapping to zero — that is the
          * whole point of keeping it outside the set. */
@@ -79,6 +76,5 @@ export function resetUiState(): void {
     keyboardState.layout = 0;
     resetOctaves();
     resetTrackMutes();
-    resetMidiIn();
     applyDefaultQuant(readPrefDefaultQuant());
 }

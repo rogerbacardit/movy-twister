@@ -28,6 +28,7 @@ const clampPct = (v: unknown): number =>
 type PrefsFile = {
     defaultQuant?: unknown; fileDirs?: unknown; moduleBlacklist?: unknown;
     fullVelocity?: unknown; masterVolume?: unknown; clickDb?: unknown;
+    midiIn?: unknown;
 };
 
 function readPrefs(): PrefsFile {
@@ -153,4 +154,15 @@ export function writePrefFileDir(key: string, dir: string): void {
         for (let i = 0; i < keys.length - MAX_FILE_DIRS; i++) delete dirs[keys[i]];
         p.fileDirs = dirs;
     });
+}
+
+/* Each track's MIDI IN channel (track/midi-in.ts). Machine-level, not per
+ * set: the channels describe the rig plugged into USB-A (a KeyStep Pro's
+ * tracks), which is the same whichever set is open (user, 2026-11-16). */
+export function readPrefMidiIn(): unknown {
+    return readPrefs().midiIn;
+}
+
+export function writePrefMidiIn(channels: number[]): void {
+    writePrefs((p) => { p.midiIn = channels.slice(); });
 }
