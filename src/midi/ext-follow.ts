@@ -30,11 +30,28 @@ const sent: number[] = new Array(EXT_KNOBS).fill(-1);
 const HOLD_MS = 350;
 const touchedMs: number[] = new Array(EXT_KNOBS).fill(0);
 
+/* RESYNC ON REST, NOT ON THE NEXT FRAME. twisterFollow runs per rendered
+ * frame, and an idle page renders none once the parameter stops moving — so a
+ * knob turned to its 127 end, with the parameter still at 70 %, was never
+ * resynced and could not take it further (seen on device). The last levels are
+ * kept, and twisterFollowRest (each tick) replays them once a hold expires. */
+const lastLevels: (number | null)[] = new Array(EXT_KNOBS).fill(null);
+let restDueMs = 0;
+
 /** A Twister knob (0-7) was just turned. */
 export function twisterTouched(knob: number, nowMs = Date.now()): void {
     if (knob < 0 || knob >= EXT_KNOBS) return;
     touchedMs[knob] = nowMs;
     sent[knob] = -1;    /* whatever it lands on is resent when it rests */
+    restDueMs = nowMs + HOLD_MS;
+}
+
+/** Each tick: a knob that has just come to rest gets its ring back, frame or
+ *  not. One compare when nothing is pending. */
+export function twisterFollowRest(nowMs = Date.now()): void {
+    if (!restDueMs || nowMs < restDueMs) return;
+    restDueMs = 0;
+    twisterFollow(lastLevels, nowMs);
 }
 
 /* The absolute decoder's origin setter, registered by midi/ext-knobs.ts at
@@ -60,8 +77,9 @@ export function twisterFollow(levels: readonly (number | null)[], nowMs = Date.n
     if (!armed) return;
     twisterColorSync();    /* the rings wear the active track's colour */
     for (let k = 0; k < EXT_KNOBS; k++) {
-        if (nowMs - touchedMs[k] < HOLD_MS) continue;
         const lv = levels[k];
+        if (levels !== lastLevels) lastLevels[k] = lv ?? null;
+        if (nowMs - touchedMs[k] < HOLD_MS) continue;
         if (lv === null || lv === undefined || !isFinite(lv)) continue;
         const v = Math.max(0, Math.min(127, Math.round(lv * 127)));
         if (sent[k] === v) continue;
