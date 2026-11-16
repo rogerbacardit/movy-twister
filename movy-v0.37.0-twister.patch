@@ -1,0 +1,215 @@
+diff --git a/src/midi/external.ts b/src/midi/external.ts
+index 69c7d2e..7ca5d1c 100644
+--- a/src/midi/external.ts
++++ b/src/midi/external.ts
+@@ -8,10 +8,124 @@ import { drumConfigFor } from '../track/pad-route.js';
+ import { extDrumPitch } from '../track/ext-route.js';
+ import { seqNotePadPlayed, seqNotePadReleased } from '../seq/router-pads.js';
+ import { EXT_KEY_BASE, extHold, extRelease } from './external-ledger.js';
++import { onMidiMessageInternal, extPresetTurn } from './router.js';
++import { mlog } from '../log.js';
++
++/* External knob controller (e.g. Midi Fighter Twister).
++ *
++ * Every mapping is replayed as the Move control it stands for, through the
++ * internal router, so each page, lock and modal behaves exactly as with the
++ * hardware.
++ *
++ *  - CC 71-78 relative (two's complement, the Move encoders' own format;
++ *    Twister "ENC 7FH/01H") and CC 102-109 absolute: the 8 param knobs, the
++ *    same convention as Schwung's slot knobs.
++ *  - A factory-default Twister (rotation = absolute CC 0-15 on channel 1,
++ *    push = CC 0-15 on channel 2, 127 down / 0 up):
++ *      encoder 1  turn = jog (geared down), push = jog click
++ *      encoder 3  turn = presets of the module the knobs edit
++ *      encoder 4  push = Back
++ *      rows 3-4 (encoders 9-16) = knobs 1-8
++ *      encoder 2 is never used: CC 1 is the mod wheel to the engine
++ *      (ext_route.rs) and cannot be kept out of the synth from here. */
++const EXT_REL_BASE = 71, EXT_ABS_BASE = 102, EXT_KNOBS = 8;
++const TW_KNOB_BASE = 8;            /* Twister CC 8-15 -> knobs 1-8 */
++const TW_JOG = 0, TW_PRESET = 2, TW_BACK = 3;
++const absLast = new Map<string, number>();
++const TW_JOG_STEPS = 10;
++let jogAccum = 0;
++let extCcLogged = 0;
++
++/* Absolute 0-127 -> a Move-format relative value (0 = no move). The first
++ * value seen on a control only sets its origin. */
++function absToRel(id: string, v: number): number {
++    const last = absLast.get(id);
++    absLast.set(id, v);
++    if (last === undefined) return 0;
++    const delta = Math.max(-63, Math.min(63, v - last));
++    return delta >= 0 ? delta : 128 + delta;
++}
++
++function replay(cc: number, value: number): void {
++    onMidiMessageInternal([0xB0, cc, value]);
++}
++
++function extKnobCc(ch: number, d1: number, d2: number): void {
++    if (d1 >= EXT_REL_BASE && d1 < EXT_REL_BASE + EXT_KNOBS) {
++        if (d2 !== 0 && d2 !== 64) replay(MoveKnob1 + d1 - EXT_REL_BASE, d2);
++        return;
++    }
++    if (d1 >= EXT_ABS_BASE && d1 < EXT_ABS_BASE + EXT_KNOBS) {
++        const rel = absToRel('abs' + d1, d2);
++        if (rel) replay(MoveKnob1 + d1 - EXT_ABS_BASE, rel);
++        return;
++    }
++    if (ch === 2) {                      /* Twister encoder pushes */
++        const down = d2 > 0;
++        if (d1 === TW_JOG)    { replay(MoveMainButton, down ? 127 : 0); return; }
++        if (d1 === TW_BACK)   { replay(MoveBack, down ? 127 : 0); return; }
++        return;
++    }
++    if (ch !== 1) return;
++    if (d1 === TW_JOG) {
++        /* The Twister sends ~1 value per small step, the Move jog 1 per detent:
++         * gear it down so one jog step (one page) takes TW_JOG_STEPS of them. */
++        const rel = absToRel('tw' + d1, d2);
++        if (!rel) return;
++        jogAccum += rel < 64 ? rel : rel - 128;
++        while (jogAccum >= TW_JOG_STEPS)  { jogAccum -= TW_JOG_STEPS; replay(MoveMainKnob, 1); }
++        while (jogAccum <= -TW_JOG_STEPS) { jogAccum += TW_JOG_STEPS; replay(MoveMainKnob, 127); }
++        return;
++    }
++    if (d1 === TW_PRESET) {              /* turn = previous / next preset */
++        const rel = absToRel('tw' + d1, d2);
++        if (rel) extPresetTurn(rel < 64 ? rel : rel - 128);
++        return;
++    }
++    if (d1 >= TW_KNOB_BASE && d1 < TW_KNOB_BASE + EXT_KNOBS) {
++        const rel = absToRel('tw' + d1, d2);
++        if (!rel) return;
++        replay(MoveKnob1 + d1 - TW_KNOB_BASE, rel);
++    }
++}
++
++/* Twister rings. Channel 2 CC n = encoder n's colour (hue 1-126); channel 3
++ * CC n = its animation/brightness: 17 RGB off .. 47 full, 65 indicator off ..
++ * 95 full. Encoders that do something are green, the rest go dark. Sent
++ * whenever the controller wakes up after a quiet spell, since a Twister forgets
++ * it on reconnect. */
++const TWISTER_COLOR = 50;   /* green */
++const TW_ASSIGNED = new Set<number>([TW_JOG, TW_PRESET, TW_BACK,
++    8, 9, 10, 11, 12, 13, 14, 15]);
++let extLastCcMs = 0;
++
++function paintTwister(): void {
++    const send = (globalThis as any).move_midi_external_send;
++    if (typeof send !== 'function') return;
++    for (let enc = 0; enc < 16; enc++) {
++        if (TW_ASSIGNED.has(enc)) {
++            send([0x0B, 0xB1, enc, TWISTER_COLOR]);
++            send([0x0B, 0xB2, enc, 47]);
++            send([0x0B, 0xB2, enc, 95]);
++        } else {
++            send([0x0B, 0xB2, enc, 17]);
++            send([0x0B, 0xB2, enc, 65]);
++        }
++    }
++    mlog('extCC paint twister color=' + TWISTER_COLOR);
++}
+ 
+ export function onMidiMessageExternal(data: number[]): void {
+     if (!data || data.length < 3) return;
+     const type = data[0] & 0xF0, note = data[1] & 0x7F, vel = data[2];
++    if (type === 0xB0) {
++        const now = Date.now();
++        if (now - extLastCcMs > 10000) { paintTwister(); extCcLogged = 0; }
++        extLastCcMs = now;
++        if (extCcLogged < 40) { extCcLogged++; mlog('extCC ch=' + ((data[0] & 0x0F) + 1) + ' cc=' + note + ' v=' + vel); }
++        extKnobCc((data[0] & 0x0F) + 1, note, vel);
++        return;
++    }
+     const key = EXT_KEY_BASE + note;
+     if (type === 0x90 && vel > 0) {
+         const track = appState.activeTrack.index;
+diff --git a/src/midi/router.ts b/src/midi/router.ts
+index d3c60bd..4bee09d 100644
+--- a/src/midi/router.ts
++++ b/src/midi/router.ts
+@@ -174,6 +174,13 @@ function masterDetailActive(): boolean { return masterChainActive() && appState.
+ /* Reset whenever the session is live, so each boot logs its own refusal. */
+ let refusedThisBoot = false;
+ 
++/* An external controller's preset encoder (midi/external.ts): step the preset
++ * list of the module the knobs edit, from whatever page is on screen. */
++export function extPresetTurn(delta: number): void {
++    const page = pageOwnerOf(knobModel()).page;
++    if (page && page.presetStep(delta)) appState.dirty = true;
++}
++
+ export function onMidiMessageInternal(data: number[]): void {
+     if (!data || data.length < 3) return;
+     /* Before any dispatch, including the paths that swallow input: a button
+diff --git a/src/renderer/schwung-grid.ts b/src/renderer/schwung-grid.ts
+index f93c75f..39ca02d 100644
+--- a/src/renderer/schwung-grid.ts
++++ b/src/renderer/schwung-grid.ts
+@@ -76,7 +76,7 @@ function deadPage(componentKey: string): SchwungPage {
+     mlog('schwung-grid: no virtual source for ' + componentKey);
+     return {
+         reload() {}, tick() {}, pageCount: 0, pageIndex: 0,
+-        changePage() {}, goToPage() {}, keyAt: () => null, targetAt: () => null,
++        changePage() {}, goToPage() {}, presetStep: () => false, keyAt: () => null, targetAt: () => null,
+         labelAt: () => null, knobParamInfo: () => null, knobLevels: () => new Array(8).fill(null),
+         marks: () => 0,
+         animating: () => STILL, peekOpen: () => false, render() {}, chrome: () => ({ header: null, footer: null, pageLabel: null, padScoped: false }), regularKnobAt: () => false,
+diff --git a/src/renderer/schwung-page-input.ts b/src/renderer/schwung-page-input.ts
+index bb3991a..9c30995 100644
+--- a/src/renderer/schwung-page-input.ts
++++ b/src/renderer/schwung-page-input.ts
+@@ -39,6 +39,10 @@ export interface PageInput {
+     /** Where knob 1 sits in the preset list (0..1) while it browses one, else
+      *  null — so its LED says "this knob does something" like any bound knob. */
+     presetKnobLevel(): number | null;
++    /** Step the module's preset list from whatever page is on screen: land on
++     *  the preset door, take the step there, come back. False when the module
++     *  has no preset door. (External controller, e.g. a Twister encoder.) */
++    presetStep(delta: number): boolean;
+ }
+ 
+ export function createPageInput(ctl: any, lib: any, port: PageParamSource,
+@@ -162,6 +166,18 @@ export function createPageInput(ctl: any, lib: any, port: PageParamSource,
+         },
+         knobTouch: (slot: number, down: boolean) => { ctl.onKnobTouch(slot, down); },
+         presetKnobLevel: preset.level,
++        presetStep(delta: number): boolean {
++            const pages: any[] = ctl.pages || [];
++            const door = pages.findIndex((p) => p && p.kind === lib.PAGE_PRESET
++                && !(Array.isArray(p.keys) && p.keys[0]));
++            if (door < 0) return false;
++            const back = ctl.pageIndex;
++            if (back !== door) ctl.goToPage(door, { remember: false });
++            let ok = false;
++            try { ok = preset.turn(delta, false); }
++            finally { if (back !== door) ctl.goToPage(back, { remember: false }); }
++            return ok;
++        },
+         /*
+          * The whole ladder, Schwung's. The old binding was `ctl.onClick()` with
+          * no slot and the return discarded, which silently dropped three
+diff --git a/src/renderer/schwung-page.ts b/src/renderer/schwung-page.ts
+index 871a920..95bb0bb 100644
+--- a/src/renderer/schwung-page.ts
++++ b/src/renderer/schwung-page.ts
+@@ -110,6 +110,8 @@ export interface SchwungPage {
+     regularKnobAt(slot: number): boolean;
+     /** `shift` only means something on a preset door: it steps the bank. */
+     knobTurn(slot: number, delta: number, shift?: boolean): void;
++    /** Step the preset list from any page (see PageInput.presetStep). */
++    presetStep(delta: number): boolean;
+     knobTouch(slot: number, down: boolean): void;
+     /** Jog click. Returns a host intent ("open") when Schwung asks for one. */
+     click(shift?: boolean): SchwungIntent | null;
+@@ -258,6 +260,7 @@ export function createSchwungPage(
+             seat.onBlock() || hier.padScopedLevel(ctl.pages?.[ctl.pageIndex]?.level)),
+         regularKnobAt: (slot: number) => regularKnob(ctl.metaAt ? ctl.metaAt(slot) : null, lib),
+         knobTurn: input.knobTurn,
++        presetStep: input.presetStep,
+         knobTouch: input.knobTouch,
+         click: input.click,
+         back: input.back,
