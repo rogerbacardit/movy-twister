@@ -7,10 +7,11 @@ import { appState } from '../app/state.js';
 import { pageOwnerOf } from '../app/page-owner.js';
 import { onMidiMessageInternal, knobModel } from './router.js';
 import { createExtKnobState, extKnobActions, isTwisterCc } from './ext-knob-map.js';
-import { armTwisterFollow } from './ext-follow.js';
+import { armTwisterFollow, setTwisterSync } from './ext-follow.js';
 import { extBaseForget, extKnobReset, extKnobTurn } from './ext-param.js';
 
 const state = createExtKnobState();
+setTwisterSync((cc, v) => state.abs.set('tw' + cc, v));
 
 /* A Twister forgets its ring colours on reconnect, and nothing tells us it
  * reconnected — so the rings are repainted whenever CCs resume after a quiet
