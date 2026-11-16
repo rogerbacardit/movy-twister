@@ -1,0 +1,205 @@
+From 53adadec10288c8b1ce81547b7fd38090b99595a Mon Sep 17 00:00:00 2001
+From: rogerbacardit <rogerbacardit@gmail.com>
+Date: Mon, 16 Nov 2026 23:12:24 +0100
+Subject: [PATCH 9/9] Twister: a continuous parameter follows the ring's
+ position, full range
+
+Two faults kept a Twister knob from reaching a parameter's ends:
+
+- Each relative step moved range/200 (Schwung's knob_engine), so the 128
+  steps of a factory Twister's travel crossed only 64 % of the range. A
+  continuous parameter with a min/max is now set from the ring's position
+  (ext-param-steps continuousAt), linear like Schwung's normalizedOf, so the
+  ring the follow puts back is exactly where the turn continues.
+- The ring resync ran only on a rendered frame; an idle page renders none
+  once the turn stops, so the ring was left at its end. twisterFollowRest
+  replays the last levels from the tick once a hold expires.
+
+Tier: local suites (abi-parity skipped: needs the author's schwung path, red
+on main too) + deployed and tried by hand on the device; device tier not run.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ browser-test/logic/ext-knobs.mjs | 25 +++++++++++++++++++++++++
+ src/app/tick.ts                  |  2 ++
+ src/midi/ext-follow.ts           | 20 +++++++++++++++++++-
+ src/midi/ext-param-steps.ts      | 10 ++++++++++
+ src/midi/ext-param.ts            | 15 +++++++++------
+ 5 files changed, 65 insertions(+), 7 deletions(-)
+
+diff --git a/browser-test/logic/ext-knobs.mjs b/browser-test/logic/ext-knobs.mjs
+index e588ac6d..77e5f43b 100644
+--- a/browser-test/logic/ext-knobs.mjs
++++ b/browser-test/logic/ext-knobs.mjs
+@@ -78,6 +78,11 @@ export async function run() {
+     eq('an enum wires its index', sp.wireOf(en3, 2), '2');
+     eq('an enum that wires names sends the name', sp.wireOf({ ...en3, wiresNames: true }, 1), 'B');
+     eq('an int wires a whole number', sp.wireOf({ type: 'int', min: 0, max: 4 }, 3.0), '3');
++    const fl = { type: 'float', value: 0.3, min: 0, max: 1 };
++    eq('a continuous ring 0 is the minimum', sp.continuousAt(fl, 0), 0);
++    eq('a continuous ring 127 is the maximum', sp.continuousAt(fl, 127), 1);
++    eq('a continuous ring is linear over the range', sp.continuousAt({ ...fl, min: 20, max: 20020 }, 63.5), 10020);
++    eq('a wide int lands on whole numbers', sp.continuousAt({ type: 'int', min: 0, max: 127 }, 64), 64);
+ 
+     /* The rings leave a knob alone while it is being turned (midi/ext-follow.ts). */
+     const fo = await import('../../dist/esm/midi/ext-follow.js');
+@@ -97,6 +102,26 @@ export async function run() {
+         drain();
+         eq('it is resynced once it rests', sent.join(' '), '8=64');
+ 
++        /* An idle page renders no frame after the turn: the tick resyncs it. */
++        sent.length = 0;
++        fo.twisterFollow([0.7, null, null, null, null, null, null, null], 1600);
++        drain();
++        sent.length = 0;
++        fo.twisterTouched(0, 1700);
++        fo.twisterFollow([0.7, null, null, null, null, null, null, null], 1750);
++        fo.twisterFollowRest(1800);
++        drain();
++        eq('no resync while the hold lasts', sent.join(' '), '');
++        fo.twisterFollowRest(2060);
++        drain();
++        eq('a resting ring is resynced with no new frame', sent.join(' '), '8=89');
++        fo.twisterFollowRest(2500);
++        drain();
++        eq('and only once', sent.join(' '), '8=89');
++        fo.twisterFollow([0.5, null, null, null, null, null, null, null], 2600);
++        drain();   /* back to the ring the checks below start from */
++        sent.length = 0;
++
+         /* The assigned rings wear the active track's colour (midi/ext-colors.ts). */
+         const co = await import('../../dist/esm/midi/ext-colors.js');
+         const cs = await import('../../dist/esm/seq/colors.js');
+diff --git a/src/app/tick.ts b/src/app/tick.ts
+index 70c93082..086496a3 100644
+--- a/src/app/tick.ts
++++ b/src/app/tick.ts
+@@ -45,6 +45,7 @@ import type { PageChrome } from '../renderer/schwung-page-chrome.js';
+ import { renderFileBrowseView } from '../renderer/file-browse-view.js';
+ import { updateKnobLEDsFrom, updateSingleKnobLED } from '../renderer/knob-leds.js';
+ import { twisterOutFlush } from '../midi/ext-out.js';
++import { twisterFollowRest } from '../midi/ext-follow.js';
+ import { seqEngineTick, takeLabelSync, requestLabelSync } from '../seq/engine.js';
+ import { drumSyncTick, resetDrumSync } from '../seq/drum-sync.js';
+ import { bindLanes } from '../seq/lane-mapping.js';
+@@ -395,6 +396,7 @@ export function tick(): void {
+     tickBody();
+     /* Outside tickBody so none of its early returns stalls the queue: what this
+      * tick painted leaves this tick, paced (midi/ext-out.ts). */
++    twisterFollowRest();   /* a resting Twister ring is resynced, frame or not */
+     twisterOutFlush();
+     /* Outside tickBody so its early returns are still accounted for. */
+     perfProbeTick();
+diff --git a/src/midi/ext-follow.ts b/src/midi/ext-follow.ts
+index 14ab7316..ee08b8b2 100644
+--- a/src/midi/ext-follow.ts
++++ b/src/midi/ext-follow.ts
+@@ -30,11 +30,28 @@ const sent: number[] = new Array(EXT_KNOBS).fill(-1);
+ const HOLD_MS = 350;
+ const touchedMs: number[] = new Array(EXT_KNOBS).fill(0);
+ 
++/* RESYNC ON REST, NOT ON THE NEXT FRAME. twisterFollow runs per rendered
++ * frame, and an idle page renders none once the parameter stops moving — so a
++ * knob turned to its 127 end, with the parameter still at 70 %, was never
++ * resynced and could not take it further (seen on device). The last levels are
++ * kept, and twisterFollowRest (each tick) replays them once a hold expires. */
++const lastLevels: (number | null)[] = new Array(EXT_KNOBS).fill(null);
++let restDueMs = 0;
++
+ /** A Twister knob (0-7) was just turned. */
+ export function twisterTouched(knob: number, nowMs = Date.now()): void {
+     if (knob < 0 || knob >= EXT_KNOBS) return;
+     touchedMs[knob] = nowMs;
+     sent[knob] = -1;    /* whatever it lands on is resent when it rests */
++    restDueMs = nowMs + HOLD_MS;
++}
++
++/** Each tick: a knob that has just come to rest gets its ring back, frame or
++ *  not. One compare when nothing is pending. */
++export function twisterFollowRest(nowMs = Date.now()): void {
++    if (!restDueMs || nowMs < restDueMs) return;
++    restDueMs = 0;
++    twisterFollow(lastLevels, nowMs);
+ }
+ 
+ /* The absolute decoder's origin setter, registered by midi/ext-knobs.ts at
+@@ -60,8 +77,9 @@ export function twisterFollow(levels: readonly (number | null)[], nowMs = Date.n
+     if (!armed) return;
+     twisterColorSync();    /* the rings wear the active track's colour */
+     for (let k = 0; k < EXT_KNOBS; k++) {
+-        if (nowMs - touchedMs[k] < HOLD_MS) continue;
+         const lv = levels[k];
++        if (levels !== lastLevels) lastLevels[k] = lv ?? null;
++        if (nowMs - touchedMs[k] < HOLD_MS) continue;
+         if (lv === null || lv === undefined || !isFinite(lv)) continue;
+         const v = Math.max(0, Math.min(127, Math.round(lv * 127)));
+         if (sent[k] === v) continue;
+diff --git a/src/midi/ext-param-steps.ts b/src/midi/ext-param-steps.ts
+index f29b1abb..92ad128b 100644
+--- a/src/midi/ext-param-steps.ts
++++ b/src/midi/ext-param-steps.ts
+@@ -37,6 +37,16 @@ export function valueAt(info: StepInfo, n: number, pos: number): number {
+     return info.type === 'enum' ? zone : Math.round(info.min) + zone;
+ }
+ 
++/** A continuous parameter at ring position 0-127: the whole travel is the
++ *  whole range, linear like Schwung's knob level (normalizedOf), so the ring
++ *  the follow puts back (midi/ext-follow.ts) is exactly where it continues.
++ *  Relative steps were range/200 each — 128 of them crossed only 64 %. */
++export function continuousAt(info: StepInfo, pos: number): number {
++    const t = Math.max(0, Math.min(127, pos)) / 127;
++    const v = info.min + t * (info.max - info.min);
++    return info.type === 'int' ? Math.round(v) : v;
++}
++
+ /** The string a module's set_param takes for `value`. */
+ export function wireOf(info: StepInfo, value: number): string {
+     if (info.type === 'enum') {
+diff --git a/src/midi/ext-param.ts b/src/midi/ext-param.ts
+index 68fc67d1..81399562 100644
+--- a/src/midi/ext-param.ts
++++ b/src/midi/ext-param.ts
+@@ -14,7 +14,7 @@ import { appState } from '../app/state.js';
+ import { pageOwnerOf, type PageOwner, type PageRef } from '../app/page-owner.js';
+ import { pageSourceFor } from '../renderer/schwung-grid.js';
+ import { onMidiMessageInternal, knobModel } from './router.js';
+-import { stepCount, valueAt, wireOf, type StepInfo } from './ext-param-steps.js';
++import { stepCount, valueAt, continuousAt, wireOf, type StepInfo } from './ext-param-steps.js';
+ import { twisterTouched } from './ext-follow.js';
+ import { mlog } from '../log.js';
+ 
+@@ -51,23 +51,26 @@ function write(ref: PageRef, info: StepInfo & { ioKey: string }, value: number):
+     appState.dirty = true;
+ }
+ 
+-/** A Twister knob turned: steps for a continuous parameter, the ring's
+- *  position for a stepped one. */
++/** A Twister knob turned: the ring's position picks the value — a zone for a
++ *  stepped parameter, the matching point of the range for a continuous one.
++ *  Only a knob with no ranged parameter (the preset list) still steps. */
+ export function extKnobTurn(knob: number, delta: number, pos: number): void {
+     twisterTouched(knob);
+     const owner = pageOwnerOf(knobModel());
+     const info = owner.ref && owner.page ? owner.knobParamInfo(knob) : null;
+     const n = stepCount(info);
+-    if (!n || !owner.ref) {
++    const ranged = !!info && info.type !== 'enum' && isFinite(info.min) && isFinite(info.max)
++        && info.max > info.min;
++    if (!owner.ref || (!n && !ranged)) {
+         onMidiMessageInternal([0xB0, MoveKnob1 + knob, delta >= 0 ? delta : 128 + delta]);
+         return;
+     }
+     extBaseNote(owner, knob, info);
+-    const v = valueAt(info, n, pos);
++    const v = n ? valueAt(info, n, pos) : continuousAt(info, pos);
+     /* The page re-reads the value a few ticks later, so until then info.value
+      * is the old one: without `zoneSent` every CC in between rewrote it. */
+     const zone = idOf(owner.ref, info.ioKey) + '=' + v;
+-    if (v === Math.round(info.value)) { zoneSent[knob] = ''; return; }
++    if (v === (n ? Math.round(info.value) : info.value)) { zoneSent[knob] = ''; return; }
+     if (zoneSent[knob] === zone) return;
+     zoneSent[knob] = zone;
+     write(owner.ref, info, v);
+-- 
+2.54.0 (Apple Git-157)
+

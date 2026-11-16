@@ -115,3 +115,8 @@ El usuario tiene dudas sobre la implementación: empezar por escucharlas.
 - Causa: cada paso relativo movía range/200 (knob_engine de Schwung) → 128 pasos del Twister = 64% del rango. Además el aro solo se resincronizaba en un frame renderizado; con la página quieta se quedaba en el tope.
 - Arreglo: parámetros continuos con min/max se fijan por la POSICIÓN del aro (`continuousAt`, lineal como `normalizedOf`); `twisterFollowRest()` en cada tick resincroniza el aro al soltar (HOLD_MS 350).
 - Probado a mano por el usuario: funciona. Desplegado en el Move. Snapshot en GitHub: rama `code-snapshot` (02a3d3ae).
+
+## 2026-11-16: todo respaldado en GitHub (rogerbacardit/movy-twister)
+- `code-snapshot`: código de device-v037 (lo que corre en el Move). `snap-external-knob-controller` y `snap-midi-channel-per-track`: copias de las ramas para upstream. Todas sin `.github/workflows` (el token no tiene scope workflow; el historial de upstream los contiene, por eso no se suben las ramas tal cual).
+- Historial completo como parches en `notes`: `patches-git/<rama>/` → `git checkout main && git am patches-git/<rama>/*.patch` los recrea.
+- `sets-backup`: copia de los Sets de Movy (`/data/UserData/UserLibrary/Movy`), restaurar con Movy cerrado (ver README de la rama).

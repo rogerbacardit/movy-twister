@@ -1,0 +1,775 @@
+From 99b48977c5f0cfc9e83f2ae0a3bd2205bd4818b3 Mon Sep 17 00:00:00 2001
+From: rogerbacardit <rogerbacardit@gmail.com>
+Date: Mon, 16 Nov 2026 17:26:13 +0100
+Subject: [PATCH 3/9] v0.37.0 device build: track MIDI IN (channel per track)
+
+Backport of 06e2d6b3. v0.37.0 has no track menu yet (it came with Freeze),
+so Shift + track opens a one-row menu: MIDI IN, turned by knob 1 or the jog.
+Engine ext_route.rs and the UI route/recording/persistence are main's,
+unchanged. Gate: local suites + cargo test on this branch.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ browser-test/logic.mjs                  |   2 +
+ browser-test/logic/midi-in.mjs          |  84 ++++++++++
+ build/browser.mjs                       |   3 +
+ engine/crates/movy-dsp/src/ext_route.rs | 214 ++++++++++++++++++------
+ engine/crates/movy-dsp/src/lib.rs       |   9 +-
+ src/app/tick.ts                         |   3 +
+ src/midi/external.ts                    |   9 +-
+ src/midi/router.ts                      |  12 ++
+ src/seq/track-menu-input.ts             |  17 ++
+ src/seq/track-menu.ts                   |  44 +++++
+ src/seq/ui-state.ts                     |   8 +-
+ src/track/ext-route.ts                  |  22 ++-
+ src/track/midi-in.ts                    |  58 +++++++
+ 13 files changed, 422 insertions(+), 63 deletions(-)
+ create mode 100644 browser-test/logic/midi-in.mjs
+ create mode 100644 src/seq/track-menu-input.ts
+ create mode 100644 src/seq/track-menu.ts
+ create mode 100644 src/track/midi-in.ts
+
+diff --git a/browser-test/logic.mjs b/browser-test/logic.mjs
+index 70b67a54..a5b3eddd 100644
+--- a/browser-test/logic.mjs
++++ b/browser-test/logic.mjs
+@@ -55,6 +55,7 @@ import { run as run_note_view } from './logic/note-view.mjs';
+ import { run as run_step_piano } from './logic/step-piano.mjs';
+ import { run as run_external_midi } from './logic/external-midi.mjs';
+ import { run as run_ext_knobs } from './logic/ext-knobs.mjs';
++import { run as run_midi_in } from './logic/midi-in.mjs';
+ import { run as run_track_watch } from './logic/track-watch.mjs';
+ import { run as run_tracks_refs } from './logic/tracks-refs.mjs';
+ import { run as run_tracks_chain } from './logic/tracks-chain.mjs';
+@@ -149,6 +150,7 @@ const SUITES = [
+     run_step_piano,
+     run_external_midi,
+     run_ext_knobs,
++    run_midi_in,
+     run_track_watch,
+     run_tracks_refs,
+     run_tracks_chain,
+diff --git a/browser-test/logic/midi-in.mjs b/browser-test/logic/midi-in.mjs
+new file mode 100644
+index 00000000..defdf2db
+--- /dev/null
++++ b/browser-test/logic/midi-in.mjs
+@@ -0,0 +1,84 @@
++/* browser-test/logic/midi-in.mjs — a track's MIDI IN (track/midi-in.ts): a
++ * claimed USB-A channel plays its track whatever is selected; the engine's
++ * route, the recording, the Set and the track menu all agree on it.
++ *
++ * Run by browser-test/logic.mjs.
++ */
++
++import { eq, lastMusicalOp, _log } from './harness.mjs';
++
++export async function run() {
++    _log('\ntrack MIDI IN (channel per track):');
++    const { installMockEngine, uninstallMockEngine } = await import('../mock-engine.mjs');
++    const { seqEngineTick, resetSeqEngine } = await import('../../dist/esm/seq/engine.js');
++    const { resetSeqState } = await import('../../dist/esm/seq/state.js');
++    const { resetStepRec } = await import('../../dist/esm/seq/step-rec.js');
++    const { resetSeqChord } = await import('../../dist/esm/seq/router-pads.js');
++    const { selectTrack } = await import('../../dist/esm/track/focus.js');
++    const { onMidiMessageExternal } = await import('../../dist/esm/midi/external.js');
++    const mi = await import('../../dist/esm/track/midi-in.js');
++    const { serializeUiState, applyUiState } = await import('../../dist/esm/seq/ui-state.js');
++    const menu = await import('../../dist/esm/seq/track-menu.js');
++
++    const engine = installMockEngine();
++    const reset = () => { resetSeqEngine(); resetSeqState(); resetStepRec(); resetSeqChord(); engine.reset(); mi.resetMidiIn(); };
++    const ext = (...b) => { onMidiMessageExternal(b); seqEngineTick(); };
++    const lastOp = () => lastMusicalOp(engine.ops);
++
++    /* Nothing claimed: the route is exactly what it always was. */
++    reset(); selectTrack(0); seqEngineTick(); seqEngineTick();
++    eq('no claim: the route is the active track alone', engine.params.extmap, '0');
++
++    /* KeyStep Pro: ch 2 -> track 2, ch 4 -> track 4. */
++    mi.setTrackMidiIn(1, 2);
++    mi.setTrackMidiIn(3, 4);
++    seqEngineTick();
++    eq('claims ride after the active track', engine.params.extmap, '0;2:1;4:3');
++    eq('channel 2 is track 2', mi.trackForChannel(2), 1);
++    eq('an unclaimed channel follows the selection', mi.trackForChannel(5), -1);
++
++    mi.setTrackMidiIn(5, 2);
++    eq('two claims on one channel: the lower track wins', mi.trackForChannel(2), 1);
++    mi.setTrackMidiIn(5, 0);
++
++    /* Recording lands on the claimed track, whatever is selected. */
++    ext(0x91, 60, 90);
++    eq('ch 2 records on track 2', lastOp(), 'non 1 60 90');
++    ext(0x93, 60, 80);
++    eq('the same key on ch 4 is a second note, on track 4', lastOp(), 'non 3 60 80');
++    ext(0x81, 60, 0);
++    eq('its off closes the ch 2 note', lastOp(), 'nof 1 60');
++    ext(0x83, 60, 0);
++    eq('and the ch 4 one', lastOp(), 'nof 3 60');
++    ext(0x90, 62, 70);
++    eq('an unclaimed channel records on the active track', lastOp(), 'non 0 62 70');
++    ext(0x80, 62, 0);
++
++    /* The Set carries it; an old Set is all SEL. */
++    const blob = serializeUiState();
++    mi.resetMidiIn();
++    applyUiState(blob);
++    eq('MIDI IN round-trips through the UI blob', mi.trackMidiIn(3), 4);
++    applyUiState(JSON.stringify({ oct: [4, 4] }));
++    eq('a Set from before MIDI IN is all SEL', mi.trackMidiIn(3), 0);
++
++    /* Steps clamp at SEL and 16. */
++    mi.stepTrackMidiIn(6, -1);
++    eq('below SEL stays SEL', mi.trackMidiIn(6), 0);
++    for (let i = 0; i < 20; i++) mi.stepTrackMidiIn(6, 1);
++    eq('above 16 stays 16', mi.trackMidiIn(6), 16);
++    eq('labels', mi.midiInLabel(0) + '|' + mi.midiInLabel(16), 'SEL|CH 16');
++
++    /* The track menu (v0.37: MIDI IN is its one row): knob 1 turns it. */
++    mi.resetMidiIn();
++    menu.openTrackMenu(2);
++    eq('the menu opens for T3', menu.buildTrackMenuVM().rows[0].name, 'MIDI IN T3');
++    menu.trackMenuKnob(1); menu.trackMenuKnob(1); menu.trackMenuKnob(1);
++    eq('knob 1 turns the channel', menu.buildTrackMenuVM().rows[0].value, 'CH 3');
++    eq('and it is the track\'s setting', mi.trackMidiIn(2), 3);
++    menu.closeTrackMenu();
++    eq('Back closes the menu', menu.trackMenuActive(), false);
++
++    uninstallMockEngine();
++    reset();
++}
+diff --git a/build/browser.mjs b/build/browser.mjs
+index 047e37bf..05f4908c 100644
+--- a/build/browser.mjs
++++ b/build/browser.mjs
+@@ -323,6 +323,9 @@ await esbuild.build({
+         /* The external knob controller's mapping, pure — driven by the
+          * logic suite (ext-knobs.mjs) without a router behind it. */
+         resolve(root, 'src/midi/ext-knob-map.ts'),
++        /* A track's MIDI IN and its track menu, driven by midi-in.mjs. */
++        resolve(root, 'src/track/midi-in.ts'),
++        resolve(root, 'src/seq/track-menu.ts'),
+         resolve(root, 'src/track/chain-persist.ts'),
+         resolve(root, 'src/track/chains-file.ts'),
+         resolve(root, 'src/track/chain-payload.ts'),
+diff --git a/engine/crates/movy-dsp/src/ext_route.rs b/engine/crates/movy-dsp/src/ext_route.rs
+index 17018a4f..1abea49e 100644
+--- a/engine/crates/movy-dsp/src/ext_route.rs
++++ b/engine/crates/movy-dsp/src/ext_route.rs
+@@ -1,44 +1,38 @@
+-//! Routing an external USB-A keyboard (cable 2) to the active track's chain on
+-//! the audio thread.
++//! Routing an external USB-A keyboard (cable 2) to a track's chain on the
++//! audio thread.
+ //!
+ //! Same reason as `pad_route`: a UI round trip would add a tick (5-16 ms) to
+-//! every note. The UI owns which chain is active and, on a drum track, which
+-//! note each pad plays; it pushes that as `extmap` and the DSP only looks up.
++//! every note. The UI owns which chain each message plays and, on a drum track,
++//! which note each pad plays; it pushes that as `extmap` and the DSP only looks
++//! up.
+ //!
+-//! Every channel is accepted and collapsed onto channel 1, because the user
+-//! picks the destination by selecting a track on Move, not on the controller.
+-//! Note-offs come from the ledger (see `pad_route.rs` for why).
++//! By default every channel is accepted and collapsed onto the ACTIVE track,
++//! because the user picks the destination by selecting a track on Move, not on
++//! the controller. A track may instead claim a MIDI channel (its MIDI IN in
++//! the track menu): that channel then plays that track whatever is selected, so
++//! a sequencer sending several channels (a KeyStep Pro's four tracks) plays
++//! several tracks at once. Unclaimed channels still follow the selection.
++//!
++//! `extmap` is `<dest>[;<ch>:<dest>]*`: the active track's destination, then
++//! one per claimed channel (1-16). A `<dest>` is `"<chain>"`, played as it
++//! comes, or `"<chain>,<p0>,<p1>,…"`, a drum rack with note `36 + i` playing
++//! `p_i`. Note-offs come from the ledger (see `pad_route.rs` for why), kept per
++//! channel so the same key on two channels is two notes.
+ 
+ const DRUM_BASE: usize = 36;
++const CHANNELS: usize = 16;
+ 
+-#[derive(Debug)]
+-pub struct ExtRoute {
++#[derive(Debug, Clone, Copy)]
++struct Dest {
+     chain: i32,
+     /// Incoming note -> pitch the chain plays, -1 for a dead key.
+     map: [i16; 128],
+-    held: [Option<(usize, u8)>; 128],
+-    /// Whether a wheel left its rest position on `chain`, so a chain change
+-    /// only resets what was actually moved.
+-    bent: bool,
+-    modded: bool,
+ }
+ 
+-impl Default for ExtRoute {
+-    fn default() -> Self {
+-        Self::new()
+-    }
+-}
++impl Dest {
++    const NONE: Dest = Dest { chain: -1, map: [-1; 128] };
+ 
+-impl ExtRoute {
+-    pub fn new() -> Self {
+-        Self { chain: -1, map: [-1; 128], held: [None; 128], bent: false, modded: false }
+-    }
+-
+-    /// `"<chain>"` plays notes as they come; `"<chain>,<p0>,<p1>,…"` is a drum
+-    /// rack, note `36 + i` playing `p_i`. Returns the chain being left when the
+-    /// chain changes with a wheel off rest, so the caller can reset it there.
+-    /// Malformed input changes nothing.
+-    pub fn set_map(&mut self, val: &str) -> Result<Option<usize>, ()> {
++    fn parse(val: &str) -> Result<Dest, ()> {
+         let mut it = val.split(',');
+         let chain: i32 = it.next().and_then(|s| s.trim().parse().ok()).ok_or(())?;
+         let mut map = [-1i16; 128];
+@@ -55,47 +49,107 @@ impl ExtRoute {
+                 *m = i as i16;
+             }
+         }
+-        self.map = map;
+-        let left = if chain != self.chain && self.chain >= 0 && (self.bent || self.modded) {
+-            Some(self.chain as usize)
+-        } else {
+-            None
+-        };
+-        if chain != self.chain {
+-            self.bent = false;
+-            self.modded = false;
++        Ok(Dest { chain, map })
++    }
++
++    fn chain(&self) -> Option<usize> {
++        usize::try_from(self.chain).ok()
++    }
++}
++
++#[derive(Debug)]
++pub struct ExtRoute {
++    active: Dest,
++    claimed: [Option<Dest>; CHANNELS],
++    held: [[Option<(usize, u8)>; 128]; CHANNELS],
++    /// Chains a wheel left off rest (bit per chain), so a route change only
++    /// resets what was actually moved, and only where it can no longer be
++    /// released.
++    bent: u128,
++    modded: u128,
++}
++
++impl Default for ExtRoute {
++    fn default() -> Self {
++        Self::new()
++    }
++}
++
++fn bit(chain: usize) -> u128 {
++    if chain < 128 { 1u128 << chain } else { 0 }
++}
++
++impl ExtRoute {
++    pub fn new() -> Self {
++        Self {
++            active: Dest::NONE,
++            claimed: [None; CHANNELS],
++            held: [[None; 128]; CHANNELS],
++            bent: 0,
++            modded: 0,
+         }
+-        self.chain = chain;
+-        Ok(left)
++    }
++
++    fn dest(&self, ch: usize) -> &Dest {
++        self.claimed[ch].as_ref().unwrap_or(&self.active)
++    }
++
++    /// Install a new `extmap`. Returns the chains left with a wheel off rest —
++    /// no channel reaches them any more, so the caller resets them there.
++    /// Malformed input changes nothing.
++    pub fn set_map(&mut self, val: &str) -> Result<Vec<usize>, ()> {
++        let mut segs = val.split(';');
++        let active = Dest::parse(segs.next().ok_or(())?)?;
++        let mut claimed = [None; CHANNELS];
++        for seg in segs {
++            let (ch, dest) = seg.split_once(':').ok_or(())?;
++            let ch: usize = ch.trim().parse().map_err(|_| ())?;
++            if !(1..=CHANNELS).contains(&ch) {
++                return Err(());
++            }
++            claimed[ch - 1] = Some(Dest::parse(dest)?);
++        }
++        self.active = active;
++        self.claimed = claimed;
++        let mut reach = self.active.chain().map_or(0, bit);
++        for d in self.claimed.iter().flatten() {
++            reach |= d.chain().map_or(0, bit);
++        }
++        let stray = (self.bent | self.modded) & !reach;
++        self.bent &= reach;
++        self.modded &= reach;
++        Ok((0..128).filter(|c| stray & bit(*c) != 0).collect())
+     }
+ 
+     /// One cable-2 message: `emit(chain, msg)` for each message to play.
+     pub fn route(&mut self, status: u8, d1: u8, d2: u8, mut emit: impl FnMut(usize, [u8; 3])) {
++        let ch = (status & 0x0F) as usize;
+         let note = (d1 & 0x7F) as usize;
+-        let chain = usize::try_from(self.chain).ok();
++        let dest = *self.dest(ch);
++        let chain = dest.chain();
+         match status & 0xF0 {
+             0x90 if d2 > 0 => {
+-                let (Some(chain), Ok(pitch)) = (chain, u8::try_from(self.map[note])) else { return };
++                let (Some(chain), Ok(pitch)) = (chain, u8::try_from(dest.map[note])) else { return };
+                 /* A retrigger before the off: close the first note, or it would
+                  * be orphaned when its ledger slot is overwritten. */
+-                if let Some((c, p)) = self.held[note].replace((chain, pitch)) {
++                if let Some((c, p)) = self.held[ch][note].replace((chain, pitch)) {
+                     emit(c, [0x80, p, 0]);
+                 }
+                 emit(chain, [0x90, pitch, d2]);
+             }
+             0x80 | 0x90 => {
+-                if let Some((c, p)) = self.held[note].take() {
++                if let Some((c, p)) = self.held[ch][note].take() {
+                     emit(c, [0x80, p, 0]);
+                 }
+             }
+             0xB0 if d1 == 1 => {
+                 let Some(chain) = chain else { return };
+-                self.modded = d2 != 0;
++                if d2 != 0 { self.modded |= bit(chain) } else { self.modded &= !bit(chain) }
+                 emit(chain, [0xB0, 1, d2]);
+             }
+             0xE0 => {
+                 let Some(chain) = chain else { return };
+-                self.bent = !(d1 == 0 && d2 == 0x40);
++                if d1 == 0 && d2 == 0x40 { self.bent &= !bit(chain) } else { self.bent |= bit(chain) }
+                 emit(chain, [0xE0, d1, d2]);
+             }
+             _ => {}
+@@ -158,14 +212,14 @@ mod tests {
+     fn wheels_reset_on_the_chain_being_left() {
+         let mut r = ExtRoute::new();
+         r.set_map("1").unwrap();
+-        assert_eq!(r.set_map("2").unwrap(), None, "nothing moved");
++        assert!(r.set_map("2").unwrap().is_empty(), "nothing moved");
+         assert_eq!(play(&mut r, 0xE0, 0, 0x60), [(2, [0xE0, 0, 0x60])]);
+-        assert_eq!(r.set_map("2").unwrap(), None, "same chain");
+-        assert_eq!(r.set_map("5").unwrap(), Some(2));
+-        assert_eq!(r.set_map("1").unwrap(), None, "reset is per chain");
++        assert!(r.set_map("2").unwrap().is_empty(), "same chain");
++        assert_eq!(r.set_map("5").unwrap(), vec![2]);
++        assert!(r.set_map("1").unwrap().is_empty(), "reset is per chain");
+         play(&mut r, 0xB0, 1, 64);
+         play(&mut r, 0xB0, 1, 0);
+-        assert_eq!(r.set_map("2").unwrap(), None, "wheel back at rest");
++        assert!(r.set_map("2").unwrap().is_empty(), "wheel back at rest");
+         assert!(play(&mut r, 0xB0, 7, 64).is_empty(), "other CCs ignored");
+     }
+ 
+@@ -177,4 +231,62 @@ mod tests {
+         assert!(r.set_map("2,a").is_err());
+         assert_eq!(play(&mut r, 0x90, 60, 1), [(1, [0x90, 60, 1])]);
+     }
++
++    #[test]
++    fn a_claimed_channel_plays_its_track_whatever_is_selected() {
++        let mut r = ExtRoute::new();
++        r.set_map("1;2:5;4:7").unwrap();
++        assert_eq!(play(&mut r, 0x91, 60, 100), [(5, [0x90, 60, 100])], "ch 2 -> chain 5");
++        assert_eq!(play(&mut r, 0x93, 64, 90), [(7, [0x90, 64, 90])], "ch 4 -> chain 7");
++        assert_eq!(play(&mut r, 0x90, 67, 80), [(1, [0x90, 67, 80])], "unclaimed ch 1 -> active");
++        assert_eq!(play(&mut r, 0x9F, 67, 80), [(1, [0x90, 67, 80])], "unclaimed ch 16 -> active");
++    }
++
++    #[test]
++    fn the_same_key_on_two_channels_is_two_notes() {
++        let mut r = ExtRoute::new();
++        r.set_map("1;2:5;4:7").unwrap();
++        play(&mut r, 0x91, 60, 100);
++        play(&mut r, 0x93, 60, 100);
++        assert_eq!(play(&mut r, 0x81, 60, 0), [(5, [0x80, 60, 0])]);
++        assert_eq!(play(&mut r, 0x83, 60, 0), [(7, [0x80, 60, 0])]);
++    }
++
++    #[test]
++    fn a_claimed_drum_track_maps_its_pads() {
++        let mut r = ExtRoute::new();
++        r.set_map("3;10:2,36,38,42").unwrap();
++        assert_eq!(play(&mut r, 0x99, 37, 90), [(2, [0x90, 38, 90])]);
++        assert_eq!(play(&mut r, 0x90, 37, 90), [(3, [0x90, 37, 90])], "the active track stays melodic");
++    }
++
++    #[test]
++    fn a_released_claim_falls_back_to_the_active_track() {
++        let mut r = ExtRoute::new();
++        r.set_map("1;2:5").unwrap();
++        play(&mut r, 0x91, 60, 100);
++        r.set_map("1").unwrap();
++        assert_eq!(play(&mut r, 0x81, 60, 0), [(5, [0x80, 60, 0])], "the held note closes where it started");
++        assert_eq!(play(&mut r, 0x91, 62, 100), [(1, [0x90, 62, 100])]);
++    }
++
++    #[test]
++    fn wheels_reset_only_where_no_channel_reaches() {
++        let mut r = ExtRoute::new();
++        r.set_map("1;2:5").unwrap();
++        play(&mut r, 0xE1, 0, 0x60);
++        assert!(r.set_map("2;2:5").unwrap().is_empty(), "chain 5 still claimed");
++        assert_eq!(r.set_map("2").unwrap(), vec![5]);
++    }
++
++    #[test]
++    fn malformed_channel_segments_change_nothing() {
++        let mut r = ExtRoute::new();
++        r.set_map("1;2:5").unwrap();
++        assert!(r.set_map("1;0:5").is_err(), "channel 0");
++        assert!(r.set_map("1;17:5").is_err(), "channel 17");
++        assert!(r.set_map("1;2").is_err(), "no destination");
++        assert!(r.set_map("1;2:x").is_err());
++        assert_eq!(play(&mut r, 0x91, 60, 1), [(5, [0x90, 60, 1])]);
++    }
+ }
+diff --git a/engine/crates/movy-dsp/src/lib.rs b/engine/crates/movy-dsp/src/lib.rs
+index 18d737b7..dd048306 100644
+--- a/engine/crates/movy-dsp/src/lib.rs
++++ b/engine/crates/movy-dsp/src/lib.rs
+@@ -297,11 +297,12 @@ impl Instance {
+              * there: the release that would have done so now reaches another track. */
+             "extmap" => match self.ext.set_map(val) {
+                 Err(()) => host::log("extmap: refused a malformed map"),
+-                Ok(Some(left)) => {
+-                    self.chains.on_midi(left, &[0xE0, 0, 0x40], MOVE_MIDI_SOURCE_INTERNAL);
+-                    self.chains.on_midi(left, &[0xB0, 1, 0], MOVE_MIDI_SOURCE_INTERNAL);
++                Ok(left) => {
++                    for c in left {
++                        self.chains.on_midi(c, &[0xE0, 0, 0x40], MOVE_MIDI_SOURCE_INTERNAL);
++                        self.chains.on_midi(c, &[0xB0, 1, 0], MOVE_MIDI_SOURCE_INTERNAL);
++                    }
+                 }
+-                Ok(None) => {}
+             },
+             /* `clickdb <0..11>` — metronome boost over the default level. The
+              * UI pushes it on every engine boot, since a re-dlopened engine
+diff --git a/src/app/tick.ts b/src/app/tick.ts
+index 6e048d3c..74bd2a74 100644
+--- a/src/app/tick.ts
++++ b/src/app/tick.ts
+@@ -8,6 +8,7 @@ import { clipPageActive } from '../seq/clip-page.js';
+ import { buildFlagsPageVM } from '../seq/flags-page-vm.js';
+ import { buildVersionsPageVM } from '../seq/versions-page-vm.js';
+ import { versionsPageState } from '../seq/versions-page.js';
++import { trackMenuActive, buildTrackMenuVM } from '../seq/track-menu.js';
+ import { renderFlagsView } from '../renderer/flags-view.js';
+ import { renderSetsView } from '../renderer/sets-view.js';
+ import { buildSetsPageVM } from '../seq/sets-page-vm.js';
+@@ -953,6 +954,8 @@ function tickBody(): void {
+          * leave modal, both of which own the screen while they are up. */
+         if (undoToastActive()) drawUndoOverlay(undoToast()!);
+         // Leave-Movy modal draws on top of everything else.
++        /* The track menu owns the screen while open, under the leave dialog. */
++        if (trackMenuActive()) renderFlagsView(buildTrackMenuVM());
+         if (leaveModalActive()) drawLeaveModal(leaveModalLabels(), leaveModalSel(), leaveModalTitle());
+         lastToastShowing = toastShowing;
+         lastHeaderShowing = headerShowing;
+diff --git a/src/midi/external.ts b/src/midi/external.ts
+index 4852ef9f..7d6c1355 100644
+--- a/src/midi/external.ts
++++ b/src/midi/external.ts
+@@ -10,14 +10,19 @@ import { extDrumPitch } from '../track/ext-route.js';
+ import { seqNotePadPlayed, seqNotePadReleased } from '../seq/router-pads.js';
+ import { EXT_KEY_BASE, extHold, extRelease } from './external-ledger.js';
+ import { onExternalControlChange } from './ext-knobs.js';
++import { trackForChannel } from '../track/midi-in.js';
+ 
+ export function onMidiMessageExternal(data: number[]): void {
+     if (!data || data.length < 3) return;
+     const type = data[0] & 0xF0, note = data[1] & 0x7F, vel = data[2];
+     if (type === 0xB0) { onExternalControlChange(data); return; }
+-    const key = EXT_KEY_BASE + note;
++    /* Keyed by channel too: the same key on two channels is two notes, on
++     * two tracks once channels are claimed (track/midi-in.ts). */
++    const ch = (data[0] & 0x0F) + 1;
++    const key = EXT_KEY_BASE + (ch - 1) * 128 + note;
+     if (type === 0x90 && vel > 0) {
+-        const track = appState.activeTrack.index;
++        const claimed = trackForChannel(ch);
++        const track = claimed >= 0 ? claimed : appState.activeTrack.index;
+         const drum = drumConfigFor(track);
+         const pitch = drum ? extDrumPitch(note, drum) : note;
+         if (pitch < 0) return;
+diff --git a/src/midi/router.ts b/src/midi/router.ts
+index ea880ba3..579eb511 100644
+--- a/src/midi/router.ts
++++ b/src/midi/router.ts
+@@ -91,6 +91,8 @@ import { jogHintTouch } from '../app/jog-hint.js';
+ import { MASTER_CC, volumeTrackDown, volumeTrackUp, volumeTouch, volumeKnobDelta } from '../mixer/track-volume.js';
+ import { masterVolumeKnob, masterVolumeTouch } from '../mixer/master-volume.js';
+ import { toggleSolo } from '../mixer/track-mutes.js';
++import { openTrackMenu } from '../seq/track-menu.js';
++import { trackMenuMidi } from '../seq/track-menu-input.js';
+ import { mlog } from '../log.js';
+ import { platform } from '../platform/index.js';
+ 
+@@ -291,6 +293,9 @@ export function onMidiMessageInternal(data: number[]): void {
+         }
+     }
+ 
++    /* The track menu owns the controls while it is up (seq/track-menu-input.ts). */
++    if (trackMenuMidi(data)) { appState.dirty = true; return; }
++
+     if (seqHandleMidi(data, appState.shiftHeld)) return;
+     const status = data[0];
+     const d1     = data[1];
+@@ -678,6 +683,13 @@ export function onMidiMessageInternal(data: number[]): void {
+             /* Snapshot before switching so the hold-release closure returns
+              * exactly here. beginTrackSwitch also closes the global Main/Clip
+              * Params pages, which a track button always leaves. */
++            /* Shift + track button: that track's menu (MIDI IN,
++             * seq/track-menu.ts), without switching to it. */
++            if (appState.shiftHeld) {
++                openTrackMenu(track);
++                appState.dirty = true;
++                return;
++            }
+             const prev = beginTrackSwitch();
+             momentaryDown(d1, () => restoreTrackState(prev));
+             switchToTrack(track, prev);
+diff --git a/src/seq/track-menu-input.ts b/src/seq/track-menu-input.ts
+new file mode 100644
+index 00000000..4e5c058f
+--- /dev/null
++++ b/src/seq/track-menu-input.ts
+@@ -0,0 +1,17 @@
++/* The track menu's input (seq/track-menu.ts), first look in the router while
++ * it is open: Back or a jog click closes, knob 1 and the jog turn MIDI IN,
++ * every other press is swallowed (releases pass, so nothing held at the open
++ * sticks). */
++
++import { closeTrackMenu, trackMenuActive, trackMenuKnob } from './track-menu.js';
++
++/** `true` = consumed. */
++export function trackMenuMidi(data: number[]): boolean {
++    if (!trackMenuActive()) return false;
++    const type = data[0] & 0xF0, d1 = data[1], d2 = data[2];
++    const press = (type === 0x90 || type === 0xB0) && d2 > 0;
++    if (type === 0xB0 && (d1 === MoveBack || d1 === MoveMainButton) && d2 > 0) { closeTrackMenu(); return true; }
++    if (type === 0xB0 && (d1 === MoveKnob1 || d1 === MoveMainKnob)) { trackMenuKnob(decodeDelta(d2)); return true; }
++    /* Knob touches (notes 0-9) and turns are presses too. */
++    return press || type === 0xA0 || type === 0xE0;
++}
+diff --git a/src/seq/track-menu.ts b/src/seq/track-menu.ts
+new file mode 100644
+index 00000000..7954676a
+--- /dev/null
++++ b/src/seq/track-menu.ts
+@@ -0,0 +1,44 @@
++/* The track menu: Shift + a track button. A list drawn like Settings
++ * (flags-view.ts). On this branch (v0.37.0, before Freeze existed) its one
++ * row is MIDI IN, the USB-A channel that plays the track (track/midi-in.ts):
++ * knob 1 or the jog turns it, a jog click or Back closes. It opens for the
++ * pressed track WITHOUT switching to it. */
++
++import type { FlagsPageVM } from './flags-page-vm.js';
++import { midiInLabel, stepTrackMidiIn, trackMidiIn } from '../track/midi-in.js';
++
++const state = { track: -1 };
++
++export function trackMenuActive(): boolean {
++    return state.track >= 0;
++}
++
++export function trackMenuTrack(): number {
++    return state.track;
++}
++
++export function openTrackMenu(track: number): void {
++    state.track = track;
++}
++
++export function closeTrackMenu(): void {
++    state.track = -1;
++}
++
++/** Knob 1 (or the jog) steps the channel. */
++export function trackMenuKnob(dir: number): void {
++    if (state.track >= 0 && dir !== 0) stepTrackMidiIn(state.track, dir);
++}
++
++export function buildTrackMenuVM(): FlagsPageVM {
++    return {
++        rows: [{ name: 'MIDI IN T' + (state.track + 1),
++                 value: midiInLabel(trackMidiIn(state.track)), selected: true }],
++        selected: 0,
++        hint: 'Knob 1: USB channel. SEL: selected track.',
++    };
++}
++
++export function resetTrackMenu(): void {
++    closeTrackMenu();
++}
+diff --git a/src/seq/ui-state.ts b/src/seq/ui-state.ts
+index 4bafc287..5e3035d9 100644
+--- a/src/seq/ui-state.ts
++++ b/src/seq/ui-state.ts
+@@ -1,5 +1,5 @@
+-/* The per-set UI-only state: tonic, scale, mode, pad layout, per-track octave
+- * and track mutes. Kept apart from the engine's own serialization because the
++/* The per-set UI-only state: tonic, scale, mode, pad layout, per-track octave,
++ * track mutes and each track's MIDI IN. Kept apart from the engine's own serialization because the
+  * engine knows nothing about any of it — it is ferried in its own JSON file
+  * alongside the state blob. */
+ 
+@@ -11,6 +11,7 @@ import { mutesSnapshot, restoreMutes, resetTrackMutes } from '../mixer/track-mut
+ import { seqState } from './state.js';
+ import { seqCmd } from './engine.js';
+ import { readPrefDefaultQuant } from './prefs.js';
++import { midiInSnapshot, restoreMidiIn, resetMidiIn } from '../track/midi-in.js';
+ 
+ const clampInt = (v: unknown, lo: number, hi: number, dflt: number): number =>
+     typeof v === 'number' && isFinite(v) ? Math.max(lo, Math.min(hi, v | 0)) : dflt;
+@@ -28,6 +29,7 @@ export function serializeUiState(): string {
+         layout: keyboardState.layout,
+         oct:    keyboardState.octave.slice(),
+         mutes:  mutesSnapshot(),
++        midiIn: midiInSnapshot(),
+         defaultQuant: seqState.defaultQuant,
+     });
+ }
+@@ -52,6 +54,7 @@ export function applyUiState(blob: string): void {
+         keyboardState.mode   = clampInt(o.mode,   0, MODE_NAMES.length - 1, 0);
+         keyboardState.layout = clampInt(o.layout, 0, layoutNames(keyboardState.mode).length - 1, 0);
+         if (o.mutes) restoreMutes(o.mutes);
++        restoreMidiIn(o.midiIn);
+         /* Absent = a set written before this feature, or a brand new one. Both
+          * adopt the machine default rather than snapping to zero — that is the
+          * whole point of keeping it outside the set. */
+@@ -76,5 +79,6 @@ export function resetUiState(): void {
+     keyboardState.layout = 0;
+     resetOctaves();
+     resetTrackMutes();
++    resetMidiIn();
+     applyDefaultQuant(readPrefDefaultQuant());
+ }
+diff --git a/src/track/ext-route.ts b/src/track/ext-route.ts
+index 549120db..5ce1dc57 100644
+--- a/src/track/ext-route.ts
++++ b/src/track/ext-route.ts
+@@ -1,5 +1,7 @@
+ /* The engine's route for an external USB-A keyboard (engine ext_route.rs): which
+- * chain the keys play, and on a drum track which note each key's pad plays.
++ * chain the keys play, and on a drum track which note each key's pad plays —
++ * for the active track, and for each track that claims a MIDI channel
++ * (track/midi-in.ts).
+  *
+  * Pushed by comparison every tick, as pad-route.ts does and for its reason: the
+  * things that change it (track switch, module change, a rack redeclaring its
+@@ -10,7 +12,8 @@ import { appState } from '../app/state.js';
+ import { drumNoteOfPad } from '../keyboard/drum-grid.js';
+ import type { DrumConfig } from '../types/param.js';
+ import { drumConfigFor } from './pad-route.js';
+-import { chainInstance } from './ref.js';
++import { chainInstance, TRACK_COUNT } from './ref.js';
++import { trackForChannel, MIDI_IN_MAX } from './midi-in.js';
+ 
+ /* Note the first drum pad sits on: the GM / Move kick. One key per pad upward. */
+ export const EXT_DRUM_BASE = 36;
+@@ -23,8 +26,8 @@ export function extDrumPitch(note: number, cfg: DrumConfig): number {
+     return pad >= 1 && pad <= cfg.padCount ? drumNoteOfPad(pad, cfg) : -1;
+ }
+ 
+-function buildMap(): string {
+-    const t = appState.activeTrack.index;
++/* One destination: `<chain>` or `<chain>,<p0>,…` for a drum rack. */
++function destFor(t: number): string {
+     const drum = drumConfigFor(t);
+     const parts: number[] = [chainInstance(t)];
+     if (drum && drum.padCount < 1) return '-1';   // a rack with no pads: the bare chain would play it melodically
+@@ -32,6 +35,17 @@ function buildMap(): string {
+     return parts.join(',');
+ }
+ 
++/* `<active>[;<ch>:<dest>]*`. A Set where no track claims a channel pushes
++ * exactly what it always did. */
++function buildMap(): string {
++    const segs = [destFor(appState.activeTrack.index)];
++    for (let ch = 1; ch <= MIDI_IN_MAX; ch++) {
++        const t = trackForChannel(ch);
++        if (t >= 0 && t < TRACK_COUNT) segs.push(ch + ':' + destFor(t));
++    }
++    return segs.join(';');
++}
++
+ export function syncExtRoute(send: (key: string, value: string) => void): void {
+     const next = buildMap();
+     if (next === pushed) return;
+diff --git a/src/track/midi-in.ts b/src/track/midi-in.ts
+new file mode 100644
+index 00000000..a21d8a62
+--- /dev/null
++++ b/src/track/midi-in.ts
+@@ -0,0 +1,58 @@
++/* A track's MIDI IN: the USB-A channel that plays it whatever is selected
++ * (1-16), or SEL — follow the selection, the default and movy's behaviour
++ * before this existed. Lets a controller that sends several channels at once
++ * (a KeyStep Pro's four sequencer tracks) play several tracks.
++ *
++ * Per Set: carried in the UI blob beside the octaves (seq/ui-state.ts). The
++ * engine is told through `extmap` (track/ext-route.ts); the recording side
++ * asks `trackForChannel` (midi/external.ts). */
++
++import { TRACK_COUNT } from './ref.js';
++
++export const MIDI_IN_SEL = 0;
++export const MIDI_IN_MAX = 16;
++
++const midiIn: number[] = new Array(TRACK_COUNT).fill(MIDI_IN_SEL);
++
++const clamp = (v: unknown): number =>
++    typeof v === 'number' && isFinite(v) ? Math.max(MIDI_IN_SEL, Math.min(MIDI_IN_MAX, v | 0)) : MIDI_IN_SEL;
++
++export function trackMidiIn(track: number): number {
++    return midiIn[track] ?? MIDI_IN_SEL;
++}
++
++export function setTrackMidiIn(track: number, ch: number): void {
++    if (track >= 0 && track < TRACK_COUNT) midiIn[track] = clamp(ch);
++}
++
++/** One knob detent: SEL, 1, 2 … 16, stopping at the ends. */
++export function stepTrackMidiIn(track: number, dir: number): void {
++    setTrackMidiIn(track, trackMidiIn(track) + (dir > 0 ? 1 : -1));
++}
++
++export function midiInLabel(ch: number): string {
++    return ch === MIDI_IN_SEL ? 'SEL' : 'CH ' + ch;
++}
++
++/**
++ * The track channel `ch` (1-16) plays, or -1 when no track claims it (it then
++ * follows the selection). Two tracks on one channel: the lower one wins — one
++ * channel, one destination, so the engine and the recording always agree.
++ */
++export function trackForChannel(ch: number): number {
++    if (ch < 1 || ch > MIDI_IN_MAX) return -1;
++    return midiIn.indexOf(ch);
++}
++
++export function midiInSnapshot(): number[] {
++    return midiIn.slice();
++}
++
++/** Tolerant: an absent or malformed value (a Set from before this) is all SEL. */
++export function restoreMidiIn(v: unknown): void {
++    for (let t = 0; t < TRACK_COUNT; t++) midiIn[t] = Array.isArray(v) ? clamp(v[t]) : MIDI_IN_SEL;
++}
++
++export function resetMidiIn(): void {
++    midiIn.fill(MIDI_IN_SEL);
++}
+-- 
+2.54.0 (Apple Git-157)
+

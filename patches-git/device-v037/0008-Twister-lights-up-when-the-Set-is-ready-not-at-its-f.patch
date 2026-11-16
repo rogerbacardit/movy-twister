@@ -1,0 +1,101 @@
+From 2be657cb4536d8d8d7e0416cf89da6dd5fa788c1 Mon Sep 17 00:00:00 2001
+From: rogerbacardit <rogerbacardit@gmail.com>
+Date: Mon, 16 Nov 2026 22:30:31 +0100
+Subject: [PATCH 8/9] Twister lights up when the Set is ready, not at its first
+ turn
+
+Movy only learned a Twister was there from its first CC, so after opening
+movy the rings stayed dark and unsynced until an encoder moved (user,
+2026-11-16). The follow is now armed once the Set is ready: the rings are
+painted and follow the parameters at once. With no Twister on USB-A the
+few messages go nowhere.
+
+Gate: local suites (logic, app-loop, screenshot, perf, source-rules,
+host-globals, fleet-pages).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ browser-test/logic/ext-knobs.mjs |  1 +
+ src/midi/ext-follow.ts           | 13 +++++++++++--
+ src/midi/ext-knobs.ts            |  3 ++-
+ src/seq/set-session.ts           |  4 ++++
+ 4 files changed, 18 insertions(+), 3 deletions(-)
+
+diff --git a/browser-test/logic/ext-knobs.mjs b/browser-test/logic/ext-knobs.mjs
+index c7bcd8b1..e588ac6d 100644
+--- a/browser-test/logic/ext-knobs.mjs
++++ b/browser-test/logic/ext-knobs.mjs
+@@ -83,6 +83,7 @@ export async function run() {
+     const fo = await import('../../dist/esm/midi/ext-follow.js');
+     const out = await import('../../dist/esm/midi/ext-out.js');
+     const drain = () => { while (out.twisterOutPending()) out.twisterOutFlush(); };
++    drain();   /* the set-ready arm (seq/set-session.ts) queued rings earlier in the suite */
+     const sent = [], colours = [];
+     const was = globalThis.move_midi_external_send;
+     globalThis.move_midi_external_send = (d) => { if (d[1] === 0xB0) sent.push(d[2] + '=' + d[3]); else colours.push(d[1].toString(16) + '/' + d[2] + ':' + d[3]); };
+diff --git a/src/midi/ext-follow.ts b/src/midi/ext-follow.ts
+index b8c47cb7..14ab7316 100644
+--- a/src/midi/ext-follow.ts
++++ b/src/midi/ext-follow.ts
+@@ -37,8 +37,17 @@ export function twisterTouched(knob: number, nowMs = Date.now()): void {
+     sent[knob] = -1;    /* whatever it lands on is resent when it rests */
+ }
+ 
+-/** Start following, and resend every ring on the next update (a reconnect). */
+-export function armTwisterFollow(sync: (cc: number, v: number) => void): void {
++/* The absolute decoder's origin setter, registered by midi/ext-knobs.ts at
++ * load, so a caller that has no decoder (the set-ready arm) can still arm. */
++let defaultSync: ((cc: number, v: number) => void) | null = null;
++
++export function setTwisterSync(sync: (cc: number, v: number) => void): void {
++    defaultSync = sync;
++}
++
++/** Start following, and resend every ring on the next update (a reconnect,
++ *  or a Set becoming ready: the Twister lights up without being touched). */
++export function armTwisterFollow(sync: ((cc: number, v: number) => void) | null = defaultSync): void {
+     armed = true;
+     mlog('twister follow armed');
+     onSync = sync;
+diff --git a/src/midi/ext-knobs.ts b/src/midi/ext-knobs.ts
+index 840dad85..29cb1bd6 100644
+--- a/src/midi/ext-knobs.ts
++++ b/src/midi/ext-knobs.ts
+@@ -7,10 +7,11 @@ import { appState } from '../app/state.js';
+ import { pageOwnerOf } from '../app/page-owner.js';
+ import { onMidiMessageInternal, knobModel } from './router.js';
+ import { createExtKnobState, extKnobActions, isTwisterCc } from './ext-knob-map.js';
+-import { armTwisterFollow } from './ext-follow.js';
++import { armTwisterFollow, setTwisterSync } from './ext-follow.js';
+ import { extBaseForget, extKnobReset, extKnobTurn } from './ext-param.js';
+ 
+ const state = createExtKnobState();
++setTwisterSync((cc, v) => state.abs.set('tw' + cc, v));
+ 
+ /* A Twister forgets its ring colours on reconnect, and nothing tells us it
+  * reconnected — so the rings are repainted whenever CCs resume after a quiet
+diff --git a/src/seq/set-session.ts b/src/seq/set-session.ts
+index 9d6e45cb..a6c024a0 100644
+--- a/src/seq/set-session.ts
++++ b/src/seq/set-session.ts
+@@ -25,6 +25,7 @@ import { migrationPending, resetVersionRestore, restoreTick } from './version-re
+ import { pollMigrationProgress, resetMigrateAction } from './migrate-action.js';
+ import { saveNeeded, saveSet } from './set-save.js';
+ import { resetWantedSet } from './set-source.js';
++import { armTwisterFollow } from '../midi/ext-follow.js';
+ import { resetLib } from './sets-lib.js';
+ import { libraryBlocked, libraryIdentity, libraryTick, resetLibSession } from './set-lib-session.js';
+ 
+@@ -142,6 +143,9 @@ function settleTick(): void {
+     refreshModelsForSet();
+     phase = 'ready';
+     mlog('seq: set ready after ' + settleWaited() + 'ms');
++    /* A Twister plugged in before movy opened lights up and follows now,
++     * not at its first turn. Unplugged, these few messages go nowhere. */
++    armTwisterFollow();
+ }
+ 
+ /* A Set whose files are on disk but unreadable is the case worth naming: a
+-- 
+2.54.0 (Apple Git-157)
+

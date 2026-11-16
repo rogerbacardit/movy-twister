@@ -1,0 +1,65 @@
+From cd39f267e1957b16ca6a84ed814cd97c1c0c2bdd Mon Sep 17 00:00:00 2001
+From: rogerbacardit <rogerbacardit@gmail.com>
+Date: Mon, 16 Nov 2026 17:32:33 +0100
+Subject: [PATCH 4/9] MIDI IN: a menu turn marks the Set to be saved
+
+Without it the channel lived until the next close: set-save writes the UI
+blob only when something marked it dirty. Found on device.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ browser-test/logic/midi-in.mjs | 3 +++
+ src/seq/track-menu.ts          | 5 ++++-
+ 2 files changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/browser-test/logic/midi-in.mjs b/browser-test/logic/midi-in.mjs
+index defdf2db..3c2ca87e 100644
+--- a/browser-test/logic/midi-in.mjs
++++ b/browser-test/logic/midi-in.mjs
+@@ -19,6 +19,7 @@ export async function run() {
+     const mi = await import('../../dist/esm/track/midi-in.js');
+     const { serializeUiState, applyUiState } = await import('../../dist/esm/seq/ui-state.js');
+     const menu = await import('../../dist/esm/seq/track-menu.js');
++    const { takeUiDirty } = await import('../../dist/esm/seq/ui-dirty.js');
+ 
+     const engine = installMockEngine();
+     const reset = () => { resetSeqEngine(); resetSeqState(); resetStepRec(); resetSeqChord(); engine.reset(); mi.resetMidiIn(); };
+@@ -72,10 +73,12 @@ export async function run() {
+     /* The track menu (v0.37: MIDI IN is its one row): knob 1 turns it. */
+     mi.resetMidiIn();
+     menu.openTrackMenu(2);
++    takeUiDirty();
+     eq('the menu opens for T3', menu.buildTrackMenuVM().rows[0].name, 'MIDI IN T3');
+     menu.trackMenuKnob(1); menu.trackMenuKnob(1); menu.trackMenuKnob(1);
+     eq('knob 1 turns the channel', menu.buildTrackMenuVM().rows[0].value, 'CH 3');
+     eq('and it is the track\'s setting', mi.trackMidiIn(2), 3);
++    eq('a turn marks the Set to be saved', takeUiDirty(), true);
+     menu.closeTrackMenu();
+     eq('Back closes the menu', menu.trackMenuActive(), false);
+ 
+diff --git a/src/seq/track-menu.ts b/src/seq/track-menu.ts
+index 7954676a..e7f8b1b9 100644
+--- a/src/seq/track-menu.ts
++++ b/src/seq/track-menu.ts
+@@ -6,6 +6,7 @@
+ 
+ import type { FlagsPageVM } from './flags-page-vm.js';
+ import { midiInLabel, stepTrackMidiIn, trackMidiIn } from '../track/midi-in.js';
++import { markUiStateDirty } from './ui-dirty.js';
+ 
+ const state = { track: -1 };
+ 
+@@ -27,7 +28,9 @@ export function closeTrackMenu(): void {
+ 
+ /** Knob 1 (or the jog) steps the channel. */
+ export function trackMenuKnob(dir: number): void {
+-    if (state.track >= 0 && dir !== 0) stepTrackMidiIn(state.track, dir);
++    if (state.track < 0 || dir === 0) return;
++    stepTrackMidiIn(state.track, dir);
++    markUiStateDirty();   // the Set saves it (seq/set-save.ts), or it is gone on close
+ }
+ 
+ export function buildTrackMenuVM(): FlagsPageVM {
+-- 
+2.54.0 (Apple Git-157)
+
