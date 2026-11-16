@@ -25,6 +25,7 @@ import { migrationPending, resetVersionRestore, restoreTick } from './version-re
 import { pollMigrationProgress, resetMigrateAction } from './migrate-action.js';
 import { saveNeeded, saveSet } from './set-save.js';
 import { resetWantedSet } from './set-source.js';
+import { armTwisterFollow } from '../midi/ext-follow.js';
 import { resetLib } from './sets-lib.js';
 import { libraryBlocked, libraryIdentity, libraryTick, resetLibSession } from './set-lib-session.js';
 
@@ -142,6 +143,9 @@ function settleTick(): void {
     refreshModelsForSet();
     phase = 'ready';
     mlog('seq: set ready after ' + settleWaited() + 'ms');
+    /* A Twister plugged in before movy opened lights up and follows now,
+     * not at its first turn. Unplugged, these few messages go nowhere. */
+    armTwisterFollow();
 }
 
 /* A Set whose files are on disk but unreadable is the case worth naming: a

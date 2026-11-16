@@ -37,8 +37,17 @@ export function twisterTouched(knob: number, nowMs = Date.now()): void {
     sent[knob] = -1;    /* whatever it lands on is resent when it rests */
 }
 
-/** Start following, and resend every ring on the next update (a reconnect). */
-export function armTwisterFollow(sync: (cc: number, v: number) => void): void {
+/* The absolute decoder's origin setter, registered by midi/ext-knobs.ts at
+ * load, so a caller that has no decoder (the set-ready arm) can still arm. */
+let defaultSync: ((cc: number, v: number) => void) | null = null;
+
+export function setTwisterSync(sync: (cc: number, v: number) => void): void {
+    defaultSync = sync;
+}
+
+/** Start following, and resend every ring on the next update (a reconnect,
+ *  or a Set becoming ready: the Twister lights up without being touched). */
+export function armTwisterFollow(sync: ((cc: number, v: number) => void) | null = defaultSync): void {
     armed = true;
     mlog('twister follow armed');
     onSync = sync;

@@ -83,6 +83,7 @@ export async function run() {
     const fo = await import('../../dist/esm/midi/ext-follow.js');
     const out = await import('../../dist/esm/midi/ext-out.js');
     const drain = () => { while (out.twisterOutPending()) out.twisterOutFlush(); };
+    drain();   /* the set-ready arm (seq/set-session.ts) queued rings earlier in the suite */
     const sent = [], colours = [];
     const was = globalThis.move_midi_external_send;
     globalThis.move_midi_external_send = (d) => { if (d[1] === 0xB0) sent.push(d[2] + '=' + d[3]); else colours.push(d[1].toString(16) + '/' + d[2] + ':' + d[3]); };
