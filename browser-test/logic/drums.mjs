@@ -40,7 +40,7 @@ _log('\nTest: drum module detection via loadHierarchy');
   const vmk = mk.getViewModel();
   eq('krautdrums: drumPadCount=16', vmk.drumPadCount, 16);
   eq('krautdrums: drumCurrentPad defaults to 1', vmk.drumCurrentPad, 1);
-  eq('krautdrums: rawMidi pad 1 is the lit grid pad', vmk.drumCurrentPhysPad, 68);
+  eq('krautdrums: pad 1 is the lit grid pad', vmk.drumCurrentPhysPad, 68);
 
   const plaitsPreset = {
     'synth:name': 'Plaits',

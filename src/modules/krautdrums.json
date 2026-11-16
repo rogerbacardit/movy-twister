@@ -3,8 +3,8 @@
   "name": "KrautDrums",
   "drum": {
     "padCount": 16,
-    "padNoteStart": 68,
-    "rawMidi": true
+    "padNoteStart": 36,
+    "rawMidi": false
   },
   "banks": [
     {
