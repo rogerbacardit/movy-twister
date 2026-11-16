@@ -1,0 +1,844 @@
+From 826b82cf1e8b3bd9accbe3c439d2d3cdb07dda06 Mon Sep 17 00:00:00 2001
+From: rogerbacardit <rogerbacardit@gmail.com>
+Date: Mon, 16 Nov 2026 19:26:19 +0100
+Subject: [PATCH] Twister: stepped params by position, push = preset value,
+ track colours, paced output
+
+- Twister knobs 9-16 drive an enum / switch / int of 2-32 values by the
+  ring's position (one zone per value); continuous params keep relative
+  steps (midi/ext-param.ts, ext-param-steps.ts).
+- Push on encoders 9-16 returns the parameter to its value when the preset
+  was loaded; bases forgotten on a preset change (encoder 3 or knob 1 on
+  the preset page).
+- A ring being turned is not resynced for 350 ms, so the follow no longer
+  fights the hand on stepped params.
+- All output to the Twister goes through a paced, coalescing queue
+  (midi/ext-out.ts, 10 messages per tick, flushed from tick()): a full
+  repaint is 43 messages and a burst lost everything past one USB packet.
+- The 10 s wake gap counts only the Twister's own CCs (ch 1/2, CC 0-15),
+  not a KeyStep's on the same hub.
+- Track colours: tracks 1-4 green, blue, orange, purple, rotated across
+  groups; the Twister's assigned rings wear the active track's colour
+  (midi/ext-colors.ts). This palette is the user's preference for their
+  device: it breaks track-colors.mjs's separation rules (blue/purple, and
+  green/orange under CVD), so it is not meant for upstream as is.
+
+Gate: local suites green (logic, app-loop, perf, screenshot, source-rules,
+fleet-pages, grid-cost, device-scripts, host-globals) except abi-parity,
+red before this change too; typecheck clean. Deployed ui.js only and
+checked by the user on the device; device tier not run.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ browser-test/logic/drums.mjs     |  6 +--
+ browser-test/logic/ext-knobs.mjs | 93 ++++++++++++++++++++++++++++++--
+ browser-test/logic/keyboard.mjs  |  2 +-
+ browser-test/track-colors.mjs    |  1 +
+ build/browser.mjs                |  4 ++
+ src/app/tick.ts                  |  4 ++
+ src/midi/ext-colors.ts           | 57 ++++++++++++++++++++
+ src/midi/ext-follow.ts           | 27 ++++++++--
+ src/midi/ext-knob-map.ts         | 21 ++++++--
+ src/midi/ext-knobs.ts            | 56 ++++++++-----------
+ src/midi/ext-out.ts              | 56 +++++++++++++++++++
+ src/midi/ext-param-steps.ts      | 49 +++++++++++++++++
+ src/midi/ext-param.ts            | 89 ++++++++++++++++++++++++++++++
+ src/midi/router.ts               |  2 +
+ src/renderer/schwung-grid.ts     | 18 +++++--
+ src/seq/colors.ts                | 36 ++++++++-----
+ 16 files changed, 458 insertions(+), 63 deletions(-)
+ create mode 100644 src/midi/ext-colors.ts
+ create mode 100644 src/midi/ext-out.ts
+ create mode 100644 src/midi/ext-param-steps.ts
+ create mode 100644 src/midi/ext-param.ts
+
+diff --git a/browser-test/logic/drums.mjs b/browser-test/logic/drums.mjs
+index cab92daf..6fe29a61 100644
+--- a/browser-test/logic/drums.mjs
++++ b/browser-test/logic/drums.mjs
+@@ -141,9 +141,9 @@ _log('\nTest: track colors — track 3 neon pink, track 4 royal blue');
+   /* A cheap pin so the table is not completely unguarded on a checkout without
+    * the schwung sibling repo — track-colors.mjs skips wholesale when it is
+    * missing, and that is where the real palette reasoning lives. */
+-  eq('track 3 = AzureBlue dim(95)',    TRACK_COLOR[2], 95);
+-  eq('track 4 = NeonPink(23)',         TRACK_COLOR[3], 23);
+-  eq('track 3 dim = ElectricViolet dim(103)', TRACK_COLOR_DIM[2], 103);
++  eq('track 3 = Bright Orange(3)',     TRACK_COLOR[2], 3);
++  eq('track 4 = purple #972BFF(23)',   TRACK_COLOR[3], 23);
++  eq('track 3 dim = Bright Orange dim(69)',   TRACK_COLOR_DIM[2], 69);
+   eq('track 4 dim = NeonPink dim(109)',       TRACK_COLOR_DIM[3], 109);
+ }
+ 
+diff --git a/browser-test/logic/ext-knobs.mjs b/browser-test/logic/ext-knobs.mjs
+index de30ab39..c7bcd8b1 100644
+--- a/browser-test/logic/ext-knobs.mjs
++++ b/browser-test/logic/ext-knobs.mjs
+@@ -11,7 +11,9 @@ export async function run() {
+     const m = await import('../../dist/esm/midi/ext-knob-map.js');
+     const { createExtKnobState, extKnobActions, TW_JOG_STEPS } = m;
+     const K1 = globalThis.MoveKnob1, JOG = globalThis.MoveMainKnob;
+-    const show = (as) => as.map((a) => a.kind === 'cc' ? `cc${a.cc}:${a.value}` : `preset:${a.delta}`).join(' ');
++    const show = (as) => as.map((a) => a.kind === 'cc' ? `cc${a.cc}:${a.value}`
++        : a.kind === 'knob' ? `knob${a.knob}:${a.delta}@${a.pos}`
++        : a.kind === 'reset' ? `reset${a.knob}` : `preset:${a.delta}`).join(' ');
+ 
+     let st = createExtKnobState();
+     const act = (ch, cc, v) => show(extKnobActions(st, ch, cc, v));
+@@ -27,9 +29,9 @@ export async function run() {
+     /* A factory-default Twister: rows 3-4 are knobs 1-8. */
+     st = createExtKnobState();
+     act(1, 8, 64);
+-    eq('Twister CC 8 is knob 1', act(1, 8, 65), `cc${K1}:1`);
++    eq('Twister CC 8 is knob 1, with its ring position', act(1, 8, 65), 'knob0:1@65');
+     act(1, 15, 10);
+-    eq('Twister CC 15 is knob 8', act(1, 15, 9), `cc${K1 + 7}:127`);
++    eq('Twister CC 15 is knob 8, signed', act(1, 15, 9), 'knob7:-1@9');
+ 
+     /* Encoder 2 sends CC 1 — the engine's mod wheel. Never a knob. */
+     act(1, 1, 10);
+@@ -46,8 +48,93 @@ export async function run() {
+     eq('encoder 1 release releases it', act(2, 0, 0), `cc${globalThis.MoveMainButton}:0`);
+     eq('encoder 4 push is Back', act(2, 3, 127), `cc${globalThis.MoveBack}:127`);
+     eq('an unassigned push does nothing', act(2, 6, 127), '');
++    eq('encoder 9 push resets knob 1', act(2, 8, 127), 'reset0');
++    eq('encoder 16 push resets knob 8', act(2, 15, 127), 'reset7');
++    eq('a knob encoder release does nothing', act(2, 8, 0), '');
+ 
+     /* Encoder 3 steps presets. */
+     act(1, 2, 50);
+     eq('encoder 3 steps the preset list', act(1, 2, 49), 'preset:-1');
++
++    /* Only the Twister's own CCs wake it (midi/ext-knobs.ts). */
++    eq('a Twister turn is the Twister', m.isTwisterCc(1, 12), true);
++    eq('a Twister push is the Twister', m.isTwisterCc(2, 8), true);
++    eq('a KeyStep CC on channel 4 is not', m.isTwisterCc(4, 12), false);
++    eq('CC 74 on channel 1 is not', m.isTwisterCc(1, 74), false);
++
++    /* Stepped parameters follow the ring's position (midi/ext-param-steps.ts). */
++    const sp = await import('../../dist/esm/midi/ext-param-steps.js');
++    const en3 = { type: 'enum', value: 0, min: 0, max: 2, options: ['A', 'B', 'C'] };
++    eq('an enum of 3 is stepped', sp.stepCount(en3), 3);
++    eq('a float is continuous', sp.stepCount({ type: 'float', value: 0, min: 0, max: 1 }), 0);
++    eq('a wide int is continuous', sp.stepCount({ type: 'int', value: 0, min: 0, max: 127 }), 0);
++    eq('an int 1..4 is stepped', sp.stepCount({ type: 'int', value: 1, min: 1, max: 4 }), 4);
++    eq('an on/off is stepped', sp.stepCount({ type: 'int', value: 0, min: 0, max: 1 }), 2);
++    eq('ring 0 is the first option', sp.valueAt(en3, 3, 0), 0);
++    eq('ring 64 is the middle option', sp.valueAt(en3, 3, 64), 1);
++    eq('ring 127 is the last option', sp.valueAt(en3, 3, 127), 2);
++    eq('an int zone is offset by min', sp.valueAt({ type: 'int', value: 1, min: 1, max: 4 }, 4, 127), 4);
++    eq('an on/off flips at half travel', `${sp.valueAt({ type: 'int', min: 0, max: 1 }, 2, 63)}${sp.valueAt({ type: 'int', min: 0, max: 1 }, 2, 64)}`, '01');
++    eq('an enum wires its index', sp.wireOf(en3, 2), '2');
++    eq('an enum that wires names sends the name', sp.wireOf({ ...en3, wiresNames: true }, 1), 'B');
++    eq('an int wires a whole number', sp.wireOf({ type: 'int', min: 0, max: 4 }, 3.0), '3');
++
++    /* The rings leave a knob alone while it is being turned (midi/ext-follow.ts). */
++    const fo = await import('../../dist/esm/midi/ext-follow.js');
++    const out = await import('../../dist/esm/midi/ext-out.js');
++    const drain = () => { while (out.twisterOutPending()) out.twisterOutFlush(); };
++    const sent = [], colours = [];
++    const was = globalThis.move_midi_external_send;
++    globalThis.move_midi_external_send = (d) => { if (d[1] === 0xB0) sent.push(d[2] + '=' + d[3]); else colours.push(d[1].toString(16) + '/' + d[2] + ':' + d[3]); };
++    try {
++        fo.armTwisterFollow(() => {});
++        fo.twisterTouched(0, 1000);
++        fo.twisterFollow([0.5, null, null, null, null, null, null, null], 1100);
++        drain();
++        eq('a ring being turned is not resynced', sent.join(' '), '');
++        fo.twisterFollow([0.5, null, null, null, null, null, null, null], 1500);
++        drain();
++        eq('it is resynced once it rests', sent.join(' '), '8=64');
++
++        /* The assigned rings wear the active track's colour (midi/ext-colors.ts). */
++        const co = await import('../../dist/esm/midi/ext-colors.js');
++        const cs = await import('../../dist/esm/seq/colors.js');
++        eq('track 1 is green on the Move', cs.trackColor(0), cs.GREEN_T);
++        eq('track 2 is blue', cs.trackColor(1), cs.BLUE_T);
++        eq('track 3 is orange', cs.trackColor(2), cs.ORANGE_T);
++        eq('track 4 is purple', cs.trackColor(3), cs.PURPLE_T);
++        eq('green is green on the Twister', co.twisterHue(cs.GREEN_T), 50);
++        eq('an unknown colour falls back to green', co.twisterHue(999), co.TW_HUE_DEFAULT);
++        eq('assigned encoders get the colour', colours.filter((c) => c.startsWith('b1/')).length, 11);
++        eq('the 5 unassigned are put dark', colours.filter((c) => c.endsWith(':17')).length, 5);
++        colours.length = 0;
++        fo.twisterFollow([0.5, null, null, null, null, null, null, null], 2000);
++        drain();
++        eq('a steady track repaints nothing', colours.length, 0);
++
++        /* Paced: a repaint is 43 messages, more than one USB packet holds
++         * (midi/ext-out.ts). At most PER_TICK leave per tick, none is lost. */
++        colours.length = 0;
++        sent.length = 0;
++        co.twisterColorsReset();
++        fo.twisterFollow([0.5, null, null, null, null, null, null, null], 3000);
++        const queued = out.twisterOutPending();
++        eq('a repaint is queued, not sent at once', colours.length, 0);
++        out.twisterOutFlush();
++        eq('one tick sends at most PER_TICK', colours.length, out.PER_TICK);
++        drain();
++        eq('every queued message arrives', colours.length, queued);
++        eq('both channel-3 settings of an encoder arrive',
++            colours.filter((c) => c === 'b2/8:47' || c === 'b2/8:95').length, 2);
++
++        /* Coalesced: a newer value for the same control replaces the queued one. */
++        sent.length = 0;
++        out.twisterSend([0x0B, 0xB0, 9, 10]);
++        out.twisterSend([0x0B, 0xB0, 10, 20]);
++        out.twisterSend([0x0B, 0xB0, 9, 30]);
++        drain();
++        eq('the last value wins, in its first place', sent.join(' '), '9=30 10=20');
++    } finally {
++        globalThis.move_midi_external_send = was;
++    }
+ }
+diff --git a/browser-test/logic/keyboard.mjs b/browser-test/logic/keyboard.mjs
+index 89e98fe9..a22980c0 100644
+--- a/browser-test/logic/keyboard.mjs
++++ b/browser-test/logic/keyboard.mjs
+@@ -244,7 +244,7 @@ export async function run() {
+     const { keyboardState, resetPadMapCache } = await import('../../dist/esm/keyboard/state.js');
+ 
+     const C_BLACK = 0, C_WHITE = 120, C_DARKGREY = 124, C_LIGHTGREY = 118, C_GREEN = 11;
+-    const TRACK0 = 65;  // track 1 = Bright Red dim
++    const TRACK0 = 126; // track 1 = Green
+     const PAD_MIN = 68;
+ 
+     keyboardState.rootPc = 0; keyboardState.scale = 0;
+diff --git a/browser-test/track-colors.mjs b/browser-test/track-colors.mjs
+index 420e0fc4..ddef7a8f 100644
+--- a/browser-test/track-colors.mjs
++++ b/browser-test/track-colors.mjs
+@@ -112,6 +112,7 @@ _log('\npalette indices still mean what movy thinks they mean:');
+ const EXPECTED = {
+     65: '661914', 7: 'FADC3B', 95: '134566', 23: '972BFF',
+     9: 'B6FF0E', 2: '800400', 3: 'C93C00', 69: '5D1700',
++    126: '00FF00', 125: '0000FF', 85: '144D08', 99: '0A1466', 109: '3C1166',
+ };
+ for (const [idx, hex] of Object.entries(EXPECTED)) {
+     eq(`index ${idx} is #${hex} (${name(+idx)})`, PAL.get(+idx)?.hex, hex);
+diff --git a/build/browser.mjs b/build/browser.mjs
+index 05f4908c..e925495f 100644
+--- a/build/browser.mjs
++++ b/build/browser.mjs
+@@ -323,6 +323,10 @@ await esbuild.build({
+         /* The external knob controller's mapping, pure — driven by the
+          * logic suite (ext-knobs.mjs) without a router behind it. */
+         resolve(root, 'src/midi/ext-knob-map.ts'),
++        resolve(root, 'src/midi/ext-param-steps.ts'),
++        resolve(root, 'src/midi/ext-follow.ts'),
++        resolve(root, 'src/midi/ext-colors.ts'),
++        resolve(root, 'src/midi/ext-out.ts'),
+         /* A track's MIDI IN and its track menu, driven by midi-in.mjs. */
+         resolve(root, 'src/track/midi-in.ts'),
+         resolve(root, 'src/seq/track-menu.ts'),
+diff --git a/src/app/tick.ts b/src/app/tick.ts
+index 74bd2a74..70c93082 100644
+--- a/src/app/tick.ts
++++ b/src/app/tick.ts
+@@ -44,6 +44,7 @@ import { renderChainView }    from '../renderer/chain-view.js';
+ import type { PageChrome } from '../renderer/schwung-page-chrome.js';
+ import { renderFileBrowseView } from '../renderer/file-browse-view.js';
+ import { updateKnobLEDsFrom, updateSingleKnobLED } from '../renderer/knob-leds.js';
++import { twisterOutFlush } from '../midi/ext-out.js';
+ import { seqEngineTick, takeLabelSync, requestLabelSync } from '../seq/engine.js';
+ import { drumSyncTick, resetDrumSync } from '../seq/drum-sync.js';
+ import { bindLanes } from '../seq/lane-mapping.js';
+@@ -392,6 +393,9 @@ let labelRetryGap = LABEL_RETRY_MIN;
+ export function tick(): void {
+     perfProbeEnter();
+     tickBody();
++    /* Outside tickBody so none of its early returns stalls the queue: what this
++     * tick painted leaves this tick, paced (midi/ext-out.ts). */
++    twisterOutFlush();
+     /* Outside tickBody so its early returns are still accounted for. */
+     perfProbeTick();
+ }
+diff --git a/src/midi/ext-colors.ts b/src/midi/ext-colors.ts
+new file mode 100644
+index 00000000..6358710a
+--- /dev/null
++++ b/src/midi/ext-colors.ts
+@@ -0,0 +1,57 @@
++/* ext-colors.ts — a Twister's assigned rings wear the active track's colour,
++ * so the controller and the Move say the same thing about which track the
++ * knobs edit.
++ *
++ * Channel 2 CC n sets encoder n's colour as a Twister hue (1-126), which is
++ * not the Move's palette — TW_HUE translates the four track colours. Any
++ * other colour falls back to green. Repainted only when the hue changes (and
++ * after a reconnect), so a steady track costs no MIDI.
++ */
++
++import { appState } from '../app/state.js';
++import { twisterSend } from './ext-out.js';
++import { trackColor, GREEN_T, BLUE_T, ORANGE_T, PURPLE_T } from '../seq/colors.js';
++import { TW_ASSIGNED } from './ext-knob-map.js';
++import { mlog } from '../log.js';
++
++export const TW_HUE_DEFAULT = 50;   /* green */
++export const TW_HUE: Readonly<Record<number, number>> = {
++    [GREEN_T]: 50, [BLUE_T]: 1, [ORANGE_T]: 72, [PURPLE_T]: 104,
++};
++
++let painted = -1;
++
++/** The Twister hue for a Move palette colour. */
++export function twisterHue(color: number): number {
++    return TW_HUE[color] ?? TW_HUE_DEFAULT;
++}
++
++/** Forget what was painted: the next sync repaints (a reconnect). */
++export function twisterColorsReset(): void {
++    painted = -1;
++}
++
++/* Channel 3 CC n is encoder n's animation byte: 17..47 is RGB brightness
++ * (off..full), 65..95 the indicator's. The whole controller is repainted with
++ * the colour — 43 messages, which is why they go through midi/ext-out.ts's
++ * paced queue: sent at once, all but one USB packet's worth were lost. */
++const ASSIGNED = new Set(TW_ASSIGNED);
++
++/** Paint the controller for the active track's colour, if it changed:
++ *  assigned encoders lit in that colour, the rest dark. */
++export function twisterColorSync(): void {
++    const hue = twisterHue(trackColor(appState.activeTrack.index));
++    if (hue === painted) return;
++    painted = hue;
++    mlog('twister colour track=' + (appState.activeTrack.index + 1) + ' hue=' + hue);
++    for (let enc = 0; enc < 16; enc++) {
++        if (ASSIGNED.has(enc)) {
++            twisterSend([0x0B, 0xB1, enc, hue]);
++            twisterSend([0x0B, 0xB2, enc, 47]);
++            twisterSend([0x0B, 0xB2, enc, 95]);
++        } else {
++            twisterSend([0x0B, 0xB2, enc, 17]);
++            twisterSend([0x0B, 0xB2, enc, 65]);
++        }
++    }
++}
+diff --git a/src/midi/ext-follow.ts b/src/midi/ext-follow.ts
+index 6cb4c36d..b8c47cb7 100644
+--- a/src/midi/ext-follow.ts
++++ b/src/midi/ext-follow.ts
+@@ -13,30 +13,51 @@
+  * MIDI at all.
+  */
+ 
+-import { platform } from '../platform/index.js';
++import { twisterSend } from './ext-out.js';
+ import { TW_KNOB_BASE, EXT_KNOBS } from './ext-knob-map.js';
++import { twisterColorSync, twisterColorsReset } from './ext-colors.js';
++import { mlog } from '../log.js';
+ 
+ let armed = false;
+ let onSync: ((cc: number, v: number) => void) | null = null;
+ const sent: number[] = new Array(EXT_KNOBS).fill(-1);
+ 
++/* HANDS OFF A RING WHILE IT IS TURNED. A stepped parameter (an enum, a switch,
++ * a short range) moves only every few Twister steps; snapping the ring back to
++ * it on every update fought the hand — the encoder could never travel far
++ * enough to reach the next value. So an encoder that sent within HOLD_MS is
++ * left alone, and resynced once it rests. */
++const HOLD_MS = 350;
++const touchedMs: number[] = new Array(EXT_KNOBS).fill(0);
++
++/** A Twister knob (0-7) was just turned. */
++export function twisterTouched(knob: number, nowMs = Date.now()): void {
++    if (knob < 0 || knob >= EXT_KNOBS) return;
++    touchedMs[knob] = nowMs;
++    sent[knob] = -1;    /* whatever it lands on is resent when it rests */
++}
++
+ /** Start following, and resend every ring on the next update (a reconnect). */
+ export function armTwisterFollow(sync: (cc: number, v: number) => void): void {
+     armed = true;
++    mlog('twister follow armed');
+     onSync = sync;
+     sent.fill(-1);
++    twisterColorsReset();
+ }
+ 
+ /** Called with the knob LEDs' levels (0..1, null = nothing bound). */
+-export function twisterFollow(levels: readonly (number | null)[]): void {
++export function twisterFollow(levels: readonly (number | null)[], nowMs = Date.now()): void {
+     if (!armed) return;
++    twisterColorSync();    /* the rings wear the active track's colour */
+     for (let k = 0; k < EXT_KNOBS; k++) {
++        if (nowMs - touchedMs[k] < HOLD_MS) continue;
+         const lv = levels[k];
+         if (lv === null || lv === undefined || !isFinite(lv)) continue;
+         const v = Math.max(0, Math.min(127, Math.round(lv * 127)));
+         if (sent[k] === v) continue;
+         sent[k] = v;
+         onSync?.(TW_KNOB_BASE + k, v);
+-        platform.externalSend([0x0B, 0xB0, TW_KNOB_BASE + k, v]);
++        twisterSend([0x0B, 0xB0, TW_KNOB_BASE + k, v]);
+     }
+ }
+diff --git a/src/midi/ext-knob-map.ts b/src/midi/ext-knob-map.ts
+index 0ab64366..419d8ded 100644
+--- a/src/midi/ext-knob-map.ts
++++ b/src/midi/ext-knob-map.ts
+@@ -19,7 +19,7 @@
+  *        encoder 1      turn = jog (geared down), push = jog click
+  *        encoder 3      turn = previous / next preset of the knobs' module
+  *        encoder 4      push = Back
+- *        encoders 9-16  knobs 1-8
++ *        encoders 9-16  knobs 1-8, push = back to the preset's value
+  *    Encoder 2 is left alone: it sends CC 1, which the engine plays as the
+  *    mod wheel (ext_route.rs) before this side sees it, so mapping it here
+  *    would turn a knob AND modulate the synth. The rest are free.
+@@ -43,7 +43,12 @@ export const TW_ASSIGNED: readonly number[] = [TW_JOG, TW_PRESET, TW_BACK,
+ 
+ export type ExtAction =
+     | { kind: 'cc'; cc: number; value: number }   /* replay as a Move control */
+-    | { kind: 'preset'; delta: number };          /* step the preset list */
++    | { kind: 'preset'; delta: number }           /* step the preset list */
++    /* A Twister knob (0-7): the signed steps AND where the ring now sits, so
++     * the dispatch can pick per parameter — steps for a continuous one, the
++     * position for an enum or a short range (midi/ext-param.ts). */
++    | { kind: 'knob'; knob: number; delta: number; pos: number }
++    | { kind: 'reset'; knob: number };            /* push: back to the preset's value */
+ 
+ export interface ExtKnobState {
+     abs: Map<string, number>;
+@@ -80,6 +85,9 @@ export function extKnobActions(st: ExtKnobState, ch: number, d1: number, d2: num
+         const v = d2 > 0 ? 127 : 0;
+         if (d1 === TW_JOG) return [cc(MoveMainButton, v)];
+         if (d1 === TW_BACK) return [cc(MoveBack, v)];
++        if (v && d1 >= TW_KNOB_BASE && d1 < TW_KNOB_BASE + EXT_KNOBS) {
++            return [{ kind: 'reset', knob: d1 - TW_KNOB_BASE }];
++        }
+         return [];
+     }
+     if (ch !== 1) return [];
+@@ -96,7 +104,14 @@ export function extKnobActions(st: ExtKnobState, ch: number, d1: number, d2: num
+     }
+     if (d1 >= TW_KNOB_BASE && d1 < TW_KNOB_BASE + EXT_KNOBS) {
+         const d = absDelta(st, 'tw' + d1, d2);
+-        return d ? [cc(MoveKnob1 + d1 - TW_KNOB_BASE, toRel(d))] : [];
++        return d ? [{ kind: 'knob', knob: d1 - TW_KNOB_BASE, delta: d, pos: d2 }] : [];
+     }
+     return [];
+ }
++
++/** A CC a factory Twister sends: rotation on channel 1, a push on channel 2,
++ *  CC 0-15. Only these say "the Twister is there" (midi/ext-knobs.ts) — a
++ *  keyboard's CCs on the same USB-A hub must not wake it or repaint it. */
++export function isTwisterCc(ch: number, cc: number): boolean {
++    return (ch === 1 || ch === 2) && cc >= 0 && cc <= 15;
++}
+diff --git a/src/midi/ext-knobs.ts b/src/midi/ext-knobs.ts
+index 3bc919c0..840dad85 100644
+--- a/src/midi/ext-knobs.ts
++++ b/src/midi/ext-knobs.ts
+@@ -4,59 +4,49 @@
+  */
+ 
+ import { appState } from '../app/state.js';
+-import { platform } from '../platform/index.js';
+ import { pageOwnerOf } from '../app/page-owner.js';
+ import { onMidiMessageInternal, knobModel } from './router.js';
+-import { createExtKnobState, extKnobActions, TW_ASSIGNED } from './ext-knob-map.js';
++import { createExtKnobState, extKnobActions, isTwisterCc } from './ext-knob-map.js';
+ import { armTwisterFollow } from './ext-follow.js';
++import { extBaseForget, extKnobReset, extKnobTurn } from './ext-param.js';
+ 
+ const state = createExtKnobState();
+ 
+ /* A Twister forgets its ring colours on reconnect, and nothing tells us it
+  * reconnected — so the rings are repainted whenever CCs resume after a quiet
+- * spell. Cheap: 32 messages, at most once per gap. */
++ * spell. */
+ const WAKE_GAP_MS = 10000;
+ let lastCcMs = 0;
+ 
+-/* Channel 2 CC n sets encoder n's colour (hue 1-126); channel 3 CC n its
+- * animation byte, where 17..47 is RGB brightness (off..full) and 65..95 the
+- * indicator's. Assigned encoders are green, the rest dark, so the controller
+- * shows which encoders do something. */
+-const TW_GREEN = 50;
+-
+-function paintTwister(): void {
+-    const assigned = new Set(TW_ASSIGNED);
+-    for (let enc = 0; enc < 16; enc++) {
+-        if (assigned.has(enc)) {
+-            platform.externalSend([0x0B, 0xB1, enc, TW_GREEN]);
+-            platform.externalSend([0x0B, 0xB2, enc, 47]);
+-            platform.externalSend([0x0B, 0xB2, enc, 95]);
+-        } else {
+-            platform.externalSend([0x0B, 0xB2, enc, 17]);
+-            platform.externalSend([0x0B, 0xB2, enc, 65]);
+-        }
+-    }
+-}
+-
+ /* Step the preset list of the module the knobs edit, from whatever page is on
+  * screen — the page layer lands on the preset door, steps, and comes back. */
+ function presetTurn(delta: number): void {
+-    const page = pageOwnerOf(knobModel()).page;
+-    if (page && page.presetStep(delta)) appState.dirty = true;
++    const owner = pageOwnerOf(knobModel());
++    if (owner.page && owner.page.presetStep(delta)) {
++        extBaseForget(owner.ref);    /* the new preset is what a push returns to */
++        appState.dirty = true;
++    }
+ }
+ 
+ export function onExternalControlChange(data: number[]): void {
+-    const now = Date.now();
+-    if (now - lastCcMs > WAKE_GAP_MS) {
+-        paintTwister();
+-        /* The rings then follow the parameters, and the absolute decoder
+-         * counts from where each ring was put (midi/ext-follow.ts). */
+-        armTwisterFollow((cc, v) => state.abs.set('tw' + cc, v));
+-    }
+-    lastCcMs = now;
+     const ch = (data[0] & 0x0F) + 1;
++    /* Only the Twister's own CCs wake it: a KeyStep on the same hub sends CCs
++     * all the time, and counting them kept the gap from ever opening (or
++     * armed a follow with no Twister there). */
++    if (isTwisterCc(ch, data[1] & 0x7F)) {
++        const now = Date.now();
++        if (now - lastCcMs > WAKE_GAP_MS) {
++            /* A reconnect: the follow repaints the controller (midi/ext-colors.ts),
++             * then the rings follow the parameters, and the absolute decoder
++             * counts from where each ring was put (midi/ext-follow.ts). */
++            armTwisterFollow((cc, v) => state.abs.set('tw' + cc, v));
++        }
++        lastCcMs = now;
++    }
+     for (const a of extKnobActions(state, ch, data[1] & 0x7F, data[2] & 0x7F)) {
+         if (a.kind === 'cc') onMidiMessageInternal([0xB0, a.cc, a.value]);
++        else if (a.kind === 'knob') extKnobTurn(a.knob, a.delta, a.pos);
++        else if (a.kind === 'reset') extKnobReset(a.knob);
+         else presetTurn(a.delta);
+     }
+ }
+diff --git a/src/midi/ext-out.ts b/src/midi/ext-out.ts
+new file mode 100644
+index 00000000..351e8545
+--- /dev/null
++++ b/src/midi/ext-out.ts
+@@ -0,0 +1,56 @@
++/* ext-out.ts — everything movy sends to a Twister on USB-A goes through here.
++ *
++ * PACED, because a burst is lost. Sent all at once, a repaint (16 encoders x
++ * up to 3 messages) reached the controller only in part: a USB-MIDI packet is
++ * 64 bytes, 16 four-byte events, and whatever did not fit in the tick's packet
++ * was dropped — seen on device as rings left the old colour, or lit when they
++ * should be dark. So messages are queued and at most PER_TICK of them leave per
++ * tick (app/tick.ts calls twisterOutFlush once per tick).
++ *
++ * COALESCED: a queued message is replaced in place by a newer one for the same
++ * control, so a ring that moves faster than the queue drains costs one slot,
++ * not a backlog, and the last value always wins. "The same control" is status +
++ * CC, except on channel 3, where one CC carries two settings (17..47 RGB
++ * brightness, 65..95 indicator brightness) that must both arrive.
++ */
++
++import { platform } from '../platform/index.js';
++
++export const PER_TICK = 10;
++
++const queue: number[][] = [];
++const slot = new Map<number, number>();   /* control id -> index in queue */
++let head = 0;
++
++function controlId(msg: readonly number[]): number {
++    const st = msg[1] & 0xFF, cc = msg[2] & 0x7F, v = msg[3] & 0x7F;
++    const half = (st & 0x0F) === 2 && v >= 64 ? 1 : 0;
++    return (st << 9) | (cc << 1) | half;
++}
++
++/** Queue one message for the Twister (USB cable-number byte first). */
++export function twisterSend(msg: readonly number[]): void {
++    const id = controlId(msg);
++    const at = slot.get(id);
++    if (at !== undefined && at >= head) { queue[at] = msg.slice(); return; }
++    slot.set(id, queue.length);
++    queue.push(msg.slice());
++}
++
++/** Send up to `max` queued messages; called once per tick. */
++export function twisterOutFlush(max = PER_TICK): void {
++    let n = 0;
++    while (head < queue.length && n < max) {
++        const msg = queue[head];
++        slot.delete(controlId(msg));
++        head++;
++        n++;
++        platform.externalSend(msg);
++    }
++    if (head >= queue.length) { queue.length = 0; head = 0; }
++}
++
++/** Messages still waiting (tests, logs). */
++export function twisterOutPending(): number {
++    return queue.length - head;
++}
+diff --git a/src/midi/ext-param-steps.ts b/src/midi/ext-param-steps.ts
+new file mode 100644
+index 00000000..f29b1abb
+--- /dev/null
++++ b/src/midi/ext-param-steps.ts
+@@ -0,0 +1,49 @@
++/* ext-param-steps.ts — how an absolute Twister ring maps onto a parameter.
++ * Pure: a KnobParamInfo-shaped value in, numbers and wire strings out.
++ *
++ * A continuous parameter (a cutoff) is driven by STEPS, like the Move's own
++ * encoder, through Schwung's onKnobTurn. A STEPPED one — an enum, a switch, an
++ * int with a short range — is not: Schwung gates an enum behind several
++ * detents and toggles a two-way box on every flick, so 128 small Twister steps
++ * made it jump about. Those are driven by the ring's POSITION instead: the
++ * travel is cut into n equal zones, one per value, so the knob lands where the
++ * wrist points and the ring (resynced on rest) shows the zone.
++ */
++
++/** Above this many values a parameter is treated as continuous. */
++export const MAX_STEPPED = 32;
++
++export interface StepInfo {
++    value: number;
++    min: number;
++    max: number;
++    type: string;
++    options?: string[];
++    wiresNames?: boolean;
++}
++
++/** How many discrete values a parameter has, or 0 when it is continuous. */
++export function stepCount(info: StepInfo | null | undefined): number {
++    if (!info) return 0;
++    let n = 0;
++    if (info.type === 'enum') n = Array.isArray(info.options) ? info.options.length : 0;
++    else if (info.type === 'int') n = Math.round(info.max) - Math.round(info.min) + 1;
++    return n >= 2 && n <= MAX_STEPPED ? n : 0;
++}
++
++/** The value (as the info reads it) a ring position 0-127 selects. */
++export function valueAt(info: StepInfo, n: number, pos: number): number {
++    const zone = Math.min(n - 1, Math.floor((Math.max(0, Math.min(127, pos)) * n) / 128));
++    return info.type === 'enum' ? zone : Math.round(info.min) + zone;
++}
++
++/** The string a module's set_param takes for `value`. */
++export function wireOf(info: StepInfo, value: number): string {
++    if (info.type === 'enum') {
++        const idx = Math.round(value);
++        const name = info.wiresNames && info.options ? info.options[idx] : undefined;
++        return name !== undefined ? String(name) : String(idx);
++    }
++    if (info.type === 'int') return String(Math.round(value));
++    return String(value);
++}
+diff --git a/src/midi/ext-param.ts b/src/midi/ext-param.ts
+new file mode 100644
+index 00000000..68fc67d1
+--- /dev/null
++++ b/src/midi/ext-param.ts
+@@ -0,0 +1,89 @@
++/* ext-param.ts — a Twister knob turn or push, applied to the parameter under
++ * that knob. The pure half (which parameters are stepped, zones, wire form) is
++ * midi/ext-param-steps.ts.
++ *
++ * PUSH = BACK TO THE PRESET. The first time a parameter is turned — by the
++ * Twister or the Move's own knob (midi/router.ts calls extBaseNote) — its value
++ * is kept as the base; a push writes it back. The bases of a module are
++ * forgotten when its preset changes (encoder 3, or knob 1 on the preset page),
++ * so the newly loaded preset becomes the base. Kept after a reset, so it can
++ * be pushed again.
++ */
++
++import { appState } from '../app/state.js';
++import { pageOwnerOf, type PageOwner, type PageRef } from '../app/page-owner.js';
++import { pageSourceFor } from '../renderer/schwung-grid.js';
++import { onMidiMessageInternal, knobModel } from './router.js';
++import { stepCount, valueAt, wireOf, type StepInfo } from './ext-param-steps.js';
++import { twisterTouched } from './ext-follow.js';
++import { mlog } from '../log.js';
++
++const bases = new Map<string, number>();
++const idOf = (ref: PageRef, ioKey: string): string => ref.track + ':' + ref.componentKey + ':' + ioKey;
++
++/** Forget the bases of one module (its preset changed). */
++export function extBaseForget(ref: PageRef | null): void {
++    if (!ref) return;
++    const pre = ref.track + ':' + ref.componentKey + ':';
++    for (const id of Array.from(bases.keys())) if (id.startsWith(pre)) bases.delete(id);
++}
++
++/** A knob is about to turn: keep the parameter's base if it has none. Knob 1
++ *  with no parameter but a lit level is the preset list turning. */
++export function extBaseNote(owner: PageOwner, knob: number, info: any | null): void {
++    const ref = owner.ref;
++    if (!ref) return;
++    if (!info) {
++        if (knob === 0 && owner.page) {
++            const lv = owner.page.knobLevels();
++            if (lv && lv[0] !== null && lv[0] !== undefined) extBaseForget(ref);
++        }
++        return;
++    }
++    const id = idOf(ref, info.ioKey);
++    if (!bases.has(id)) bases.set(id, info.value);
++}
++
++function write(ref: PageRef, info: StepInfo & { ioKey: string }, value: number): void {
++    const src = pageSourceFor(ref.track, ref.componentKey);
++    if (!src) return;
++    src.setParam(ref.componentKey + ':' + info.ioKey, wireOf(info, value));
++    appState.dirty = true;
++}
++
++/** A Twister knob turned: steps for a continuous parameter, the ring's
++ *  position for a stepped one. */
++export function extKnobTurn(knob: number, delta: number, pos: number): void {
++    twisterTouched(knob);
++    const owner = pageOwnerOf(knobModel());
++    const info = owner.ref && owner.page ? owner.knobParamInfo(knob) : null;
++    const n = stepCount(info);
++    if (!n || !owner.ref) {
++        onMidiMessageInternal([0xB0, MoveKnob1 + knob, delta >= 0 ? delta : 128 + delta]);
++        return;
++    }
++    extBaseNote(owner, knob, info);
++    const v = valueAt(info, n, pos);
++    /* The page re-reads the value a few ticks later, so until then info.value
++     * is the old one: without `zoneSent` every CC in between rewrote it. */
++    const zone = idOf(owner.ref, info.ioKey) + '=' + v;
++    if (v === Math.round(info.value)) { zoneSent[knob] = ''; return; }
++    if (zoneSent[knob] === zone) return;
++    zoneSent[knob] = zone;
++    write(owner.ref, info, v);
++}
++const zoneSent: string[] = [];
++
++/** A Twister knob pushed: back to the base, if it has moved since. */
++export function extKnobReset(knob: number): void {
++    const owner = pageOwnerOf(knobModel());
++    const ref = owner.ref;
++    if (!ref || !owner.page) return;
++    const info = owner.knobParamInfo(knob);
++    if (!info) return;
++    const base = bases.get(idOf(ref, info.ioKey));
++    mlog('extReset k=' + knob + ' ' + info.ioKey + ' now=' + info.value + ' base=' + base);
++    if (base === undefined || base === info.value) return;
++    zoneSent[knob] = '';
++    write(ref, info, base);
++}
+diff --git a/src/midi/router.ts b/src/midi/router.ts
+index 579eb511..5172dd16 100644
+--- a/src/midi/router.ts
++++ b/src/midi/router.ts
+@@ -10,6 +10,7 @@ import { openSchwungEditor, schwungEditorActive, schwungEditorJog,
+          schwungEditorCommit, schwungEditorCancel } from '../renderer/schwung-editor.js';
+ import { openSchwungDive } from '../browser/schwung-dive.js';
+ import { canvasDiveTakes } from './canvas-dive-input.js';
++import { extBaseNote } from './ext-param.js';
+ 
+ /*
+  * WHICH PARAMETER IS UNDER KNOB k — one answer, for every gesture.
+@@ -645,6 +646,7 @@ export function onMidiMessageInternal(data: number[]): void {
+          */
+         const owner = pageOwnerOf(model);
+         const info = owner.knobParamInfo(k);
++        extBaseNote(owner, k, info);    /* what a Twister push returns to (midi/ext-param.ts) */
+         if (info && handleAutomationKnob(track, k, info, delta,
+                 mappingFor(info, (key, val) => portFor(track).setParam(key, val)))) {
+             return;
+diff --git a/src/renderer/schwung-grid.ts b/src/renderer/schwung-grid.ts
+index 39ca02d1..74ace063 100644
+--- a/src/renderer/schwung-grid.ts
++++ b/src/renderer/schwung-grid.ts
+@@ -15,6 +15,7 @@ import { isMovyOwnComponent, isVirtualPageComponent } from '../chain/config.js';
+ import { virtualSourceFor } from '../seq/virtual-page-sources.js';
+ import { ownComponentSourceFor } from '../chain/own-component-source.js';
+ import { mlog } from '../log.js';
++import type { PageParamSource } from './schwung-page-source.js';
+ 
+ /* One SchwungPage per (track, component). */
+ const pages = new Map<string, SchwungPage>();
+@@ -52,11 +53,7 @@ export function schwungPageFor(trackIndex: number, componentKey: string,
+          * own comment in chain/config.ts) — resolved before `componentPort`
+          * for the same reason a virtual component is: there is a translation
+          * to do that a bare port cannot do for itself. */
+-        const source = isVirtualPageComponent(componentKey)
+-            ? virtualSourceFor(componentKey)
+-            : isMovyOwnComponent(componentKey)
+-                ? ownComponentSourceFor(trackIndex, componentKey)
+-                : componentPort(trackIndex, componentKey);
++        const source = pageSourceFor(trackIndex, componentKey);
+         if (!source) return pages.get(id) ?? deadPage(componentKey);
+         p = createSchwungPage(source, componentKey,
+                               modulatedOf ?? null, automationOf ?? null, trackIndex);
+@@ -106,3 +103,14 @@ export function schwungGridDrop(trackIndex: number, componentKey: string): void
+ /* WHETHER SCHWUNG IS DRIVING IS NOT ASKED HERE: `app/page-owner.ts` is the
+  * only caller of `schwungPageFor` (`browser-test/logic/page-owner.mjs` greps
+  * for a second one). */
++
++/** Where a component's params live — the one answer the page and any direct
++ *  writer (midi/ext-param.ts) share. Virtual and movy-own components first:
++ *  each has a translation a bare port cannot do (see schwungPageFor). */
++export function pageSourceFor(trackIndex: number, componentKey: string): PageParamSource | null {
++    return isVirtualPageComponent(componentKey)
++        ? virtualSourceFor(componentKey)
++        : isMovyOwnComponent(componentKey)
++            ? ownComponentSourceFor(trackIndex, componentKey)
++            : componentPort(trackIndex, componentKey);
++}
+diff --git a/src/seq/colors.ts b/src/seq/colors.ts
+index 78ba3d02..9cd68f84 100644
+--- a/src/seq/colors.ts
++++ b/src/seq/colors.ts
+@@ -42,24 +42,36 @@ export const C_REC_RED = 127;  // Red — recording indicator (index 1 renders p
+  * `browser-test/track-colors.mjs` holds all of that, and also checks these
+  * indices still mean what they mean in schwung's own palette — the table here
+  * is a copy, and a copy can drift. */
++export const GREEN_T = 126;   // Green (#00FF00)
++export const BLUE_T = 125;    // Blue (#0000FF)
++export const ORANGE_T = 3;    // Bright Orange
++export const PURPLE_T = 23;   // #972BFF (palette 22 "Purple" is a blue)
++const DIM_OF: Record<number, number> = { [GREEN_T]: 85, [BLUE_T]: 99, [ORANGE_T]: 69, [PURPLE_T]: 109 };
++
++/* Track colours: the user's four, rotated. Tracks 1-4 are green, strong blue,
++ * orange and purple, and each later group starts one colour on, so every row
++ * (a group's 4 tracks) and every column (one track index across groups) holds
++ * all four — the distinctness rule, met with the four hues furthest apart.
++ * A Twister's rings take the same colour as the active track
++ * (midi/ext-colors.ts).
++ *
++ * The bans below still hold, and `browser-test/track-colors.mjs` checks them:
++ *   - cool hues (LAB 145-310) above L 45 read as white on the root pad.
++ *   - pastels (L > 65 with chroma under 0.7*L), whatever their hue.
++ * It also checks these indices still mean what they mean in schwung's own
++ * palette — the table here is a copy, and a copy can drift. */
+ export const TRACK_COLOR = [
+-    65, 7, 95, 23,        // G1: Bright Red dim, Vivid Yellow, Azure Blue dim, Neon Pink
+-    9, 2, 23, 95,         // G2: Bright Lime, Orange Red, Neon Pink, Azure Blue dim
+-    95, 23, 3, 9,         // G3: Azure Blue dim, Neon Pink, Bright Orange, Bright Lime
+-    23, 95, 9, 69,        // G4: Neon Pink, Azure Blue dim, Bright Lime, Bright Orange dim
++    GREEN_T, BLUE_T, ORANGE_T, PURPLE_T,
++    BLUE_T, ORANGE_T, PURPLE_T, GREEN_T,
++    ORANGE_T, PURPLE_T, GREEN_T, BLUE_T,
++    PURPLE_T, GREEN_T, BLUE_T, ORANGE_T,
+ ];
+ 
+-
+ /* Dim variants, still used by two things the Session selector no longer is:
+  * muted track buttons and the watched track's empty in-loop steps, where the
+  * dim colour marks the LOOP WINDOW. Each shares its bright partner's hue and is
+- * clearly darker. They repeat wherever the bright table repeats. */
+-export const TRACK_COLOR_DIM = [
+-    71, 77, 103, 109,     // Tan dim, Vivid Yellow dim, Electric Violet dim, Neon Pink dim
+-    81, 71, 109, 103,     // Bright Lime dim, Tan dim, Neon Pink dim, Electric Violet dim
+-    103, 109, 6, 81,      // Electric Violet dim, Neon Pink dim, Ochre, Bright Lime dim
+-    109, 103, 81, 71,     // Neon Pink dim, Electric Violet dim, Bright Lime dim, Tan dim
+-];
++ * clearly darker. */
++export const TRACK_COLOR_DIM = TRACK_COLOR.map((c) => DIM_OF[c]);
+ 
+ export function trackColor(track: number): number {
+     return TRACK_COLOR[track & 15];
+-- 
+2.54.0 (Apple Git-157)
+

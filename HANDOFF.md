@@ -62,3 +62,31 @@ El usuario tiene dudas sobre la implementación: empezar por escucharlas.
   - Desplegados `ui.js` y `dsp.so` (copias: `ui-device-v037-midi-in.js`, `dsp-device-v037-midi-in.so`). Copia de seguridad previa en el Move: `/data/UserData/schwung/backup-movy-<fecha-hora>/`.
   - Probado por el usuario con el KeyStep Pro: T1=CH10 (batería), T2–T4 = CH2–4. Funciona y se guarda en el Set.
 - Pendiente: decidir la publicación upstream (¿issue/PR del Twister y de MIDI IN por separado?), sincronizar el reloj MIDI con el KeyStep, y que el usuario cargue un módulo de batería en T1.
+
+## 2026-11-16 (noche): Twister con parámetros de pasos + reset, en el código fuente (rama device-v037, SIN commit)
+- Ojo: el `ui.js` de MIDI IN sobrescribió el parche del reset (que se había hecho a mano en el `ui.js`). Ahora el reset está en el código fuente.
+- `ext-knob-map.ts`: los encoders 9–16 dan `{kind:'knob', knob, delta, pos}`; la pulsación (canal 2, CC 8–15) da `{kind:'reset', knob}`.
+- `ext-param-steps.ts` (puro): un enum o un int de 2 a 32 valores es "de pasos" y se maneja por zonas de la posición del aro. Los parámetros continuos van por pasos relativos, como antes.
+- `ext-param.ts`: `extKnobTurn` / `extKnobReset` / `extBaseNote` (también desde `router.ts`) / `extBaseForget` (cambio de preset). Escribe con `pageSourceFor` (exportado desde `schwung-grid.ts`).
+- `ext-follow.ts`: `twisterTouched` deja el aro quieto 350 ms mientras se gira, y lo resincroniza al soltar.
+- Tests: `browser-test/logic/ext-knobs.mjs` (+21) y entradas nuevas en `build/browser.mjs`. Suites locales en verde salvo `abi-parity` (ya fallaba antes). Typecheck limpio.
+- Desplegado (solo `ui.js`, md5 e058c612…). PENDIENTE: que lo pruebe el usuario, y el commit cuando lo apruebe. Copia de seguridad de la versión MIDI IN: `/data/UserData/schwung/backup-movy-ui-device-v037-midi-in.js`.
+
+## 2026-11-16 (noche): colores de pista = colores del Twister (rama device-v037, SIN commit)
+- `seq/colors.ts`: las pistas 1–4 son verde (126), azul (125), naranja (3) y morado (23, #972BFF; la 22 "Purple" es azul). Los grupos 2–4 rotan esos mismos 4 colores. Versiones tenues: 85/99/69/109.
+- `midi/ext-colors.ts`: los aros asignados toman el color de la pista activa (`TW_HUE`: verde 50, azul 1, naranja 72, morado 112). Son valores ESTIMADOS de la escala de color del Twister y hay que ajustarlos a ojo. Se pinta desde `twisterFollow` solo cuando cambia el color.
+- `track-colors.mjs` (se salta si no encuentra la ruta de Schwung de /Users/dake): con estos colores fallarían sus reglas de separación (azul/morado, verde/naranja en daltonismo). Es una preferencia del usuario para su Move, no para el PR upstream.
+- Además, el verde de la pista 1 se parece al verde del cursor de reproducción (C_GREEN 11).
+- Desplegado solo el `ui.js`.
+
+## 2026-11-16 (noche): cortes de audio → es el módulo Model-72
+- Síntoma: una pista se queda en un micro-click unos segundos y vuelve sola. Descartado (con pruebas): el Twister, MIDI IN y nuestros cambios (también pasa con el Movy original), la CPU (medidor ~4-5 %) y Movy (sin "slow frame" en el log). Solo falla la pista de Model-72; con OB-Xd en su lugar no hay cortes.
+- Borrador del reporte para el autor: `3-ISSUE-model72.md` (sd88me/schwung-model72, v1.0.0). Sin publicar.
+- Pendiente: probar Model-72 con voices=1 como apaño.
+
+## 2026-11-16 (noche): envío al Twister con ritmo + despertar solo con CC del Twister (rama device-v037)
+- Causa de los aros mal pintados (la diagnosticó el usuario): un repintado manda 43 mensajes de golpe, y por USB-A solo cabe un paquete de 64 bytes (16 eventos) por tick; el resto se perdía.
+- `midi/ext-out.ts`: cola con `twisterSend()`; `twisterOutFlush()` envía como mucho `PER_TICK` = 10 por tick. Se llama desde `tick()` en `app/tick.ts`, después de `tickBody()`. Fusiona mensajes del mismo control (estado + CC; en el canal 3, el brillo RGB y el del indicador por separado) y gana el último valor. `ext-colors.ts` y `ext-follow.ts` envían a través de la cola.
+- `isTwisterCc(ch, cc)` en `ext-knob-map.ts` (canal 1 o 2, CC 0–15): solo esos CC cuentan para el "despertar" de 10 s; los del KeyStep ya no.
+- Tests +9 en `ext-knobs.mjs`; todas las suites locales en verde. Desplegado solo el `ui.js`, sin probar en el Move.
+- COMMIT 826b82cf en `device-v037`, solo en local: todo el trabajo del Twister de esta tarde y los colores. El usuario lo ha probado y funciona. No se ha subido a ningún remoto: `backup` = rogerbacardit/movy-twister (privado; ramas code-snapshot y notes) y `origin` = el repositorio del autor.
