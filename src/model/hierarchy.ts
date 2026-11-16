@@ -1,0 +1,246 @@
+import type { ModelState } from './state.js';
+import { loadModuleConfig } from '../modules/loader.js';
+import { effectiveDrumConfig, padVoices, readSurface } from './drum-declared.js';
+import { mlog } from '../log.js';
+import { moduleReadKey } from '../chain/config.js';
+import { declaredContract } from '../chain/hierarchy-source.js';
+import { buildConfigPages } from './config-pages.js';
+import { buildGenericPages } from './generic-pages.js';
+import { conditionHolds, collectRules } from './visible-if.js';
+import { physPadOfDrumPad } from '../keyboard/drum-grid.js';
+import { PAD_MIN } from '../seq/constants.js';
+import { armHierarchyRetry } from './meta-retry.js';
+import type { RawMeta } from './param-build.js';
+import { optionList } from './param-build.js';
+import { childLevelsOf, declaredKeysOf } from './child-keys.js';
+import { voiceKeysOf } from './voice-keys.js';
+
+type HierParam = RawMeta;
+
+interface HierLevel {
+    name?: string;
+    knobs?: (string | HierParam)[];
+    params?: (string | HierParam)[];
+    list_param?: string; count_param?: string; name_param?: string;
+    items_param?: string; select_param?: string;
+    children?: string;
+}
+
+export function loadHierarchy(s: ModelState): void {
+    s.knobParams   = [];
+    s.declared     = null;
+    s.moduleConfig = null;
+    s.bankNames    = [];
+    s.presetDeclared = false;
+    s.degenerateKeys = [];
+    s.hierarchyKey = s.activeModuleName;
+    /* Cleared on EVERY call, armed again below only if this read is the empty
+     * one — otherwise a retry armed by a PRIOR empty read outlives the success
+     * that followed it and forces one pointless extra rebuild. */
+    s.hierarchyRetryCountdown = -1;
+
+    mlog('loadHierarchy: slot=' + s.port.track.index + ' module=' + s.activeModuleName);
+    const prevModuleId = s.moduleId;
+    s.moduleId = s.port.getParam(moduleReadKey(s.componentKey)) || '';
+
+    s.moduleConfig = loadModuleConfig(s.moduleId, s.componentKey);
+    /* Only a genuine module change invalidates per-param gesture state. A reload
+     * of the same module happens ~1 s after load as pollModuleName settles —
+     * clearing then would re-arm a latched trigger mid-gesture and fire a
+     * destructive action twice. */
+    if (s.moduleId !== prevModuleId) {
+        // A same-module rebuild is what the metadata retry itself triggers —
+        // resetting the budget there would loop forever.
+        s.metaRetries   = 0;
+        s.hierarchyRetries = 0;
+    }
+
+    /* Params movy wants to own from load (e.g. ui_auto_select_pad=off so the DSP
+     * never drifts its focused pad away from movy's manual selection). */
+    if (s.moduleConfig?.setOnLoad) {
+        for (const [k, v] of Object.entries(s.moduleConfig.setOnLoad)) {
+            s.port.setParam(s.componentKey + ':' + k, v);
+        }
+    }
+
+    /* The contract as the module wrote it, kept so the drum surface can be read
+     * from it below. absorbHierarchy flattens levels into paramDefs and loses
+     * the top-level statements (`pad_layout`, `focus_param`) that say what kind
+     * of instrument this is. */
+    let declaredHierarchy: any = null;
+    s.drumPadCount       = 0;
+    // Focused pad is movy-authoritative: default 1, changed only by a manual pad
+    // press. Deliberately NOT seeded from the DSP's currentPadParam — that
+    // coupling let the DSP's playback-drifted pad leak into movy.
+    s.drumCurrentPad     = 1;
+    s.drumCurrentPhysPad = 0;
+    if (s.moduleConfig?.drum) {
+        s.drumPadCount = s.moduleConfig.drum.padCount;
+        /* Which GRID pad that first pad is. The step lane and the header icon
+         * already opened on pad 1; leaving the physical pad at 0 meant no pad
+         * lit white, so a freshly loaded rack looked like it had no pad
+         * selected while the sequencer was already editing one. */
+        s.drumCurrentPhysPad = physPadOfDrumPad(s.drumCurrentPad, PAD_MIN, s.moduleConfig.drum);
+    }
+
+    /* chain_params → cpMap for type/min/max/step/options/name lookups. cpOrder
+     * preserves the publish order for the no-hierarchy fallback (B1). */
+    const cpMap: Record<string, HierParam & { name?: string }> = {};
+    const cpOrder: string[] = [];
+    const chainParamsRaw = s.port.getParam(s.componentKey + ':chain_params');
+    if (chainParamsRaw) {
+        try {
+            const arr = JSON.parse(chainParamsRaw) as Array<{ key?: string }>;
+            for (const cp of arr) { if (cp.key) { cpMap[cp.key] = cp; cpOrder.push(cp.key); } }
+            mlog('loadHierarchy: chain_params ' + arr.length + ' entries');
+        } catch (e) { mlog('chain_params parse error: ' + e); }
+    }
+
+    /* Parse ui_hierarchy — build paramDefs (from .params arrays) and knobInline
+     * (from inline object knobs) for label/type fallback lookups.
+     *
+     * This flatten is last-write-wins across levels: a level can list a key by
+     * BARE STRING (no object) to reuse another level's canonical declaration —
+     * filter's root lists lfo_rate_div in its knobs but only the "lfo" level
+     * declares its short_name, and Main is meant to inherit it — so this map
+     * has to stay as the fallback for exactly that case. What it must NOT be is
+     * the *first* place a page's own cell looks: a level that redeclares a key
+     * with its OWN object entry (jp8000's perf_main/perf_setup/perf_arp each
+     * do, with DIFFERENT short_names) owns that declaration for its own page,
+     * and generic-pages.ts asks the owning level (hierarchy-walk.ts's
+     * levelOwnDefs) FIRST, falling back to this flat map only when the owning
+     * level didn't redeclare the key itself. See SP-25,
+     * docs/schwung-page-migration.md. */
+    const paramDefs:  Record<string, HierParam> = {};
+    const knobInline: Record<string, HierParam> = {};
+    let allLevels: Record<string, HierLevel> = {};
+    function absorbHierarchy(hier: { levels?: Record<string, HierLevel> } | null): void {
+        allLevels = hier?.levels ?? {};
+        for (const lvl of Object.values(allLevels)) {
+            if (lvl.params) {
+                for (const p of lvl.params) {
+                    if (p && typeof p === 'object' && p.key) paramDefs[p.key] = p;
+                }
+            }
+            if (lvl.knobs) {
+                for (const k of lvl.knobs) {
+                    if (k && typeof k === 'object' && k.key) knobInline[k.key] = k;
+                }
+            }
+        }
+    }
+
+    /*
+     * WHAT THE MODULE PUBLISHED, from the one reader (SP-20).
+     *
+     * `chain/hierarchy-source` climbs the three rungs — `ui_hierarchy`, then
+     * `ui_pages` for a module that ships its own chain editor (9W9 answers the
+     * first key EMPTY on purpose and publishes the same contract under a key
+     * the host does not probe), then `module.json`, because schwung serves a
+     * SYNTH slot's `ui_hierarchy` from the plugin alone and a module that
+     * describes its UI in its manifest arrives here with none. The delegated
+     * page climbs the same three, which is the point: two readers of one
+     * contract is how a pad press ended up with no page to jump to.
+     *
+     * `pending` is not acted on here. These reads go through a BLOCKING port,
+     * so a null means the param does not exist — it is the delegated page's
+     * cached reads that can be in flight.
+     *
+     * NOT CACHED BEYOND THIS LOAD. 9W9's note map is switchable at runtime and
+     * it serves a DIFFERENT hierarchy per map, so a value kept across loads
+     * would seat every voice at the wrong note with nothing to say why. This
+     * runs on each hierarchy load, which is what a map change triggers.
+     */
+    const declared = declaredContract({
+        read: (k) => s.port.getParam(s.componentKey + ':' + k),
+        moduleId: () => s.moduleId,
+        componentKey: s.componentKey,
+    });
+    if (declared.levels) {
+        mlog('loadHierarchy: contract from ' + declared.source);
+        /* The source's own parse, not a second one: minijv's contract is 39 KB
+         * and it had to parse it to know the module had said anything. */
+        const parsed = declared.levels as { levels?: Record<string, HierLevel> };
+        declaredHierarchy = parsed;
+        absorbHierarchy(parsed);
+    }
+
+    /*
+     * THE MODULE'S OWN WORD ABOUT ITS PADS, now the contract is in hand.
+     *
+     * The block above answered from movy's table alone, because it runs before
+     * the hierarchy is read. A module that DECLARES its voices (schwung #411)
+     * overrides that here: its pad count and its notes are what it says, and
+     * the table survives only as the fallback for the 100 fleet modules that
+     * declare nothing — for those `effectiveDrumConfig` hands back the very
+     * object it was given, so nothing moves.
+     *
+     * Resolved once, onto `s.drumConfig`, rather than at each call site: two
+     * places merging the two sources is how they would come to disagree.
+     */
+    const declaredSurface = readSurface(declaredHierarchy);
+    /* Says what the module declared, once per load. Without it a rack that does
+     * not seat itself is indistinguishable from a rack that declared nothing,
+     * and the difference is the whole feature — the reader, the contract that
+     * reached movy, and the table fallback all fail the same silent way. */
+    mlog('drum-declared layout=' + (declaredSurface ? declaredSurface.layout : 'no-reader')
+       + ' voices=' + (declaredSurface ? declaredSurface.voices.length : 0)
+       + ' press=' + (declaredSurface?.pressParam || '-')
+       + ' hier=' + (declaredHierarchy ? 'yes' : 'none')
+       + ' keys=' + (declaredHierarchy ? Object.keys(declaredHierarchy).join('|') : '-'));
+    /* Alongside the drum config, not inside it: the vouch is not drum-only.
+     * See ModelState.pressParam. */
+    s.pressParam = declaredSurface?.pressParam ?? null;
+    /* Kept past the load for the label sync (`childTemplateOf`): a lane on a
+     * template rack names a concrete instance key, which no page lists. */
+    s.childLevels = childLevelsOf(declaredHierarchy?.levels);
+    /* ...and every key the module declares, for the same sync. Under the
+     * Schwung grid a lane binds what SCHWUNG planned — forge's Voice macros
+     * (`cv_m1`) are on no movy page — so "a param movy's pages show" is the
+     * wrong test for whether a lane is stale. `paramRangeByKey` falls back to
+     * this. */
+    s.declared = { cp: cpMap, defs: { ...knobInline, ...paramDefs }, keys: declaredKeysOf(cpOrder, allLevels) };
+    s.drumConfig = effectiveDrumConfig(declaredSurface, s.moduleConfig?.drum ?? null);
+    /* The declared voices, one per PAD of the rack that won (D4) — matched by
+     * the note the pad plays, so a config's own numbering cannot hand pad 10
+     * pad 11's name or keys. */
+    const voices = (s.drumConfig && declaredSurface && declaredSurface.layout === 'drums')
+        ? padVoices(s.drumConfig, declaredSurface.voices) : [];
+    s.drumPadNames = voices.map((v) => (v && v.name) || '');
+    s.drumPadRoles = voices.map((v) => (v && v.role) || '');
+    s.voiceKeys = voiceKeysOf(declaredHierarchy, voices.map((v) => ({ note: v ? v.note : NaN })));
+    if (s.drumConfig) {
+        s.drumPadCount = s.drumConfig.padCount;
+        s.drumCurrentPhysPad = physPadOfDrumPad(s.drumCurrentPad, PAD_MIN, s.drumConfig);
+    }
+
+    // B1: with no ui_hierarchy and no config we can still build pages from
+    // chain_params (handled by the fallback in the generic path below). Only bail
+    // when there's genuinely nothing — no hierarchy, no config, no chain_params.
+    if (Object.keys(allLevels).length === 0 && !s.moduleConfig && cpOrder.length === 0) {
+        mlog('loadHierarchy: ui_hierarchy null — no params');
+        s.dirty = true;
+        armHierarchyRetry(s);
+        return;
+    }
+
+    /* Which params the module is hiding right now. Evaluated against live
+     * values, and re-evaluated whenever a watched value changes (processTick). */
+    s.visibilityRules = collectRules(paramDefs);
+    s.hiddenKeys = new Set<string>();
+    for (const r of s.visibilityRules) {
+        /* One read per rule, at LOAD only. After this the value cache carries
+         * it (see hiddenNow in tick.ts) and no further host call is made. */
+        const raw = s.port.getParam(s.componentKey + ':' + r.param);
+        const opts = optionList(cpMap[r.param]?.options, paramDefs[r.param]?.options);
+        if (!conditionHolds(r, raw, opts)) s.hiddenKeys.add(r.key);
+    }
+
+    /* ── Custom config path (Plaits, Wurl, etc.) ─────────────────────────── */
+    if (s.moduleConfig) {
+        buildConfigPages(s, cpMap, paramDefs, allLevels);
+        return;
+    }
+
+    buildGenericPages(s, cpMap, cpOrder, paramDefs, knobInline, allLevels);
+}

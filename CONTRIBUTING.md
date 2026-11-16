@@ -1,0 +1,304 @@
+# Contributing to Movy
+
+Thanks for your interest! Movy is an **early prototype** built for fun and
+experimentation, and contributions — code, module layout templates, docs, or
+good bug reports — are very welcome.
+
+Please keep in mind: I can't promise to merge everything or to keep the project
+going indefinitely. Opening an issue to discuss a larger change before you build
+it is usually the fastest path.
+
+---
+
+## Reporting bugs
+
+A reproducible bug report is the single most useful contribution. Please include:
+
+1. **Steps to reproduce** — a numbered list.
+2. **Expected** vs **actual** behaviour.
+3. **Which modules** were loaded in the chain (and on which track).
+4. Device/log details if you have them.
+
+See [Troubleshooting → Reporting a bug](https://dimadake.github.io/schwung-movy/reference/troubleshooting/#reporting-a-bug)
+on the website, including how to record the screen with the web mirror.
+
+---
+
+## Project layout
+
+Movy is a Schwung tool module. The interesting parts:
+
+```
+movy/
+├── src/              TypeScript source (UI). Bundled to ui.js — never edit ui.js directly.
+│   ├── types/        Shared interfaces (no logic).
+│   ├── model/        Knob/param state machine (no display calls).
+│   ├── renderer/     Pure display functions (no state).
+│   ├── modules/      Per-module layout templates (JSON).
+│   ├── seq/          The sequencer UI layer.
+│   ├── keyboard/     Pad → note mapping, drums.
+│   └── ...
+├── engine/           Rust workspace: seq-core (pure logic) + movy-dsp (→ dsp.so).
+├── browser-test/     Headless tests (logic, app-loop, screenshot, perf).
+├── scripts/          build / deploy / device-test scripts.
+└── plans/            Design & implementation notes per feature.
+```
+
+Two hard architectural rules:
+
+- **`model/` never calls display functions**, and **`renderer/` holds no state.**
+  State lives in `model/` and `app/state.ts`; renderers are pure
+  `ViewModel → pixels`.
+- **Files stay small** — hard cap **200 lines**, target 50–100. One
+  responsibility per file.
+
+---
+
+## Build, deploy, test
+
+You need **Node.js**, **Rust** and an **aarch64 cross-compiler**: `deploy.sh`
+builds the UI bundle (`ui.js`), the Rust engine (`dsp.so`) and `movy-host`, all
+cross-compiled for the Move's aarch64 Linux, and the local suites need a
+[schwung](https://github.com/charlesvestal/schwung) checkout at `../schwung`.
+
+```bash
+# Rust toolchain (skip if you already have cargo)
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+rustup target add aarch64-unknown-linux-gnu
+
+# aarch64 cross-compiler (macOS; on Linux: apt install gcc-aarch64-linux-gnu
+# and point engine/.cargo/config.toml's linker at it)
+brew tap messense/macos-cross-toolchains
+brew install aarch64-unknown-linux-gnu
+```
+
+```bash
+npm install
+
+# Build
+npm run build           # device bundle (ui.js) + browser test modules
+npm run typecheck       # tsc --noEmit, must be clean
+
+# Local tests (no device needed) — run all of these before sending a PR:
+npm test                # builds, then runs the four suites below
+#   browser-test/logic.mjs       viewmodel / business-logic assertions
+#   browser-test/app-loop.mjs    full init/tick/MIDI loop → setLED
+#   browser-test/screenshot.mjs  framebuffer pixel-diff vs baselines
+#   browser-test/perf.mjs        fill_rect / IPC / render-time budgets
+
+# Rust engine (only if engine/ changed)
+cd engine && cargo test
+
+# Deploy + device end-to-end (when a Move is reachable at move.local)
+./scripts/deploy.sh
+npm run test:device     # param-UI e2e (the `smoke` scenario and the rest)
+./scripts/test-seq.sh   # sequencer e2e (also builds + deploys dsp.so)
+```
+
+**If you change any UI rendering**, update the screenshot baselines and commit
+them:
+
+```bash
+node browser-test/screenshot.mjs --update
+```
+
+**Performance matters** on this hardware. If you add rendering or hot-path logic,
+add/extend a perf test and keep `perf.mjs` green.
+
+---
+
+## Adding a module layout template
+
+Most modules work with no template — Movy reads their parameter hierarchy and
+lays it out automatically. Add a template only when a module deserves a nicer
+arrangement, or when it's a **drum** module (drums can't be configured from the
+device otherwise).
+
+A module may ship `movy_config.json` beside its `module.json`; Movy checks the
+active sound-generator, audio-FX, MIDI-FX, or Master-FX module directory before
+falling back to its bundled templates.
+
+1. Create `src/modules/<module-id>.json` following the `ModuleConfig` shape in
+   `src/types/param.ts` (see `src/modules/plaits.json` / `wurl.json` for
+   examples).
+2. Register it in `src/modules/loader.ts` (add an import + a `CONFIGS` entry).
+3. `npm run build` bundles the JSON in automatically.
+4. Add a screenshot test for the new layout and run `npm test`.
+
+> Prefer a module-owned layout when you also maintain that module; keep bundled
+> compatibility templates declarative and minimal.
+
+### Per-pad pages on a drum module
+
+A bank marked `"padSpecific": true` follows the pad you press. Its slots hold
+*alias* keys, and `drum.padScoping` says how an alias becomes the real key for
+the focused pad. There are two forms — use whichever matches how the module
+names its parameters:
+
+**Template** — when the pad number builds the key (sample players, voice-cloned
+engines). One rule covers every pad:
+
+```json
+"padScoping": {
+  "aliasPrefix": "pad_", "concreteKeyTemplate": "p{pad}_{suffix}", "padDigits": 2
+}
+```
+`pad_vol` on pad 3 → `p03_vol`.
+
+**Table** — when each voice is its own circuit and owns its parameter names, as
+on a TR-909/606-style machine. List each pad's key; `null` means that voice
+hasn't got that knob, and Movy shows the knob as unavailable rather than the
+previous pad's value:
+
+```json
+"padScoping": {
+  "aliasPrefix": "pad_",
+  "padKeys": {
+    "pitch": ["bd_c_tune", "sd_c_tune", "ohh_pitch"],
+    "drive": ["bd_c_drive", "sd_c_drive", null]
+  }
+}
+```
+`pad_pitch` on pad 3 → `ohh_pitch`.
+
+The table's keys are the module's **own declared parameters**, so they automate
+by their own name and need nothing extra in `chain_params` — unlike template
+keys, which are synthetic and validate through their alias. Both forms may
+appear in one config: the table wins where it lists a suffix, the template
+covers the rest.
+
+### A pad that selects a whole page
+
+`padSpecific` re-points ONE bank at the pad you press. That fits a kit whose
+pads share a control set. It does not fit a machine whose voices are separate
+circuits with different panels — a 909's snare has no Decay or Attack and its
+kick has no FX sends, so a single re-targeting row is mostly holes. Such a
+module wants a page *per* voice, and the pad to choose among them, the way
+schwung's stock editor switches page to the drum you hit.
+
+For that, each voice bank names the pad that selects it — and movy accepts
+**exactly one arrangement**, the same one `padSpecific` has always had: the
+pad-following pages first, the ordinary pages behind them.
+
+```json
+"drum":  { "padCount": 3, "padNoteStart": 36, "rawMidi": false },
+"banks": [
+  { "name": "Kick",   "pad": 1, "rows": [ ... ] },
+  { "name": "Snare",  "pad": 2, "rows": [ ... ] },
+  { "name": "Hat",    "pad": 3, "rows": [ ... ] },
+  { "name": "Reverb",           "rows": [ ... ] },
+  { "name": "Master",           "rows": [ ... ] }
+]
+```
+
+The **voice run** is the leading run of banks that declare a `pad`. Movy reads
+only that run as voices, so ordering is load-bearing, and a `pad` on any bank
+behind it is ignored.
+
+- **The voice pages share one seat in the rotation.** Sixteen voices at sixteen
+  seats is a sixteen-dot bank bar and a walk through the whole kit to reach the
+  delay. 8W8 ships nineteen banks and shows four pages: *voice* → Reverb →
+  Delay → Master — the chain's own order, master bus last, as elsewhere in the
+  fleet.
+- **A pad only turns the page from a voice page.** From Master or Reverb it
+  re-points the voice slot and leaves you where you are — reaching for a pad to
+  hear an edit must not cost you your place. The slot remembers, so jogging back
+  lands on the voice you last hit.
+- **The module opens on the voice slot**, the way it opens `padSpecific`
+  modules. Your own editor may open on Master; movy does not.
+- Pad numbers are **1-based**, like everywhere else in the drum API.
+- **Shift+Pad** picks a voice without sounding it.
+
+**`padCount` is the kit, not the grid.** Set it to the number of voices; the
+remaining seats of the 4×4 are dead. It used to be worth padding out to 16 to
+keep page-only pads addressable — see below.
+
+**No page-only pads.** Putting a `pad` on a page that has no voice behind it — a
+spare seat in the grid that opens Reverb — reads as a free shortcut and is the
+opposite: **having a `pad` is what makes a bank a voice.** Inside the run it
+would make Reverb a voice; behind the run movy ignores it. Leave `pad` off every
+page that is not a voice, and let the jog reach them.
+
+Either mechanism gives the header its pad-grid icon, lit on the pad you last
+hit — on a per-voice-page kit that icon is the only thing on screen saying which
+voice is under the knobs. It is drawn on the **chain page** too, so a voice page
+is recognisable from either view, and only on a voice page: on Master the pad
+decides nothing, so an icon there would claim a relationship that is not there.
+
+Movy checks four things about `pad` over every bundled config and fixture, and
+a module config wants to hold them too:
+
+- **One bank is one page.** A bank's cells must fit `KNOBS_PER_PAGE` (8). Pages
+  are fixed slices and the bank name is looked up by page index, so an overfull
+  bank silently wears the next bank's name — and `pad` targets the wrong page.
+- **No two banks claim the same pad.** The first one wins; the second becomes
+  unreachable by pad.
+- **`pad` must be ≤ `drum.padCount`.** A pad past the count resolves to nothing,
+  so its page is reachable only by the jog.
+- **No `pad` behind the voice run.** Movy ignores it, so a config that declares
+  one there is not doing what it reads as doing.
+
+### Vetoing a graphic Movy inferred
+
+Movy detects envelopes, filters and LFOs from param names, and reads the **key**
+as well as the label. A key stem is not always a promise: 9W9's `bd_c_attack` is
+a click *level*, not a time, so pairing it with `bd_c_decay` drew an envelope
+over a level and hoisted Attack to knob 1 — disagreeing with the module's own
+editor about knob order. Renaming the label does not help while the key matches.
+
+A slot can say no:
+
+```json
+{ "key": "bd_c_attack", "short": "ATCK", "full": "Attack",
+  "type": "int", "min": 0, "max": 127, "env": false }
+```
+
+`"env": false` keeps the param a plain knob, in its declared position. The same
+field still *names* a stage (`"env": "a"`) where detection needs the help.
+
+### When movy has to override a module's own config
+
+A module that ships `movy_config.json` is authoritative — movy's bundled table
+is only the fallback for modules that ship nothing. The exception is a shipped
+layout movy cannot use: the 808/909-family kits declare a `pad` on every bank,
+including the pages with no voice, which reads as "every bank is a voice" and
+collapses the module to one page.
+
+`OVERRIDES_MODULE_FILE` in `src/modules/loader.ts` names those modules, and the
+replacement config lives in `src/module-configs/<id>.json`. It is a **data
+file, not an import**: esbuild inlines an imported `.json` into `ui.js`, which
+is re-parsed on every tool open, so importing four kit configs cost ~90 KB per
+open for layouts needed only when one of them is loaded. It ships beside
+`ui.js` and is read through the same `host_read_file` path.
+
+A list of named exceptions rather than a flipped rule, because libpo32 is both
+bundled and self-describing — inverting the default would silently override it
+with movy's older copy.
+
+Adding one: drop the config in `src/module-configs/`, add the id to the list.
+`scripts/build-module.sh` fails the release if the two disagree, or if the
+tarball ends up without the files. **Delete the id** as soon as the module ships
+a config movy can use.
+
+For modules whose releases Movy explicitly supports, copy the released
+`module.json` into `browser-test/fixtures/module-contracts/` using the
+`<component-type>--<module-id>.json` name. Contract fixtures replace an older
+entry from the full device dump and are replayed by `npm test`; this keeps page,
+parameter, trigger, acceleration, and automation metadata from silently
+drifting between releases.
+
+---
+
+## Pull request checklist
+
+- [ ] `npm run typecheck` is clean.
+- [ ] `npm test` passes (logic, app-loop, screenshot, perf).
+- [ ] Screenshot baselines updated if rendering changed.
+- [ ] `cargo test` passes if you touched `engine/`.
+- [ ] Device e2e (`npm run test:device` / `test-seq.sh`) run if you have hardware
+      — note in the PR if you couldn't.
+- [ ] New rendering → a screenshot test; new logic → a logic test.
+- [ ] No code duplication; shared logic factored out.
+- [ ] Comments explain **why**, not what.
+
+Thanks again for helping make Movy better! 🎛️

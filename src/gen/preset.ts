@@ -1,0 +1,52 @@
+/* The preset contract (design §4): each preset is a generator of its own,
+ * with four or eight knobs of its own. */
+
+import type { GenCtx } from './analysis/context.js';
+import type { KnobDef } from './knobs.js';
+import type { Span } from './create/phrase.js';
+import type { Note, PresetClass, RoleKind, Task } from './types.js';
+
+export interface Preset {
+    id: string;
+    name: string;               // short, for the screen
+    task: Task;
+    drum: boolean;
+    roles?: RoleKind[];         // melodic roles served; absent = every melodic role
+    cls: PresetClass;
+    /** New Clip on drums: writes only `ctx.pad` (ai/preview-pads.ts). */
+    perPad?: boolean;
+    /** Its pitches are what its knobs ask for (a cadence's landing note, a
+     *  chromatic approach), so they are never moved off the band (generate.ts). */
+    ownPitches?: boolean | ((v: number[], ctx: GenCtx) => boolean);
+    knobs: KnobDef[];           // four or eight
+    /** Whether this part is material the preset can work with at all (a
+     *  harmonised line needs a line that already plays two notes at times). */
+    accepts?: (ctx: GenCtx) => boolean;
+    /** How suited this preset is to this part, 0..1 (default 0.5). */
+    fit?: (ctx: GenCtx) => number;
+    /** The new part. `seed` already mixes the request, the preset and any
+     *  retry; `spans` is SPARSE's phrase plan, for a generator that writes
+     *  its phrases into it itself (create/phrase.ts). */
+    generate: (ctx: GenCtx, v: number[], seed: number, spans?: readonly Span[]) => Note[];
+    /** A merged generator (plans/2026-11-01-generator-ux-design.md §2.7):
+     *  the id whose dice a knob state rolls, so a path taken over from a
+     *  removed generator gives that generator's takes. Default: its own id. */
+    seedAs?: (v: number[], ctx: GenCtx) => string | undefined;
+}
+
+export function serves(p: Preset, ctx: GenCtx): boolean {
+    if (p.task !== ctx.task || p.drum !== ctx.drum) return false;
+    if (p.accepts && !p.accepts(ctx)) return false;
+    if (ctx.drum || ctx.task === 'create') return true;
+    const kind = ctx.role?.kind;
+    return !p.roles || (kind !== undefined && p.roles.includes(kind));
+}
+
+/** A preset's knobs at their defaults (once moved by SAFE/BALANCED/WILD,
+ *  removed 2026-11-01: the defaults are BALANCED's). */
+export function defaults(p: Preset, ctx: GenCtx): number[] {
+    return p.knobs.map((k) => Math.max(0, Math.min(k.steps(ctx) - 1, k.def(ctx))));
+}
+
+/** Knob index by name, for generators that read their own knobs by name. */
+export function knobIndex(p: Preset, name: string): number { return p.knobs.findIndex((k) => k.name === name); }

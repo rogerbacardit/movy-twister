@@ -1,0 +1,56 @@
+/* modulated-keys.ts — which model answers "is this key modulated", for a page
+ * that belongs to a (track, component) rather than to a model.
+ *
+ * The delegated page is created by `renderer/schwung-grid` from a track index
+ * and a component key; the LFO routing that decides the answer lives on the
+ * MODEL, which is app state (R12: renderer/ must not grow app state). So the
+ * page is handed a FUNCTION.
+ *
+ * IT IS A FUNCTION, NOT THE SET IT RETURNS. A page is cached by (track,
+ * component) and outlives the chain slot that built it, so a captured Set would
+ * go on answering with the modulation of whichever module happened to be loaded
+ * first — and would go on being believed, because a tilde that is merely stale
+ * is not a failure of anything visible.
+ */
+
+import { appState } from './state.js';
+import { isMasterComponent } from '../chain/config.js';
+
+/**
+ * The model that owns `componentKey` in `track`, or null when none does.
+ *
+ * The same resolution `app/tick.ts` does for its own module lookups. Shared by
+ * the two answers a delegated page asks of a model — "is this key modulated"
+ * below, and "which pad's key is this alias" (`automated-keys.ts`) — so both
+ * find the same model.
+ */
+export function componentModelOf(track: number, componentKey: string): any | null {
+    /* A `mfx:` component's model is not in any track's chain — it lives
+     * in `masterFxModels`, addressed by slot, and the port that reaches it
+     * reports `track` as a fixed carrier (0), not a real track (SP-52). Reading
+     * `trackModels[0]` for it would walk track 0's OWN chain, find no match,
+     * and answer "unmodulated" forever — silently, since a stale tilde looks
+     * exactly like a correct one. */
+    const chain = isMasterComponent(componentKey) ? appState.masterFxModels : appState.trackModels[track];
+    if (!chain) return null;
+    for (const m of chain) {
+        /* Guarded member by member: this walks models of every kind — a module,
+         * a scoped LFO, the mix page — and the app tick hands `pageOwnerOf`
+         * stubs as well as real models. */
+        if (!m || typeof m.getComponentKey !== 'function') continue;
+        if (m.getComponentKey() === componentKey) return m;
+    }
+    return null;
+}
+
+/**
+ * The params a slot LFO drives on `componentKey`'s model in `track`, or null
+ * when no model there owns that component.
+ *
+ * The same set the `~` mark on movy's own page is drawn from
+ * (`model/viewmodel.ts`) — one source, so the two marks cannot disagree.
+ */
+export function modulatedKeysOf(track: number, componentKey: string): ReadonlySet<string> | null {
+    const m = componentModelOf(track, componentKey);
+    return m && typeof m.modulatedKeys === 'function' ? m.modulatedKeys() : null;
+}

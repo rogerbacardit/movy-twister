@@ -1,0 +1,299 @@
+/* New with SP-15 — the page contract's LIFECYCLE on hardware.
+ *
+ * WHAT ONLY THE DEVICE CAN SAY. `browser-test/logic/page-contract.mjs` drives
+ * both halves against a param store the suite writes, and a store the suite
+ * writes is the one thing under suspicion: "resolved and empty" is a claim about
+ * what the ENGINE answers for a slot that has just gone None, and the logic
+ * suite can only model that. Here the module is really loaded, really cleared
+ * through the same param the chain UI writes (`ch0:synth:module`), and what movy
+ * draws afterwards is read back from movy.
+ *
+ * THE PAGE GATES; THE LOG ONLY CORROBORATES.
+ *
+ *   `probe.page()`  is movy's last rendered view model: the module the page
+ *                   belongs to and the cells on it. A transition in it is the
+ *                   direct answer to "did the frame change hands", so every
+ *                   check below waits on it.
+ *   `schwung-body`  (app/tick.ts) is the reason the body was drawn or handed
+ *                   back — the only statement of whether Schwung or movy is
+ *                   drawing. It is written ONCE PER DISTINCT REASON, so a
+ *                   claim whose reason has not changed writes nothing at all,
+ *                   and the pattern that deduplicated it away is
+ *                   indistinguishable from the pattern that never ran. It is
+ *                   recorded, never waited on.
+ *
+ * WHAT THIS DOES NOT DO: prove the retry latch is what changed. THE TEETH ARE
+ * IN `browser-test/logic/page-contract.mjs`, which goes red with the latch
+ * taken out. This suite is the same story on hardware, and on hardware it
+ * passes either way — MEASURED, with the latch reverted and the empty window at `PAST_OLD_BUDGET`: 29 s of device work, ~1840
+ * ticks at the slowest rate the board is known to tick against a 720-tick
+ * budget, and the module's page still comes back. So the device does not reach
+ * the latch by this route at all — something re-makes the contract when the
+ * module lands — and which path that is has not been established here.
+ *
+ * The first version of L3 could not have shown teeth whatever the latch did:
+ * it waited `OLD_BUDGET` FRAMES (2.4 s) against a budget denominated in TICKS,
+ * so it finished inside the urgent window, where even the reverted rule reloads
+ * on the ordinary retry. What is left is worth keeping and is the reason the check
+ * stays: the end-to-end outcome on hardware, which the logic suite can only
+ * model — the engine's own answer for a slot that has just gone None, and a
+ * frame that comes back without a gesture.
+ *
+ * Covers:
+ *   L1  page mode draws the loaded module's page
+ *   L2  the slot set to None hands the frame back, with no navigation
+ *   L3  movy opened on an empty slot draws the module that lands in it later,
+ *       with no navigation. That is the shape the item is about: after a cold
+ *       boot no chain slot is active at all.
+ */
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+import { scenario } from '../runner.js';
+import { Device } from '../device.js';
+import { Probe } from '../probe.js';
+import * as fixture from '../fixture.js';
+import { until } from '../wait.js';
+import { CC_BACK } from '../midi.js';
+import { SSH_OPTS } from '../ssh.js';
+
+const run = promisify(execFile);
+/* test-device/dist/scenarios/page-lifecycle.js at run time. */
+
+/* Frames of device work, never a wall clock. ACT is the settle the other
+ * scenarios use for one gesture. */
+const ACT = 90;
+
+/* movy's own lines reach debug.log twice — once per sink. Narrowed to one here
+ * so "the last line" is unambiguous rather than index-parity. */
+const SHADOW = '[shadow]';
+const BODY   = 'schwung-body';
+
+/* The OLD retry budget — RETRY_TICKS x RETRY_LIMIT = 720 TICKS — which is what
+ * has to be spent with the slot empty before the latch closes. L3 waits that
+ * out before the module arrives, because a budget already spent when the user
+ * loads is what made the bug permanent.
+ *
+ * THE WAIT IS IN FRAMES AND THE BUDGET IS IN TICKS, AND THEY ARE NOT ON A
+ * RATIO. A frame is ~2.9 ms of SPI work whatever the load; the tick rate swings
+ * 63-205 Hz. So the frames have to be sized for the SLOWEST tick — 720 ticks at
+ * 63 Hz is 11.4 s, ~3940 frames. The first version of this check waited 810
+ * FRAMES (2.4 s) and so finished deep inside the urgent window, where even the
+ * reverted rule reloads on the ordinary retry: it could not have shown teeth
+ * whatever the latch did. The window below is sized PAST the budget so that the
+ * premise is true — and the reverted rule passes it anyway, which is a fact
+ * about the device and not about the arithmetic (see the header). */
+const OLD_BUDGET_TICKS = 12 * 60;
+const PAST_OLD_BUDGET  = 10000;   /* the shim caps one WAIT_FRAME at 10000 */
+
+/* What movy names a slot that has nothing in it (`loadHierarchy: slot=N
+ * module=—` in the same log). A page for it is movy's own, not a module's. */
+const EMPTY_NAME = '—';
+
+
+type Page = { module?: string; pageCount?: number; pageIndex?: number;
+              body?: string; cells?: ({ name?: string } | null)[];
+              /* The SCREEN, not the page on it — the one field here that
+               * answers about where movy is rather than about what it drew
+               * (`src/test/probe.ts`). L4 grades it. */
+              view?: string };
+
+scenario('page-lifecycle', async (t) => {
+    fixture.setHost(t.host);
+    const dev   = new Device(t.tx);
+    const probe = new Probe(t.tx);
+    const open  = () => dev.open(probe);
+    const close = () => dev.close(probe);
+
+    /* A movy track's chain lives in movy's OWN engine: the param is written
+     * through `ch0:` and only while movy is open, or the module lands somewhere
+     * the track is not (scenarios/items.ts learned this the same way). */
+    const ep = (key: string, value: string): Promise<void> => t.tx.engineSetQueued(key, value);
+
+    const MODULE = fixture.fixtureSynth(0);
+    t.note('fixtureSynth', MODULE);
+
+    /* debug.log PERSISTS across runs and is grep'd whole over ssh, so a read is
+     * slow enough to land either side of the change it is looking for. The
+     * device's own clock is taken once and every line read after it is stamped
+     * with it, which is immune to the two ways a count is not: a claim whose
+     * reason is unchanged adds no line, and a rotated log takes lines away. */
+    let watermark = '00:00:00';
+    try {
+        const { stdout } = await run('ssh', [...SSH_OPTS, `ableton@${t.host}`, 'date +%H:%M:%S']);
+        watermark = stdout.trim();
+    } catch { /* no watermark: the notes below fall back to the raw tail */ }
+    const bodyLines = async (): Promise<string[]> =>
+        (await dev.logLines(BODY)).filter((l) => l.includes(SHADOW));
+    const bodySince = async (): Promise<string[]> =>
+        (await bodyLines()).filter((l) => l.slice(0, 8) >= watermark);
+    const lastBody = async (): Promise<string> => {
+        const ls = await bodyLines();
+        return ls.length ? ls[ls.length - 1] : '';
+    };
+
+    const pageNow = async (): Promise<Page | null> => {
+        try { const p = (await probe.page()) as Page; return p?.module === undefined ? null : p; }
+        catch { return null; }
+    };
+    const waitPage = async (pred: (p: Page) => boolean, what: string,
+                            within: number): Promise<Page | null> => {
+        try {
+            return await until(t.tx, what, async () => (await probe.page()) as Page,
+                               (p) => !!p && pred(p), { within, every: 150 });
+        } catch { return await pageNow(); }
+    };
+    const dump = (p: Page | null) => p && { module: p.module, pageCount: p.pageCount,
+                                            body: p.body,
+                                            cells: (p.cells ?? []).map((c) => c?.name) };
+    const describe = (p: Page | null): string => !p ? 'movy has not rendered'
+        : `body=${p.body} module=${p.module || '(none)'} pages=${p.pageCount} `
+        + `cells=[${(p.cells ?? []).map((c) => c?.name).filter(Boolean).join(' ')}]`;
+    /* The page belongs to the module when it NAMES it and has cells on it. The
+     * cell list is what makes this non-vacuous: an empty slot renders a page
+     * too, so `pageCount > 0` alone is true for a slot with nothing in it. */
+    const hasCells = (p: Page): boolean => (p.cells ?? []).some((c) => !!c?.name);
+    const isModules = (p: Page): boolean => p.module === MODULE && hasCells(p);
+    /* AND SCHWUNG IS THE ONE DRAWING IT: the last frame's body was the page,
+     * not the blank a page still loading leaves. Every check below is gated on
+     * this. */
+    const delegated = (p: Page | null): boolean => !!p && p.body === 'schwung';
+    const isDelegatedModules = (p: Page): boolean => isModules(p) && delegated(p);
+
+    await fixture.ensure(t.tx, open, close);
+    await dev.deployUi();
+    await dev.open(probe);
+    await dev.selectTrack(0);
+    /* The slot is put back whatever happens below — this suite empties it. */
+    t.need.register(async () => { await ep('ch0:synth:module', MODULE); });
+
+    /* ── L1: the module's page comes up in page mode ──────────────────────────
+     * THE CLICK HAS A PRECONDITION. In the chain view a jog click on an EMPTY
+     * slot opens the module browser instead of drilling into the knobs
+     * (src/midi/router.ts), and it is a no-op in the views above the chain. So
+     * the click is repeated against the page it is supposed to produce rather
+     * than fired blind: a blind click that lands in the browser leaves movy
+     * there for the whole run, which is what the first version of this scenario
+     * did — every check failed against a log line left by the fixture and
+     * nothing said why.
+     *
+     * The gate for everything below. A page that does not come up here cannot be
+     * watched leaving and coming back. */
+    let pg: Page | null = null;
+    for (let i = 0; i < 3 && !(pg && isDelegatedModules(pg)); i++) {
+        await dev.tap.jog();
+        await t.tx.frames(ACT);
+        pg = await waitPage(isDelegatedModules, `${MODULE}'s page under page mode`, 1200);
+    }
+    t.note('pageAtL1', dump(pg));
+    t.check('knobs-page-is-the-modules',
+        'the knob view comes up on the loaded module, with cells to draw, delegated',
+        !!pg && isDelegatedModules(pg),
+        { expected: `a rendered page naming ${MODULE} with knobs on it, drawn through Schwung`,
+          actual: describe(pg) });
+
+    /* ── L4: a knob released onto ANOTHER page does not latch this one ───────
+     * SP-31, on hardware, and it is the whole symptom rather than a proxy: the
+     * controller recomputes `touched` from `touchOrder` and has no staleness
+     * expiry for a held knob (it refuses to re-plan under a hand), so a release
+     * that arrives at a page which never heard the press leaves the pressed
+     * page holding the slot FOREVER. movy's jog-click guard reads
+     * `ctl.state.touched >= 0` as "a knob is under the hand" and gives the
+     * click to the page — so the module browser never opens again.
+     *
+     * WHY THE DEVICE, when `browser-test/app-loop.mjs` already holds it: the
+     * page that hears the press and the one that hears the release are
+     * different CONTROLLERS here, built by the page cache for two real chains
+     * with two real modules on them, and the gesture crosses a track switch
+     * that only the hardware's own MIDI produces. The logic suite models both
+     * ends; this is the one run where they are the device's.
+     *
+     * `knobHold` is press → body → release, so the release lands while track 1
+     * is up: exactly the out-of-order gesture the user cannot avoid. The click
+     * afterwards is the ASSERTION — it is the thing that stops working — and it
+     * is backed out with Back rather than committed, so the fixture's chain is
+     * untouched either way. */
+    await dev.knobHold(1, async () => {
+        await dev.selectTrack(1);
+        await t.tx.frames(ACT);
+    });
+    await dev.selectTrack(0);
+    await t.tx.frames(ACT);
+    const beforeClick = await pageNow();
+    t.note('viewBeforeLatchClick', beforeClick?.view);
+    await dev.tap.jog();
+    await t.tx.frames(ACT);
+    const afterClick = await pageNow();
+    t.note('viewAfterLatchClick', afterClick?.view);
+    t.check('knob-release-does-not-latch',
+        'a knob released while another track´s page is up leaves the click working',
+        afterClick?.view === 'browse',
+        { expected: 'view=browse — the module browser, which a latched `touched` swallows',
+          actual: `view=${afterClick?.view ?? '(movy has not rendered)'} `
+                + `(before the click: ${beforeClick?.view ?? '-'})` });
+    /* Back out of whatever the click opened, so L2 starts on the page again.
+     * Unconditional: the browser is where a PASS lands, and a fail may have
+     * left a dive or a picker instead — both leave on Back. */
+    await dev.tap.cc(CC_BACK);
+    await t.tx.frames(ACT);
+    t.note('viewAfterBack', (await pageNow())?.view);
+
+    /* ── L2: None hands the frame back ────────────────────────────────────────
+     * The user's own write, not a gesture: `synth:module` = "" is schwung's
+     * teardown value (chain_slots.rs logs it as `(cleared)`), and it is what the
+     * chain UI sends when a slot is set to None. The module instance is KEPT —
+     * the engine does not unload it — so what the contract reads afterwards is
+     * the engine's real answer to "is there anything here", which is the fact
+     * the logic suite can only model.
+     *
+     * WHAT THE USER SEES is the page ceasing to be the module's: an empty slot
+     * has no page, so nothing is drawn under the header. The kept instance can
+     * go on serving its old hierarchy, which is why the owner asks the model
+     * whether the slot is empty rather than trusting the contract. */
+    await ep('ch0:synth:module', '');
+    const emptied = await waitPage((p) => p.module !== MODULE && !hasCells(p) && !delegated(p),
+                                   'the page to let the module go', 4000);
+    t.note('pageAfterClear', dump(emptied));
+    t.note('emptiedPageIsMovysOwn', !!emptied && emptied.module === EMPTY_NAME);
+    t.check('none-releases-the-frame',
+        'the slot set to None hands the frame back, with no navigation',
+        !!emptied && emptied.module !== MODULE && !hasCells(emptied) && !delegated(emptied),
+        { expected: `the empty slot ("${EMPTY_NAME}") with no page and no cells`,
+          actual: describe(emptied) });
+
+    /* ── L3: a module that arrives after the old budget is spent ─────────────
+     * THE SLOT IS EMPTY FOR THE WHOLE SESSION, and that is the point of the
+     * reopen. The old rule re-arms the budget the moment a page goes empty, so
+     * a slot cleared in place is a different situation from a slot that never
+     * held anything — which is the cold start this item is about, and the one
+     * case the retry latch is reachable from.
+     *
+     * Waited out in DEVICE FRAMES. `probe.tick().tickSeq` is structurally 0 by
+     * construction — it has no writer at all any more, its only one (`noteTick`)
+     * having been deleted — so the budget cannot be counted on this field and is
+     * instead spent by waiting a quantity of device work sized for the slowest
+     * tick rate (`PAST_OLD_BUDGET`). Frames cannot be talked out of advancing,
+     * and the count is arithmetic rather than a guess. */
+    await dev.reopen(probe);
+    await dev.selectTrack(0);
+    t.note('pageAtColdStart', dump(await pageNow()));
+    await t.tx.frames(PAST_OLD_BUDGET);
+    /* A contract that is not being asked anything cannot latch, so the run has
+     * to show it was live while the slot sat empty. */
+    t.note('bodyWhileEmpty', await bodySince());
+
+    await ep('ch0:synth:module', MODULE);
+    const back = await waitPage(isDelegatedModules, `${MODULE}'s page to come back`, 6000);
+    t.note('pageAfterReload', dump(back));
+    t.note('bodyAfterReload', await lastBody());
+    t.note('bodyLinesThisRun', (await bodySince()).length);
+    t.check('late-load-is-claimed',
+        `a module dropped in after the old ${OLD_BUDGET_TICKS}-tick budget is spent `
+        + 'is drawn by Schwung, with no navigation',
+        !!back && isDelegatedModules(back),
+        { expected: `a rendered ${MODULE} page drawn through Schwung after movy sat `
+                  + `on the empty slot for ${OLD_BUDGET_TICKS} ticks (${PAST_OLD_BUDGET} frames)`,
+          actual: describe(back) });
+
+    t.note('bodyThisRun', await bodySince());
+    await ep('ch0:synth:module', MODULE);
+});

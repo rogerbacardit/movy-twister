@@ -1,0 +1,414 @@
+/* Migrated from scripts/test.sh — the original smoke suite, and the broadest of
+ * the twelve: one scenario touching the module load, the hierarchy read, the
+ * knob path, the jog, a park/resume and movy's own perf instrumentation. Each
+ * check's id names its own subject rather than the suite's, because "something
+ * basic broke" is not a useful thing to read on a red line.
+ *
+ * The bash read all of it by grepping debug.log and cutting fields out with
+ * grep -oE. Two properties of that log are kept and tightened here:
+ *
+ *  - It PERSISTS across runs. The bash cleared it as an infrastructure step and
+ *    then still compared absolutely — its `claims >= 2` was satisfiable by a
+ *    claim an earlier run had left behind. Nothing in the harness clears it, so
+ *    every read below is a DELTA from a byte offset taken first, and a window is
+ *    one slice of one read (never an accumulation across reads, which would
+ *    double-count a line that appeared in both).
+ *  - Every line is written TWICE, once `[DEBUG] [shadow] [movy] …` and once
+ *    `[INFO ] [move-shim] [movy] …`, the shim copy a millisecond later. The
+ *    filter below keeps only the shadow copy — which is not a tidiness
+ *    preference: mixed copies interleave, and check 8's adjacency assertion only
+ *    means anything once they are separated.
+ */
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+import { scenario } from '../runner.js';
+import { Device } from '../device.js';
+import { Probe } from '../probe.js';
+import * as fixture from '../fixture.js';
+import { until } from '../wait.js';
+import { TICK_RATE_MIN, at, lastOf } from '../log-fields.js';
+import { SSH_OPTS } from '../ssh.js';
+import { Display } from '../display.js';
+import { noteOn, noteOff, NOTE_JOG_TOUCH } from '../midi.js';
+
+const run = promisify(execFile);
+
+/* Frames to let movy act on a gesture before reading. A quantity of device
+ * work, never a wall clock. */
+const ACT = 90;
+
+/* The knob turns the bash made: knob 1 up, knob 1 down, knob 2 up. Two knobs so
+ * one stuck cache cannot satisfy the CC check, and bidirectional so a turn is
+ * not simply clamped at a rail. */
+const KNOB_TURNS: Array<[number, number]> = [[0, 1], [0, -1], [1, 1]];
+
+/* Everything this suite reads out of the log, in ONE grep. `leds: repaint` is
+ * here only so check 8's adjacency is a real adjacency: without it the line
+ * after `resume from background` would be shortened away, and a claim written
+ * 200 ms later by the repaint watch would read as though it came from the
+ * resume — which is exactly the false pass this check exists to avoid. */
+const LOG_RE = '\\[shadow\\].*\\[movy\\] (' + [
+    'init: activeTrack=',
+    'loadHierarchy:',
+    'knobCC k=',
+    'set slot=',
+    'set_param returned ',
+    'chain chainIndex=',
+    'changePage delta=',
+    'LED ownership claimed',
+    'resume from background',
+    'leds: repaint',
+    'knobLED k=',
+    'perf_tick_rate=',
+].join('|') + ')';
+
+/* On a PASS, `actual` says what was measured; the diagnostic chain is only ever
+ * reached on the failing side. */
+const said = (ok: boolean, evidence: string, why: string): string => (ok ? evidence : why);
+
+scenario('smoke', async (t) => {
+    fixture.setHost(t.host);
+    const dev   = new Device(t.tx);
+    const probe = new Probe(t.tx);
+    const open  = () => dev.open(probe);
+    const close = () => dev.close(probe);
+
+    /* The whole log, filtered to movy's shadow copy, from a byte offset
+     * forward. Bounded at the device end by `tail -c`, so a log that has been
+     * growing for days costs no more than this run's own output.
+     *
+     * The offset is a POSITION, not a count of matching lines: a count would
+     * silently shift if a read ever returned a different subset, and it cannot
+     * survive the log being cleared mid-run at all. The `SZ < O` arm handles
+     * exactly that case — someone clears the log, and the window reopens at 0
+     * instead of coming back empty forever. */
+    const logSince = async (from: number): Promise<string[]> => {
+        try {
+            const { stdout } = await run('ssh', [...SSH_OPTS, `ableton@${t.host}`,
+                `F=/data/UserData/schwung/debug.log; SZ=$(stat -c %s "$F" 2>/dev/null || echo 0); `
+                + `O=${from}; [ "$SZ" -lt "$O" ] && O=0; `
+                + `tail -c +$((O+1)) "$F" 2>/dev/null | grep -E '${LOG_RE}' || true`],
+                { maxBuffer: 8 * 1024 * 1024 });
+            return stdout.split('\n').filter(Boolean);
+        } catch { return []; }
+    };
+    const mark = async (): Promise<number> => {
+        try {
+            const { stdout } = await run('ssh', [...SSH_OPTS, `ableton@${t.host}`,
+                'stat -c %s /data/UserData/schwung/debug.log 2>/dev/null || echo 0']);
+            return Number(stdout.trim()) || 0;
+        } catch { return 0; }
+    };
+
+    /* Wait for the window past `from` to satisfy `pred`, then hand back that
+     * window. On a timeout the last read is returned rather than nothing, so a
+     * red check still reports what it saw. */
+    const settled = async (from: number, pred: (w: string[]) => boolean,
+                           what: string, within: number): Promise<string[]> => {
+        try { return await until(t.tx, what, () => logSince(from), pred, { within, every: 300 }); }
+        catch { return logSince(from); }
+    };
+
+    /* Phase timings. This suite is partly judged on its runtime, and a wall
+     * clock cannot say which of "the fixture", "the build", "the device acts" or
+     * "the waits" owns the total — so the notes do. */
+    const T0 = Date.now();
+    const lap = (k: string): void => { t.note(k, `${((Date.now() - T0) / 1000).toFixed(1)}s`); };
+
+    await fixture.ensure(t.tx, open, close);
+    lap('t_1_fixture');
+    await dev.deployUi();
+    lap('t_2_deploy');
+
+    const mark0 = await mark();
+    await dev.open(probe);
+    await t.tx.frames(ACT);
+    /* Movy opens on schwung's focused slot, which is device state this suite
+     * does not own. The fixture's synth is on track 0 and every check below
+     * reads that track — on any other slot they read an empty chain and report
+     * feature failures that are really state drift. */
+    await dev.selectTrack(0);
+    await t.tx.frames(ACT);
+    lap('t_3_open');
+
+    /* Rule: the instrument this suite judges is the one the fixture put there.
+     * The bash had 'plaits' written down, and when plaits gained a movy config
+     * the check's "no synth" branch stopped being reachable at all. */
+    const synth = fixture.fixtureSynth(0);
+    t.note('fixtureSynth', synth);
+
+    // ── the knob path ────────────────────────────────────────────────────────
+    for (const [k, d] of KNOB_TURNS) {
+        await dev.tap.knob(k, d);
+        await t.tx.frames(ACT);
+    }
+
+    await settled(mark0, (w) => w.some((l) => /loadHierarchy: chain_params [1-9]/.test(l)),
+                  "the fixture's module metadata to be read", 900);
+
+    // ── the jog ──────────────────────────────────────────────────────────────
+    await dev.tap.jogTurn(1);
+    await t.tx.frames(ACT);
+    await dev.tap.jogTurn(1);
+    await t.tx.frames(ACT);
+
+    /* AND A LIT KNOB ROW: the row is dark while the module's page is still
+     * loading (nothing is under the knobs yet), and the LED log is sampled about
+     * once a second, so the first sample can predate the page. A row that never
+     * lights still runs out the budget and fails check 9. */
+    const w0 = await settled(mark0, (w) => w.some((l) => l.includes('perf_tick_rate='))
+                                         && w.some((l) => l.includes('knobLED k=') && at(l, 'color') > 0),
+                             'the first tick-rate sample and a lit knob row', 3000);
+    t.note('windowLines', w0.length);
+    lap('t_4_gesturesAndSample');
+
+    // ── the jog hint, on the real framebuffer ────────────────────────────────
+    /* What used to be the jog-hint scenario, cut to the part only the device
+     * can show: the hold timing and the turn-clears rule are app-loop.mjs's
+     * ("jog touch shows the CLICK JOG hint only after a hold"); this proves the
+     * touch note reaches movy and the hint reaches the panel. The idle read is
+     * what keeps the held read honest — a band already lit would pass it.
+     * The hint is an inverted full-width bar on rows 58..63, so a lit FRACTION
+     * is the assertion and the font is not re-encoded. HOLD_MS (1000 in
+     * model/constants.ts) is a wall clock in movy; 600 frames is ~1.7 s of
+     * device time, and only "at least HOLD_MS" matters here, so frames serve. */
+    const disp = new Display(t.tx);
+    const band = () => disp.bandFill(58, 6);
+    const LIT = 0.5;
+    const hintIdle = await band();
+    await t.tx.uiMidi(noteOn(NOTE_JOG_TOUCH, 127));
+    await t.tx.frames(600);
+    const hintHeld = await band();
+    await dev.tap.jogTurn(-1);   // back where the jog turns above left the cursor
+    await t.tx.frames(ACT);
+    const hintTurned = await band();
+    await t.tx.uiMidi(noteOff(NOTE_JOG_TOUCH));
+    t.note('jogHintFill', { idle: hintIdle, held: hintHeld, turned: hintTurned });
+    t.check('jog-hint-hold', 'resting on the jog draws the hint; a turn removes it',
+        hintIdle < LIT && hintHeld > LIT && hintTurned < LIT,
+        { expected: `toast band under ${LIT * 100}% lit idle, over it after a ~1.7 s rest, under it after a turn`,
+          actual: [hintIdle, hintHeld, hintTurned].map((v) => `${(v * 100).toFixed(0)}%`).join(' → ') });
+
+    // ── 1. the module loaded ─────────────────────────────────────────────────
+    /* The bash printed the slot it opened on but asserted nothing about it. It
+     * is asserted now: "init ran" with a garbage index is the same failure as
+     * init not running, one branch later. */
+    const initLine  = lastOf(w0.filter((l) => l.includes('init: activeTrack=')));
+    const initTrack = at(initLine, 'activeTrack');
+    const okInit = initLine !== '' && Number.isInteger(initTrack) && initTrack >= 0 && initTrack <= 15;
+    t.note('initLine', initLine);
+    t.check('module-loaded', 'movy loaded — init ran and opened on a real track', okInit, {
+        expected: 'an "init: activeTrack=<0..15>" line',
+        actual: said(okInit, `${initLine} — init ran`,
+            initLine === '' ? 'init never ran (syntax error or path issue?)'
+                            : `${initLine} — the track it opened on is not a valid index`),
+    });
+
+    // ── 1b. the chain host running is the one movy ships ─────────────────────
+    /* Read from the process, not the log: a `chain host loaded from` line says
+     * which file was opened, while the maps say which one is RUNNING — and a
+     * stale copy or a missing payload file (the stock fallback) shows up here
+     * as the wrong path. Root, because /proc/<pid>/maps is not world-readable
+     * for a process movy-host's helper raised. */
+    const engineProc = 'movy-host';
+    const maps = await run('ssh', [...SSH_OPTS, `root@${t.host}`,
+        `grep -ho 'tools/movy/chain-[a-z]*\\.so' /proc/$(pidof ${engineProc})/maps | sort -u`])
+        .then((r) => r.stdout.trim().split('\n').filter(Boolean)).catch(() => [] as string[]);
+    const okPin = maps.length === 1 && maps[0] === 'tools/movy/chain-pinned.so';
+    t.note('chainHostMaps', maps.join(', ') || '(none)');
+    t.check('chain-host-pinned', 'movy\'s chains run the chain host movy ships', okPin, {
+        expected: `${engineProc} maps tools/movy/chain-pinned.so and no other movy chain host`,
+        actual: said(okPin, 'chain-pinned.so is the one mapped',
+            maps.length === 0 ? 'no movy chain host is mapped at all'
+                              : `mapped: ${maps.join(', ')}`),
+    });
+
+    // ── 2. the fixture's synth loaded a hierarchy ────────────────────────────
+    /* The fixture guarantees a synth on track 0, so "no synth loaded" is a
+     * FAILURE here rather than an outcome — it is precisely what a fixture that
+     * never reached the track's host looks like. Two lines can say so, one per
+     * hierarchy path: a module with a bundled movy config (src/modules/*.json)
+     * reports `config for <id>,`, one without reports the generic
+     * `<n> params, <n> banks`. */
+    const hLines = w0.filter((l) => l.includes('loadHierarchy:'));
+    const cfgHit = hLines.filter((l) => l.includes(`loadHierarchy: config for ${synth},`));
+    const genHit = hLines.filter((l) => /loadHierarchy: [0-9]+ params,/.test(l));
+    const okHier = hLines.length > 0 && (cfgHit.length > 0 || genHit.length > 0);
+    t.note('hierarchyLines', hLines.slice(0, 6));
+    t.check('hierarchy-loaded', `the fixture's synth ('${synth}') loaded a hierarchy`, okHier, {
+        expected: `"loadHierarchy: config for ${synth}," or "loadHierarchy: <n> params,"`,
+        actual: said(okHier, `${cfgHit.length + genHit.length} hierarchy line(s) for it`,
+            hLines.length === 0
+                ? 'loadHierarchy never called'
+                : `${hLines[0]} … — the fixture's synth ('${synth}') never loaded a hierarchy: `
+                  + "track 0's host has no instrument"),
+    });
+
+    // ── 3. the module's own metadata, off the live chain ─────────────────────
+    /* Empty here is the failure mode behind "knobParams empty at knob turn
+     * time". The bash proved only that the line was present; a count of zero is
+     * the same failure with the same consequence. */
+    const cpLines = w0.filter((l) => l.includes('loadHierarchy: chain_params '));
+    const cpCount = Number((lastOf(cpLines).match(/chain_params (\d+) entries/) ?? [])[1]);
+    const okCp = cpLines.length > 0 && Number.isFinite(cpCount) && cpCount > 0;
+    t.check('chain-params-read', `chain_params read from the module — ${cpCount} entries`, okCp, {
+        expected: 'a non-empty "loadHierarchy: chain_params <n> entries" line',
+        actual: said(okCp, lastOf(cpLines),
+            cpLines.length === 0 ? 'chain_params never read — the module served no metadata'
+                                 : `${lastOf(cpLines)} — the module served no entries`),
+    });
+
+    // ── 4. the knob CCs reached the router ───────────────────────────────────
+    const ccLines = w0.filter((l) => l.includes('knobCC k='));
+    const turned  = KNOB_TURNS.map(([k]) => k);
+    const ccSeen  = new Set(ccLines.map((l) => at(l, 'k')));
+    const okCc = turned.every((k) => ccSeen.has(k));
+    t.check('knob-ccs-received',
+        `knob CCs received for every knob turned (${ccLines.length} events)`, okCc, {
+            expected: `k=${turned.join(' and k=')} seen`,
+            actual: said(okCc, `knob CCs arrived for k=[${[...ccSeen].join(', ')}]`,
+                ccLines.length === 0
+                    ? 'no knob CCs received'
+                    : `knob CCs arrived for k=[${[...ccSeen].join(', ')}] — `
+                      + `the turns on k=${turned.join(', k=')} never reached the router`),
+        });
+
+    // ── 5/6. the knob turn became a param write the IPC accepted ─────────────
+    const setLines = w0.filter((l) => l.includes('set slot='));
+    const slotHit  = setLines.filter((l) => at(l, 'slot') === 0);
+    const okSet = slotHit.length > 0;
+    t.note('setLines', setLines.slice(0, 4));
+    t.check('set-param-attempted',
+        'the knob turn became a param write through the page', okSet, {
+            expected: "a \"set slot=0 …\" line (track 0 is the fixture's)",
+            actual: said(okSet, lastOf(slotHit),
+                setLines.length > 0
+                    ? `${lastOf(setLines)} — the write went to slot ${at(lastOf(setLines), 'slot')}, `
+                      + "not the fixture's track"
+                    : 'the knob turn produced no write at all'),
+        });
+
+    /* Both halves of the bash's chain, tightened once to a true and NO false —
+     * and now loosened back, on evidence the zero-false bar does not hold.
+     *
+     * The channel under test is `overtake_dsp:`, a SINGLE SLOT shared with
+     * every other schwung param reader/writer on the device (host/param.ts's
+     * own header). This scenario's own `pollModuleName` (model/tick.ts) polls
+     * that exact slot on a ~1 s cadence while the knob-turn burst runs, so
+     * movy contends with ITSELF for it, let alone anything else on the box.
+     *
+     * Measured 2026-09-22 09:49: device debug.log carries `set_param returned
+     * false` at 07.268, 77 ms after shadow_ui.c's own telemetry logged
+     * `param_giveup: claim=2 ... blocked=112ms` for a GET on the same channel
+     * — schwung's own instrumentation, not movy's, reporting the slot as
+     * genuinely contended at that moment, not a key refused for cause. The
+     * device measured live at diagnosis time carried a load average of 4.5 on
+     * 4 cores (`MoveOriginal` alone at 133% CPU) — sustained oversubscription,
+     * not a spike. `test-device/.flake-log.json` puts this check's hit rate at
+     * 6/50 runs over three days and five different commits (unrelated to any
+     * one of them), and 5 of those 6 failed on BOTH the scenario's own attempt
+     * 1 and its retried attempt 2 — far above the ~1% a per-attempt-independent
+     * race would predict, which is why "restart the stack and retry" already
+     * measured no different (see this file's task notes) — the condition
+     * outlives one retry, it does not un-happen.
+     *
+     * What still has to hold: the write eventually got through. A knob stream
+     * is last-write-wins by design (host/param.ts's own reason for not
+     * retrying: "the value after it supersedes the one that was lost") — so an
+     * EARLIER refusal the user never saw, because the next turn already
+     * superseded it, is not a bug. The knob's FINAL position never reaching the
+     * DSP still is, so the last write in the burst is the one held to account.
+     *
+     * The refusal COUNT is noted on every run, not just a failing one, rather
+     * than dropped once the last-write gate is satisfied. host/param.ts's own
+     * header is explicit about why: "it makes the failure COUNTABLE. A dropped
+     * write is otherwise perfectly silent, which is why a green test run never
+     * proved the channel was healthy." A ratio is not asserted here — it is not
+     * a stable invariant on a contended single slot, which is the whole finding
+     * above — but a SILENT drop rate is exactly what this channel has
+     * historically hidden, so it is measured every run and left for a human to
+     * read (this note, and `.flake-log.json` over many runs) rather than
+     * dropped on the floor a second time. */
+    const ipcLines = w0.filter((l) => l.includes('set_param returned '));
+    const ipcTrue  = ipcLines.filter((l) => l.includes('returned true'));
+    const ipcFalse = ipcLines.filter((l) => l.includes('returned false'));
+    const lastIpc  = lastOf(ipcLines);
+    const okIpc = ipcTrue.length > 0 && lastIpc.includes('returned true');
+    t.note('ipcWrites', ipcLines.length);
+    t.note('ipcRefused', ipcFalse.length);
+    t.check('set-param-ipc', 'shadow_set_param returned true — the IPC accepted the write', okIpc, {
+        expected: 'at least one "set_param returned true", and the LAST write in the burst to land '
+                  + '(an earlier refusal under single-slot contention is tolerated — see the note above — '
+                  + 'the final one is not)',
+        actual: said(okIpc,
+            `${ipcTrue.length} write(s) accepted, ${ipcFalse.length} refused, last write accepted`,
+            ipcTrue.length === 0
+                ? 'no IPC for the knob turn — the write never reached the host'
+                : `${ipcFalse.length} write(s) returned false, and the LAST write in the burst was also refused `
+                  + '— the knob\'s final position never reached the DSP'),
+    });
+
+    // ── 7. the jog wheel navigates ───────────────────────────────────────────
+    /* Two views answer a jog and the bash accepted either. Both branches are
+     * asserted a step further than it did: presence only proves CC14 arrived,
+     * whereas a cursor that MOVED in the direction turned proves movy routed it
+     * into something. The `changePage` half is live (src/model/index.ts logs the
+     * decoded delta), so a counter-clockwise turn would read as -1.
+     *
+     * No mark is needed for this window: `chain chainIndex=` and
+     * `changePage delta=` are only ever written by a jog, and nothing else in
+     * this scenario turns one, so filtering the window by content IS the jog
+     * window. */
+    const chainIdx = w0.filter((l) => l.includes('chain chainIndex=')).map((l) => at(l, 'chainIndex'));
+    const pageDeltas = w0.filter((l) => l.includes('changePage delta=')).map((l) => at(l, 'delta'));
+    const chainMoved = chainIdx.length > 0 && chainIdx.every((v, i) => i === 0 || v > chainIdx[i - 1]);
+    const pageMoved  = pageDeltas.length > 0 && pageDeltas.every((v) => v === 1);
+    const okJog = chainMoved || pageMoved;
+    t.note('chainIndex', chainIdx);
+    t.note('pageDeltas', pageDeltas);
+    t.check('jog-navigates', 'the jog wheel navigates the chain', okJog, {
+        expected: 'the chain cursor to move on every turn, or a page change of +1 on every turn',
+        actual: said(okJog,
+            chainMoved ? `chainIndex went ${chainIdx.join(' -> ')}`
+                       : `the page moved by ${pageDeltas.join(', ')}`,
+            chainIdx.length === 0 && pageDeltas.length === 0
+                ? 'jog wheel CC not received (CC14 not reaching onMidiMessageInternal)'
+                : `the jog was decoded but nothing moved — chainIndex ${JSON.stringify(chainIdx)}, `
+                  + `page deltas ${JSON.stringify(pageDeltas)}`),
+    });
+
+    // ── 9. the knob LEDs are driven from the drawn page ──────────────────────
+    /* updateKnobLEDsFrom logs all eight knobs at once, so the bash got the line for
+     * free from its perf wait and never checked which knobs. The bar is the
+     * invariant knob-leds.ts states: every knob is lit so the row is
+     * identifiable — so an all-dark row is the failure, and a partially-driven
+     * row is the failure too. */
+    const klLines = w0.filter((l) => l.includes('knobLED k='));
+    const klSeen  = new Set(klLines.map((l) => at(l, 'k')));
+    const klLit   = klLines.filter((l) => at(l, 'color') > 0);
+    const okKl = klLines.length > 0 && klSeen.size === 8 && klLit.length > 0;
+    t.check('knob-leds-firing',
+        `the knob row ran — ${klSeen.size} knobs logged, ${klLit.length} lit`, okKl, {
+            expected: 'all 8 knob LEDs logged, at least one lit',
+            actual: said(okKl, lastOf(klLines),
+                klLines.length === 0
+                    ? 'the knob row never ran (knobLED log line absent)'
+                    : klSeen.size < 8
+                        ? `only ${klSeen.size} of 8 knobs logged — the row is not fully driven`
+                        : 'every knob logged dark — the row is not lit at all'),
+        });
+
+    // ── 10. movy's own timing instrumentation ────────────────────────────────
+    /* The MAX tick-rate sample (best window) shrugs off per-window scheduling
+     * noise; read from THIS run's window, not whatever the log happened to hold. */
+    const rates   = w0.filter((l) => l.includes('perf_tick_rate=')).map((l) => at(l, 'perf_tick_rate'));
+    const maxRate = rates.length ? Math.max(...rates) : NaN;
+    const okRate  = rates.length > 0 && maxRate >= TICK_RATE_MIN;
+    t.check('tick-rate', `tick rate ${maxRate} ticks/sec (max) >= ${TICK_RATE_MIN} (threshold)`, okRate, {
+        expected: `a perf_tick_rate sample at or above ${TICK_RATE_MIN}`,
+        actual: said(okRate, `${rates.length} sample(s), max ${maxRate}`,
+            rates.length === 0
+                ? 'perf_tick_rate not found — timing instrumentation missing or not reached'
+                : `tick rate ${maxRate} ticks/sec is below threshold ${TICK_RATE_MIN} — possible blocking`),
+    });
+});

@@ -1,0 +1,49 @@
+/* The job's generator path (plans/2026-10-27-algorithmic-generators-design.md
+ * §7): the Set's reads, then the generators in slices — one preset per tick —
+ * and the preview. */
+
+import { mlog } from '../log.js';
+import { finishExtras, finishRequest, type Request, startRequest, stepRequest } from '../gen/engine.js';
+import type { GenInput } from '../gen/types.js';
+import type { AiPreviewInput, Running } from './job-types.js';
+import { setHeader } from './set-input.js';
+import { seqState } from '../seq/state.js';
+
+function inputOf(r: Running, source: number | null): GenInput {
+    const c = r.ctx!;
+    const h = setHeader();
+    return {
+        task: r.task, tracks: r.tracks, target: { track: r.track, slot: r.slot },
+        source: source === null ? null : { track: r.track, slot: source },
+        len: c.len, scale: c.scale, drum: c.drum, kit: c.kit, root: h.root, mode: h.mode,
+        /* Every press of New Clip, Variation and Smart Double is its own run
+         * (variety bench: a second press gave the same six); Smart Quantize
+         * fixes the take as played, the same way each time. */
+        ...(r.task !== 'quantize' ? { nonce: r.nonce } : {}),
+        ...(r.task === 'create' ? { pad: c.drum && seqState.watchLane >= 0 ? seqState.watchLane : undefined } : {}),
+    };
+}
+
+export function startAlgo(r: Running, source: number | null): Request {
+    return startRequest(inputOf(r, source));
+}
+
+/** One preset run; the preview input once all ran, null when none survived,
+ *  'busy' until then. */
+export function algoTick(r: Running): AiPreviewInput | null | 'busy' {
+    const g = r.gen!;
+    if (!stepRequest(g)) return 'busy';
+    const picks = finishRequest(g);
+    if (g.dropped.length) mlog('gen: dropped ' + g.dropped.join(' '));
+    mlog(`gen: ${r.task} t${r.track} s${r.slot} ${g.ctx.freedom} key ${g.ctx.key.tonic}${g.ctx.key.minor ? 'm' : ''} `
+        + `options ${picks.map((p) => p.preset.id).join(' ')}`);
+    if (!picks.length) return null;
+    const c = r.ctx!;
+    /* The jog reaches the rest past the picks (design §2.2). */
+    const all = [...picks, ...finishExtras(g, picks)];
+    return {
+        task: r.task, track: r.track, slot: r.slot, orig: c.orig, options: all.map((p) => p.notes), picks: picks.length,
+        len: c.len, scaleNum: c.scale[0], scaleDen: c.scale[1],
+        gen: { ctx: g.ctx, picks: all.map((p) => ({ preset: p.preset, knobs: [...p.knobs], ...(p.ctx ? { ctx: p.ctx } : {}) })) },
+    };
+}

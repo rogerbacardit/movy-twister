@@ -1,0 +1,437 @@
+// Bundles model + renderer entry points -> dist/esm/ for browser tests.
+// Code splitting puts shared code in chunk files; JSON configs are inlined.
+import * as esbuild from 'esbuild';
+import { rmSync, existsSync } from 'fs';
+import { resolve, dirname } from 'path';
+import { fileURLToPath } from 'url';
+import { pinnedSchwungRoot } from '../scripts/lib/schwung-pinned.mjs';
+
+const __dir = dirname(fileURLToPath(import.meta.url));
+const root  = resolve(__dir, '..');
+
+/* Wipe the output first. esbuild only writes the files this build produces, so
+ * dropping an entry point (or letting one fold into a chunk) LEAVES THE OLD
+ * FILE THERE — and a test that imports it goes on passing against code that is
+ * no longer built. dist/esm/midi/router.js sat three weeks stale exactly that
+ * way, and a suite asserting on it could not tell a fix from its removal. */
+rmSync(resolve(root, 'dist/esm'), { recursive: true, force: true });
+
+await esbuild.build({
+    entryPoints: [
+        resolve(root, 'src/model/index.ts'),
+        /* Entry point so the browser tests can call the adapter directly;
+         * without this esbuild folds it into a chunk and there is no
+         * dist/esm/renderer/schwung-lib.js to import. */
+        resolve(root, 'src/renderer/schwung-lib.ts'),
+        resolve(root, 'src/renderer/schwung-page.ts'),
+        /* The worn-encoder filter's module state, driven by the logic suite
+         * (knob-input.mjs) at the level the opt-in lives at. */
+        resolve(root, 'src/midi/knob-direction.ts'),
+        /* The delegated page's read cache (SP-26): an entry point so the logic
+         * suite can drive the stale-write hazard at the level it lives at,
+         * rather than racing Schwung's settle window through the page. */
+        resolve(root, 'src/renderer/schwung-page-cache.ts'),
+        /* A virtual component's contract (SP-53): an entry point so the logic
+         * suite can assert on the synthesised `ui_hierarchy`/`chain_params`
+         * JSON directly — the shape the real planner requires (an ARRAY, not
+         * a keyed object) is exactly what a chunk-folded module would leave
+         * unreachable to test at this level. */
+        resolve(root, 'src/renderer/schwung-virtual-source.ts'),
+        /* WHICH keys that cache spends its round trip on (SP-39). Its own entry
+         * point because the file has no state and no host: the logic suite
+         * seeds a Map and a port and asserts on the request, which is the only
+         * level that can see the batch's COMPOSITION — a folded-in module would
+         * leave the suite failing on a path instead, and the composition bug
+         * (every read counted as an ask, so the cap evicts the live page) is
+         * invisible to every other suite in both tiers. */
+        resolve(root, 'src/renderer/schwung-page-batch.ts'),
+        /* The io movy injects and the held-step decorations (SP-59): entry
+         * points so the logic suite can assert which channel a lane rides, and
+         * which cells a held step decorates, at the level the decision lives. */
+        resolve(root, 'src/renderer/schwung-page-io.ts'),
+        resolve(root, 'src/renderer/schwung-page-decorations.ts'),
+        resolve(root, 'src/renderer/schwung-editor.ts'),
+        resolve(root, 'src/renderer/schwung-ctx.ts'),
+        resolve(root, 'src/renderer/held-header-fit.ts'),
+        resolve(root, 'src/renderer/schwung-widgets.ts'),
+        /* The file side of a module's widget (SP-28): an entry point so the
+         * logic suite can drive the resolution — which script a module names,
+         * and which global the `#ref` points at — through the real function
+         * rather than through a re-implementation of it. */
+        resolve(root, 'src/renderer/schwung-canvas.ts'),
+        /* A canvas knob's fullscreen dive and the input it takes (DR32's ENGN):
+         * the suite drives the open, the hooks and the router's one gate
+         * directly — shared chunk state with app/tick.ts and midi/router.ts. */
+        resolve(root, 'src/renderer/schwung-canvas-dive.ts'),
+        resolve(root, 'src/midi/canvas-dive-input.ts'),
+        /* The file browser's preview + browser_hooks: driven directly, with the
+         * real DR32/granny declarations. */
+        resolve(root, 'src/browser/file-handler.ts'),
+        resolve(root, 'src/browser/file-preview.ts'),
+        resolve(root, 'src/model/file-decl.ts'),
+        /* The widget trigger (SP-28 defect 3): same reason — the suite asserts
+         * WHEN the question is asked, which is behaviour the device tier can
+         * only confirm after the fact. */
+        resolve(root, 'src/renderer/schwung-page-widget-sync.ts'),
+        resolve(root, 'src/renderer/schwung-voices.ts'),
+        resolve(root, 'src/renderer/schwung-grid.ts'),
+        /* The file-param predicate: the logic suite classifies a click's
+         * consequence with the same rule the footer and the dive use. */
+        resolve(root, 'src/renderer/schwung-file-param.ts'),
+        /* The device harness's probe: entry point so the logic suite can pin
+         * its response shape without a device. */
+        resolve(root, 'src/test/probe.ts'),
+        /* The one door to the param channel: an entry point so the logic suite
+         * can drive it directly and assert on its refusal counters. */
+        resolve(root, 'src/host/param.ts'),
+        /* The host seam (standalone WP1): an entry point so a suite can swap the
+         * platform with setPlatformForTest and see every caller follow. */
+        resolve(root, 'src/platform/index.ts'),
+        /* The movy-host platform, asserted on its own (platform-caps.mjs). */
+        resolve(root, 'src/platform/standalone.ts'),
+        /* AI MIDI (plans/2026-10-26-ai-midi-plan.md): one entry for every
+         * src/ai module the ai-* suites drive directly. */
+        resolve(root, 'src/ai/index.ts'),
+        /* The algorithmic generators (plans/2026-10-27-algorithmic-generators-
+         * design.md): one entry for the gen-* suites and the bench. */
+        resolve(root, 'src/gen/index.ts'),
+        /* The Set phase, so the ai-* suites can stand in a ready Set. */
+        resolve(root, 'src/seq/set-session.ts'),
+        /* Move-only features the platform-caps suite asserts switch off. */
+        resolve(root, 'src/model/page-rotation.ts'),
+        resolve(root, 'src/model/config-hierarchy.ts'),
+        resolve(root, 'src/model/modern-rack.ts'),
+        /* The one reader of a module's declared page contract (SP-20): an entry
+         * point so the logic suite can drive the three rungs, the levels test
+         * and the pending answer directly, rather than inferring the ladder
+         * from a page that was planned from it. */
+        resolve(root, 'src/chain/hierarchy-source.ts'),
+        resolve(root, 'src/modules/loader.ts'),
+        resolve(root, 'src/model/viewmodel.ts'),
+        resolve(root, 'src/model/store.ts'),
+        resolve(root, 'src/model/knob-step.ts'),
+        resolve(root, 'src/model/step-labels.ts'),
+        resolve(root, 'src/model/toggle.ts'),        resolve(root, 'src/model/constants.ts'),
+        resolve(root, 'src/model/enum-value.ts'),
+        resolve(root, 'src/model/file-validate.ts'),
+        resolve(root, 'src/model/pad-scope.ts'),
+        resolve(root, 'src/renderer/knob-view.ts'),
+        resolve(root, 'src/renderer/header.ts'),
+        resolve(root, 'src/renderer/keys-view.ts'),
+        resolve(root, 'src/renderer/browse-view.ts'),
+        /* The other browser — the one a file parameter dives into. An entry
+         * point for the same reason as its sibling: the screenshot scene has to
+         * render it, and folded into a chunk there is no path to import. */
+        resolve(root, 'src/renderer/file-browse-view.ts'),
+        resolve(root, 'src/renderer/chain-view.ts'),
+        resolve(root, 'src/renderer/overlay.ts'),
+        resolve(root, 'src/renderer/leave-modal-view.ts'),
+        resolve(root, 'src/renderer/volume-overlay.ts'),
+        resolve(root, 'src/renderer/capture-overlay.ts'),
+        resolve(root, 'src/renderer/undo-overlay.ts'),
+        resolve(root, 'src/undo/state.ts'),
+        resolve(root, 'src/undo/group.ts'),
+        resolve(root, 'src/undo/record.ts'),
+        resolve(root, 'src/undo/apply.ts'),
+        resolve(root, 'src/undo/verbs.ts'),
+        resolve(root, 'src/undo/label.ts'),
+        resolve(root, 'src/undo/toast.ts'),
+        resolve(root, 'src/undo/module-dump.ts'),
+        resolve(root, 'src/undo/module-apply.ts'),
+        resolve(root, 'src/undo/rec-pass.ts'),
+        resolve(root, 'src/undo/param-sync.ts'),
+        resolve(root, 'src/undo/edit.ts'),
+        resolve(root, 'src/undo/ui-fields.ts'),
+        resolve(root, 'src/chain/set-param.ts'),
+        resolve(root, 'src/seq/lane-mapping.ts'),
+        resolve(root, 'src/seq/lane-value.ts'),
+        /* The base an automated parameter reverts to (SP-36). Its own entry
+         * point because it is pure — a Map, and two functions over it — and
+         * the suite has to be able to SEED it the way a restored Set does
+         * (`seedFromEngine`), which no other path can drive without a
+         * device. Splitting keeps the map a singleton: every importer
+         * resolves to the one shared chunk, which is the property the
+         * mirror depends on. */
+        resolve(root, 'src/seq/automation-base.ts'),
+        resolve(root, 'src/track/mix-persist.ts'),
+        resolve(root, 'src/track/send-persist.ts'),
+        resolve(root, 'src/track/send-port.ts'),
+        resolve(root, 'src/mixer/db-ladder.ts'),
+        resolve(root, 'src/mixer/mix-io.ts'),
+        resolve(root, 'src/mixer/mix-model.ts'),
+        /* MIX's virtual-component source (SP-55) — an entry point for the
+         * same reason as Clip/Set/Step Params: the logic suite drives the
+         * synthesised contract and the read-modify-write directly. */
+        resolve(root, 'src/mixer/mix-apply.ts'),
+        resolve(root, 'src/mixer/mix-schwung-cells.ts'),
+        /* The Session mixer: the contract, the meter decode and the hold,
+         * driven directly by the logic suite and the screenshot scenes. */
+        resolve(root, 'src/mixer/mixer-contract.ts'),
+        resolve(root, 'src/mixer/meter.ts'),
+        resolve(root, 'src/renderer/mixer-view.ts'),
+        resolve(root, 'src/seq/mixer-page.ts'),
+        resolve(root, 'src/seq/mixer-input.ts'),
+        resolve(root, 'src/mixer/track-volume.ts'),
+        resolve(root, 'src/mixer/master-volume.ts'),
+        resolve(root, 'src/mixer/track-mutes.ts'),
+        resolve(root, 'src/mixer/pad-mutes.ts'),
+        resolve(root, 'src/seq/leds.ts'),
+        resolve(root, 'src/seq/led-cache.ts'),
+        resolve(root, 'src/seq/button-held.ts'),
+        resolve(root, 'src/seq/buttons.ts'),
+        resolve(root, 'src/seq/colors.ts'),
+        resolve(root, 'src/keyboard/drum-handler.ts'),
+        resolve(root, 'src/keyboard/drum-grid.ts'),
+        resolve(root, 'src/model/drum-declared.ts'),
+        resolve(root, 'src/model/child-keys.ts'),
+        resolve(root, 'src/model/voice-keys.ts'),
+        resolve(root, 'src/keyboard/layouts.ts'),
+        resolve(root, 'src/keyboard/state.ts'),
+        resolve(root, 'src/keyboard/held-notes.ts'),
+        resolve(root, 'src/keyboard/release.ts'),
+        resolve(root, 'src/keyboard/handler.ts'),
+        /* The knob-touch ledger (SP-31): an entry point so app-loop can assert
+         * the map is EMPTY again after a release, not only that its effect on
+         * the controller went away — the same reason held-notes.ts is one. */
+        resolve(root, 'src/midi/knob-page-pin.ts'),
+        /* The delegation boundary (SP-10): an entry point so the logic suite
+         * can ask the accessor directly, rather than inferring ownership from
+         * a router gesture. */
+        resolve(root, 'src/app/page-owner.ts'),
+        /* SP-53's sibling accessor for a page with no model (Set/Clip Params)
+         * — an entry point so a screenshot scene can drive it the same way
+         * app/tick.ts and midi/router.ts do, rather than a folded chunk with
+         * no dist/esm/app/page-owner-virtual.js to import. */
+        resolve(root, 'src/app/page-owner-virtual.ts'),
+        /* The repaint decision (SP-38): an entry point because that decision IS
+         * the fix — the animated widgets were already drawing correctly and
+         * simply never asked for a second frame. A suite that drove it through
+         * a whole tick could not tell "the term is gone" from "the fixture
+         * happened not to animate", which is the difference between a test and
+         * a coincidence. */
+        resolve(root, 'src/app/page-poll.ts'),
+        /* The repaint cap (SP-48): an entry point so the logic suite can drive
+         * the escalation state machine directly, and separately assert that
+         * `page-poll.ts` actually calls it rather than a parallel copy. */
+        resolve(root, 'src/app/repaint-cap.ts'),
+        /* Which body fills the knob rows (SP-58): an entry point so the logic
+         * suite and the app loop read the SAME trip counter `tick.ts` bumps. */
+        resolve(root, 'src/app/param-body.ts'),
+        /* The body/ring decision (SP-18): an entry point so the `page` scenes
+         * render through `schwungBodyFor` itself. A scene that re-derived the
+         * condition would stay green with it taken out, which is exactly what
+         * the scene exists to catch. */
+        resolve(root, 'src/app/tick.ts'),
+        resolve(root, 'src/app/modulated-keys.ts'),
+        /* The lane view a delegated page's mark reads: an entry point so the
+         * drum automation matrix asks the SAME lookup the page does. */
+        resolve(root, 'src/app/automated-keys.ts'),
+        /* The Set-load view fallback (set-settling S10) reads the SAME appState
+         * the settle path writes. */
+        resolve(root, 'src/app/model-refresh.ts'),
+        resolve(root, 'src/app/globals.ts'),
+        resolve(root, 'src/app/init.ts'),
+        resolve(root, 'src/app/unload.ts'),
+        resolve(root, 'src/renderer/knob-leds.ts'),
+        resolve(root, 'src/app/leave-modal.ts'),
+        resolve(root, 'src/app/jog-hint.ts'),
+        resolve(root, 'src/app/perf-probe.ts'),
+        resolve(root, 'src/chain/config.ts'),
+        /* movy's own master chain (WP3): the binding and its prefix, driven
+         * directly by browser-test/logic/master-chain.mjs. */
+        resolve(root, 'src/chain/master-prefix.ts'),
+        resolve(root, 'src/lfo/params.ts'),
+        resolve(root, 'src/lfo/model.ts'),
+        /* The LFO page's virtual-component source (SP-55) — same reason as
+         * MIX's above: the logic suite drives it directly. */
+        resolve(root, 'src/lfo/lfo-schwung-source.ts'),
+        resolve(root, 'src/lfo/lfo-target-list.ts'),
+        resolve(root, 'src/lfo/assign.ts'),
+        resolve(root, 'src/lfo/assign-mode.ts'),
+        resolve(root, 'src/lfo/scope.ts'),
+        resolve(root, 'src/lfo/io.ts'),
+        resolve(root, 'src/track/lfo-persist.ts'),
+        resolve(root, 'src/font/big.ts'),
+        resolve(root, 'src/font/index.ts'),
+        resolve(root, 'src/font/glyphs.ts'),
+        resolve(root, 'src/font/index5x3.ts'),
+        resolve(root, 'src/font/glyphs5x3.ts'),
+        resolve(root, 'src/seq/engine.ts'),
+        resolve(root, 'src/seq/automation.ts'),
+        resolve(root, 'src/seq/router.ts'),
+        resolve(root, 'src/seq/router-steps.ts'),
+        resolve(root, 'src/seq/router-buttons.ts'),
+        resolve(root, 'src/seq/router-pads.ts'),
+        resolve(root, 'src/seq/state.ts'),
+        resolve(root, 'src/seq/watch.ts'),
+        resolve(root, 'src/seq/leds.ts'),
+        resolve(root, 'src/seq/led-cache.ts'),
+        resolve(root, 'src/seq/button-held.ts'),
+        resolve(root, 'src/seq/buttons.ts'),
+        resolve(root, 'src/seq/constants.ts'),
+        resolve(root, 'src/seq/colors.ts'),
+        resolve(root, 'src/seq/scales.ts'),
+        resolve(root, 'src/seq/render.ts'),
+        resolve(root, 'src/seq/loop-strip.ts'),
+        resolve(root, 'src/seq/note-layout.ts'),
+        resolve(root, 'src/seq/note-view.ts'),
+        resolve(root, 'src/seq/step-piano.ts'),
+        resolve(root, 'src/seq/piano-range.ts'),
+        resolve(root, 'src/renderer/step-piano.ts'),
+        resolve(root, 'src/seq/pads.ts'),
+        resolve(root, 'src/seq/loop-mode.ts'),
+        resolve(root, 'src/seq/step-edit.ts'),
+        resolve(root, 'src/seq/step-rec.ts'),
+        resolve(root, 'src/seq/step-rec-view.ts'),
+        resolve(root, 'src/seq/step-page.ts'),
+        resolve(root, 'src/seq/step-page-vm.ts'),
+        resolve(root, 'src/seq/edit-ops.ts'),
+        resolve(root, 'src/seq/duplicate.ts'),
+        resolve(root, 'src/seq/voice-copy.ts'),
+        resolve(root, 'src/seq/session.ts'),
+        /* Freeze's UI half (status fields, double tap, guard): an entry point
+         * so browser-test/logic/freeze.mjs drives it directly. */
+        resolve(root, 'src/seq/freeze.ts'),
+        resolve(root, 'src/seq/freeze-pads.ts'),
+        resolve(root, 'src/seq/freeze-busy.ts'),
+        resolve(root, 'src/seq/freeze-toast.ts'),
+        resolve(root, 'src/seq/load-errors.ts'),
+        resolve(root, 'src/seq/freeze-wave.ts'),
+        resolve(root, 'src/seq/frozen-view-vm.ts'),
+        resolve(root, 'src/seq/track-menu.ts'),
+        resolve(root, 'src/seq/freeze-screen.ts'),
+        resolve(root, 'src/seq/frozen-playhead.ts'),
+        resolve(root, 'src/renderer/playhead-column.ts'),
+        resolve(root, 'src/seq/loop-strip.ts'),
+        resolve(root, 'src/renderer/freeze-toast-view.ts'),
+        resolve(root, 'src/mixer/pad-mutes.ts'),
+        resolve(root, 'src/seq/song.ts'),
+        resolve(root, 'src/seq/persist-blob.ts'),
+        resolve(root, 'src/seq/persist-store.ts'),
+        resolve(root, 'src/seq/set-load.ts'),
+        resolve(root, 'src/seq/set-save.ts'),
+        resolve(root, 'src/seq/set-session.ts'),
+        resolve(root, 'src/seq/set-fail.ts'),
+        resolve(root, 'src/renderer/loading-view.ts'),
+        resolve(root, 'src/seq/ui-state.ts'),
+        resolve(root, 'src/seq/set-context.ts'),
+        /* Version history. Entry points rather than chunk members so the logic
+         * suite can import each layer on its own — the retention ladder in
+         * particular is a pure function whose whole value is being testable
+         * without a filesystem. */
+        resolve(root, 'src/seq/ui-dirty.ts'),
+        resolve(root, 'src/seq/version-restore.ts'),
+        resolve(root, 'src/seq/migrate-action.ts'),
+        resolve(root, 'src/seq/version-wire.ts'),
+        resolve(root, 'src/seq/versions-page.ts'),
+        resolve(root, 'src/seq/versions-page-vm.ts'),
+        resolve(root, 'src/seq/sets-lib.ts'),
+        resolve(root, 'src/seq/set-names.ts'),
+        resolve(root, 'src/seq/set-source.ts'),
+        resolve(root, 'src/seq/sets-page-vm.ts'),
+        resolve(root, 'src/seq/sets-page.ts'),
+        resolve(root, 'src/seq/set-lib-session.ts'),
+        resolve(root, 'src/renderer/sets-view.ts'),
+        resolve(root, 'src/renderer/button-icons.ts'),
+        resolve(root, 'src/renderer/versions-view.ts'),
+        resolve(root, 'src/seq/held.ts'),
+        resolve(root, 'src/seq/buttons.ts'),
+        resolve(root, 'src/keyboard/leds.ts'),
+        resolve(root, 'src/app/state.ts'),
+        resolve(root, 'src/model/state.ts'),
+        resolve(root, 'src/track/ref.ts'),
+        resolve(root, 'src/track/registry.ts'),
+        resolve(root, 'src/track/focus.ts'),
+        resolve(root, 'src/track/switch.ts'),
+        resolve(root, 'src/track/bulk.ts'),
+        resolve(root, 'src/track/pad-route.ts'),
+        resolve(root, 'src/track/ext-route.ts'),
+        resolve(root, 'src/midi/external.ts'),
+        /* The external knob controller's mapping, pure — driven by the
+         * logic suite (ext-knobs.mjs) without a router behind it. */
+        resolve(root, 'src/midi/ext-knob-map.ts'),
+        resolve(root, 'src/track/chain-persist.ts'),
+        resolve(root, 'src/track/chains-file.ts'),
+        resolve(root, 'src/track/chain-payload.ts'),
+        resolve(root, 'src/browser/handler.ts'),
+        resolve(root, 'src/browser/state.ts'),
+        resolve(root, 'src/seq/track-select.ts'),
+        resolve(root, 'src/seq/momentary.ts'),
+        resolve(root, 'src/seq/detent.ts'),
+        resolve(root, 'src/seq/param-page.ts'),
+        resolve(root, 'src/seq/main-page.ts'),
+        resolve(root, 'src/seq/header-vm.ts'),
+        /* SP-53's absolute-value writers, shared with the virtual-component
+         * seam's set() — an entry point so the logic suite can drive them
+         * directly (the one-writer invariant needs to call the SAME function
+         * the delta path calls, not a copy folded into a chunk). */
+        resolve(root, 'src/seq/main-page-apply.ts'),
+        resolve(root, 'src/seq/main-page-constants.ts'),
+        /* Set Params' virtual-component contract (SP-53) — an entry point for
+         * the same reason as its sibling, clip-params-contract.ts. */
+        resolve(root, 'src/seq/set-params-contract.ts'),
+        resolve(root, 'src/seq/capture.ts'),
+        resolve(root, 'src/seq/capture-vm.ts'),
+        resolve(root, 'src/seq/clip-scale.ts'),
+        resolve(root, 'src/seq/clip-page.ts'),
+        /* SP-53's virtual-component seam, pinned at Clip Params: an entry
+         * point so the logic suite can drive the synthesised contract and the
+         * one-writer invariant directly, rather than folded into a chunk with
+         * no `dist/esm/seq/clip-params-contract.js` to import. */
+        resolve(root, 'src/seq/clip-params-contract.ts'),
+        /* The step page's virtual-component contract (SP-54) — an entry point
+         * for the same reason as its two siblings above. */
+        resolve(root, 'src/seq/step-params-contract.ts'),
+        resolve(root, 'src/seq/drum-sync.ts'),
+        resolve(root, 'src/seq/quant.ts'),
+        resolve(root, 'src/seq/clip-quant.ts'),
+        resolve(root, 'src/seq/prefs.ts'),
+        resolve(root, 'src/seq/click-volume.ts'),
+        resolve(root, 'src/seq/link-setting.ts'),
+        resolve(root, 'src/seq/quant-overlay.ts'),
+        resolve(root, 'src/renderer/cpu-view.ts'),
+        resolve(root, 'src/renderer/frozen-view.ts'),
+        resolve(root, 'src/seq/cpu-page.ts'),
+        resolve(root, 'src/seq/cpu-page-vm.ts'),
+        resolve(root, 'src/seq/cpu-scale.ts'),
+        resolve(root, 'src/seq/flags-page.ts'),
+        resolve(root, 'src/seq/flags-page-vm.ts'),
+        resolve(root, 'src/renderer/flags-view.ts'),
+        resolve(root, 'src/renderer/wrap.ts'),
+        resolve(root, 'src/renderer/layout.ts'),
+        resolve(root, 'src/renderer/value-row.ts'),
+        resolve(root, 'src/renderer/quant-overlay.ts'),
+    ],
+    bundle:    true,
+    splitting: true,
+    plugins: [{
+        /* movy imports Schwung's shared JS by its absolute device path, which
+         * the device build leaves external. Here it resolves to the PINNED
+         * tag's bytes — the ones movy ships (scripts/lib/schwung-pinned.mjs) —
+         * so the suites render the real Schwung widgets. SCHWUNG= says where
+         * the schwung repo is; ../schwung by default, like run-gate.sh. */
+        name: 'schwung-param-pages',
+        setup(build) {
+            /* The keyboard is always the stand-in: the real one draws through
+             * Schwung's globals and is Schwung's to test (stubs/text-entry.mjs). */
+            build.onResolve({ filter: /^\/data\/UserData\/schwung\/shared\/text_entry\.mjs$/ },
+                () => ({ path: resolve(root, 'browser-test/stubs/text-entry.mjs') }));
+            build.onResolve({ filter: /^\/data\/UserData\/schwung\/(shared\/param_pages\/|shadow\/|shared\/lane_voice_map\.mjs$)/ }, (a) => {
+                /* wav_io_qjs.mjs (SP-42) statically imports QuickJS's built-in
+                 * `std`/`os`, which node cannot resolve: a stand-in backed by the
+                 * same globalThis.std/os mocks browser-test/env.mjs installs. */
+                if (a.path.endsWith('wav_io_qjs.mjs')) {
+                    return { path: resolve(root, 'browser-test/stubs/wav-io-qjs.mjs') };
+                }
+                return { path: resolve(pinnedSchwungRoot(), 'src/' + a.path.replace('/data/UserData/schwung/', '')) };
+            });
+        },
+    }],
+    supported: { 'top-level-await': true },
+    outdir:    resolve(root, 'dist/esm'),
+    outbase:   resolve(root, 'src'),
+    format:    'esm',
+    target:    ['es2020'],
+    logLevel:  'info',
+});
+console.log('Browser modules written: dist/esm/');

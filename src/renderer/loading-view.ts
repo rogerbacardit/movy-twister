@@ -1,0 +1,109 @@
+/* The screen while movy is not yet live, and the one when it cannot become
+ * live.
+ *
+ * Deliberately plain: the loading case lasts a couple of seconds and anything
+ * animated here competes for tick budget with the engine boot it is waiting on.
+ * The failure case is plain for a different reason — it has to be read and
+ * acted on, so it says what broke and what the one button does. */
+
+import { fontPrint, fontWidth } from '../font/index.js';
+import { W } from './layout.js';
+
+const H = 64;
+
+/** set-settle.ts's SettleStage, restated so the renderer imports no state. */
+export type SettleView = { step: string; loaded: number; total: number };
+
+function centre(y: number, text: string, color: number): void {
+    fontPrint(Math.floor((W - fontWidth(text)) / 2), y, text, color);
+}
+
+/** What the splash is waiting on. Separated from the drawing so the wording is
+ *  testable without pixels — and because "loaded" and "playable" are different
+ *  things the user is entitled to see the difference between: the Set's state
+ *  lands in one blocking write, but its modules arrive one per audio callback
+ *  after it. */
+export function loadingStage(phase: string, settle: SettleView | null, migrating = ''): string {
+    if (phase === 'booting') return 'STARTING ENGINE';
+    /* The first start's migration from Move, before any Set can open. */
+    if (migrating) return 'MIGRATING SETS ' + migrating;
+    if (phase !== 'settling' || !settle) return 'LOADING SET';
+    if (settle.step === 'modules') {
+        /* A count only once there is one to show: the first status after the
+         * open can still read the previous Set's zero. */
+        return settle.total > 0 ? 'LOADING MODULES ' + settle.loaded + '/' + settle.total : 'LOADING MODULES';
+    }
+    /* The saved patches, banks and SoundFonts, applied once the modules exist. */
+    return settle.step === 'sounds' ? 'LOADING SOUNDS' : 'PREPARING SET';
+}
+
+/** The failure screen's three lines: what happened, why, and what to do.
+ *
+ *  Separated from the drawing for the same reason as `loadingStage` — and
+ *  because WHICH ACTION IS OFFERED is a correctness question, not a wording
+ *  one. The only recovery movy has is to blank the set, and that answers
+ *  exactly one failure: this set's own file will not parse. Offered against an
+ *  engine that never started it is worse than useless — the set is fine, the
+ *  engine is not, and a jog click the user reads as "get me out of here"
+ *  overwrites their sequencer state with nothing.
+ *
+ *  An empty string means the line is not drawn.
+ */
+export function failureLines(reason: string, scope: string): [string, string, string] {
+    if (scope === 'engine') {
+        /* No "cannot load this set": the set is not what failed, and a user who
+         * is told it is will go looking for the damage in the wrong place. Both
+         * engine failures are a broken install, which a restart does not fix. */
+        return [reason, 'REINSTALL MOVY', ''];
+    }
+    /* Naming the button rather than "press to continue": this wipes the Set's
+     * sequencer state, and a user who did not mean to should be able to tell
+     * from the screen alone. */
+    return ['CANNOT LOAD THIS SET', reason, 'JOG CLICK = START EMPTY'];
+}
+
+/* A wait shorter than this is a blank screen, without words. On the device
+ * movy-sa went STARTING ENGINE -> PREPARING SET -> its first page in ~50 ms,
+ * one frame each, and the user saw the screen "blink weirdly". Blank, not
+ * untouched: a Set switch must still cover the previous Set's page at once
+ * (app-loop "a session phase change repaints"). A real wait (a Set with
+ * modules to load) still gets its words, just later. */
+export const SPLASH_DELAY_MS = 250;
+
+let waitingSince = 0;
+let splashShown = false;
+
+/** How long movy has been waiting to go live, 0 once it is; `now` in ms. */
+export function loadingWaitMs(ready: boolean, now: number): number {
+    if (ready) { waitingSince = 0; splashShown = false; return 0; }
+    if (waitingSince === 0) waitingSince = now;
+    return now - waitingSince;
+}
+
+/** True once, on the tick the held-back splash becomes due — the repaint
+ *  that draws it, since nothing else marks the screen dirty mid-wait. */
+export function splashDue(waited: number): boolean {
+    if (splashShown || waited < SPLASH_DELAY_MS) return false;
+    splashShown = true;
+    return true;
+}
+
+/** Returns whether any words were drawn. */
+export function renderLoadingView(
+    phase: string, error: string, settle: SettleView | null = null, failScope = 'set',
+    waitedMs = Infinity, migrating = '',
+): boolean {
+    clear_screen();
+    /* A failure is never held back: it is waiting on the user. */
+    if (phase !== 'failed' && waitedMs < SPLASH_DELAY_MS) return false;
+    if (phase === 'failed') {
+        const lines = failureLines(error, failScope);
+        /* Two lines sit where three would leave a gap at the bottom, so the
+         * block stays vertically centred whichever failure this is. */
+        const ys = lines[2] === '' ? [22, 36, 0] : [18, 30, 46];
+        for (let i = 0; i < 3; i++) if (lines[i] !== '') centre(ys[i], lines[i], 1);
+        return true;
+    }
+    centre(Math.floor(H / 2) - 3, loadingStage(phase, settle, migrating), 1);
+    return true;
+}

@@ -1,0 +1,250 @@
+export interface KnobSlot {
+    key:            string;
+    short:          string;
+    full:           string;
+    type:           'float' | 'int' | 'enum' | 'file';
+    render?:        'arc' | 'hbar' | 'vbar' | 'preset' | 'items';
+    /* `render: 'items'` only: the ui_hierarchy level key whose
+     * items_param/select_param pair this slot selects from. */
+    itemsLevel?:    string;
+    /* Names this param's envelope stage — or `false` to declare that it is NOT
+     * one, vetoing the name-based auto-detect.
+     *
+     * The veto exists because detection reads the param KEY as well as the
+     * label, and a key stem is not always a promise: 9W9's `bd_c_attack` is a
+     * click LEVEL, not a time, so pairing it with `bd_c_decay` drew a fake AD
+     * graphic and hoisted Attack to knob 1 — disagreeing with the module's own
+     * editor about knob order. A module cannot rename its way out of that while
+     * the key still matches, so the config has to be able to say no. */
+    env?:           'a' | 'd' | 's' | 'r' | false;
+    lfo?:           'shape' | 'phase' | 'mode' | 'retrig' | 'rate' | 'depth' | 'deform';
+    filter?:        'cutoff' | 'resonance' | 'mode' | 'slope';
+    /* Override movy's automatable heuristic: force a param on (an enum the host
+     * can still automate as an index) or off (a per-voice key the host can't
+     * resolve, so no misleading automation dot). */
+    automatable?:   boolean;
+    /* One-shot actions stay visually idle: clockwise fires once per gesture,
+     * counter-clockwise sends idle and re-arms the gesture. */
+    behavior?:      'trigger';
+    /**
+     * This param REWRITES other params when it changes, so its inverse is
+     * lossy: writing the old value back makes the DSP re-apply that selection's
+     * defaults, discarding anything the user tweaked afterwards. Undo therefore
+     * snapshots the whole module (schwung's `<component>:state`) before the
+     * change and restores that instead.
+     *
+     * `render: "preset"` implies this and needs no flag. Set it explicitly for
+     * the params that behave like a preset without looking like one — a bank or
+     * ROM selector (osirus `rom_index`/`bank_index`), or a plugin selector whose
+     * choice redefines what the other knobs mean (clap/airwindows
+     * `plugin_index`).
+     *
+     * Trade-offs, which are why this is opt-in rather than the default:
+     *   - One extra BLOCKING chain read per gesture (~3-5 ms on device against
+     *     a 2-reads-per-tick budget — see browser-test/perf.mjs). Fine next to a
+     *     preset load; not fine on an ordinary knob.
+     *   - The undo entry grows from ~50 bytes to the size of the state blob,
+     *     hundreds of bytes to several KB, and the stack holds 64 of them.
+     *   - Undo then restores the WHOLE module, so it also reverts params the
+     *     user never touched — including ones automation or an LFO is driving.
+     *     Only mark a param where that is the lesser evil, i.e. where the param
+     *     really does rewrite the others.
+     */
+    capturesModuleState?: boolean;
+
+    /* Wide integer spaces (sample indexes, random seeds, etc.) retain
+     * single-step precision on a slow turn and accelerate on a fast sweep. */
+    knobAcceleration?: 'wide';
+    options?:       string[];
+    min?:           number;
+    max?:           number;
+    /* Rarely needed: applyKnobDelta normalizes float sensitivity from the range,
+     * so a config `step` only acts as an int floor / max<=min fallback. */
+    step?:          number;
+    /* For a `render: 'preset'` slot: the chain_params keys movy polls for the
+     * preset count and the live preset name. Both default to the module's
+     * ui_hierarchy root `count_param`/`name_param` when omitted, so a config
+     * usually only needs `render: 'preset'`. If no count is resolvable the slot
+     * degrades to a plain indexed knob. */
+    presetCountKey?: string;
+    presetNameKey?:  string;
+    fileRoot?:      string;
+    fileFilter?:    string[];
+    /* wav_position only: the key of the file param whose sample this marker
+     * indexes. Schwung declares the link explicitly, so the waveform never has
+     * to guess which of a page's file params it belongs to. */
+    /* Render hint that does NOT change the data type — schwung's `ui_type`.
+     * A wav_position is a float; treating it as its own type made the write
+     * path fall through to String(Math.round(v)) and store 0 for every value
+     * below 0.5. */
+    uiType?:        string;
+    filepathParam?: string;
+    /* Markers sharing a view group draw on one waveform (schwung's view_group). */
+    viewGroup?:     string;
+    fileStartPath?: string;
+    fileRequireContains?: string;
+}
+
+export interface BankConfig {
+    name: string;
+    rows: (KnobSlot | null)[][];
+    padSpecific?: boolean;
+    /* Pad-follow: pressing this pad selects this bank, the way schwung's stock
+     * editor switches page to the drum you hit.
+     *
+     * The alternative already here is `padSpecific` — ONE bank whose alias keys
+     * re-target to the focused pad. That fits a kit whose pads share a control
+     * set. It does not fit an analog-style drum machine, where the voices are
+     * different circuits: a 909's snare has no Decay or Attack, its kick has no
+     * FX sends, so a single re-targeting row is mostly holes. Such a module
+     * wants a page PER voice, and the pad to choose among them.
+     *
+     * Opt-in and per bank. A bank without `pad` is never auto-selected (that is
+     * how a module keeps Main, or an FX page, off the pad rotation), and a
+     * config that sets it nowhere behaves exactly as before.
+     *
+     * 1-based, like every other pad number movy hands around (drumPadOn returns
+     * 1 for the first pad, and padKeys indexes `table[pad - 1]`). */
+    pad?: number;
+    /* Params in this bank are non-automatable globals (not reachable as a chain
+     * target:param). Replaces the old `g_` key-prefix heuristic. */
+    global?: boolean;
+}
+
+export interface ModuleConfig {
+    id:    string;
+    name:  string;
+    banks: BankConfig[];
+    drum?: DrumConfig;
+    /* Params to set once when the module loads (e.g. disable a DSP auto-behavior
+     * movy wants to own). Applied as componentKey-prefixed sets. */
+    setOnLoad?: Record<string, string>;
+    /* Commit enum values by INDEX even when the DSP reports them by NAME on read.
+     * For modules whose set_param parses an integer index but whose get_param
+     * returns the option name (e.g. Forge) — without this movy would echo the
+     * name back and the DSP's atoi() would collapse every choice to index 0. */
+    enumSetIndex?: boolean;
+}
+
+export interface DrumConfig {
+    padCount:         number;
+    padNoteStart:     number;
+    rawMidi:          boolean;
+    /* The note each pad plays, pad-ordered (1-based pad -> padNotes[pad-1]).
+     *
+     * Present only when the MODULE declared its voices (schwung #411). A
+     * declared rack's notes need not be contiguous — voice-poc states 36, 38,
+     * 42, 60, 61, 62, 63 — and `padNoteStart + pad - 1` cannot describe that:
+     * it would send five of those seven pads to the wrong voice. When this is
+     * present it is authoritative and the arithmetic is not consulted. */
+    padNotes?:        number[];
+    currentPadParam?: string;
+    /* What to WRITE into `currentPadParam` for each pad, 1-based pad ->
+     * padFocusValues[pad-1]. Present only for a rack that DECLARED
+     * `focus_param`, whose contract is a level name rather than an instance
+     * number; absent means the pad number is the value. See drum-declared.ts. */
+    padFocusValues?:  string[];
+    shiftSelectMidi?: boolean;
+    /* Only pads 1..N are host-automatable (the chain caps declared params at 256,
+     * so a padScoped module can only declare concrete keys for some voices —
+     * Forge: Kit A pv1-8). A param on a pad past this is not offered for
+     * automation, so no dead dot appears. Omit = all pads automatable. */
+    automatablePads?: number;
+    /* How an alias pad param ("pad_vol") maps to its concrete per-pad key
+     * ("p03_vol"). Lets movy address the focused pad directly, with no key-shape
+     * literal in code. */
+    padScoping?: {
+        aliasPrefix:         string;   // "pad_"
+        /* Template addressing: the pad NUMBER builds the key. Optional, because
+         * a padKeys-only config has no key shape to describe. */
+        concreteKeyTemplate?: string;  // "p{pad}_{suffix}"
+        padDigits?:          number;   // 2
+        /* Per-suffix template overrides for params whose concrete keys follow a
+         * different shape than the module's main template (Forge: sends/pan are
+         * v{pad}_fx1, not pv{pad}_fx1 — only the v-form is host-automatable).
+         * `maxPad` bounds the override to pads whose v-form keys the DSP accepts
+         * (Forge: Kit A, 1-8); beyond it the main template applies, keeping the
+         * param editable (not automatable) on the remaining pads. */
+        suffixOverrides?: Record<string, { template: string; maxPad?: number }>;
+        /* TABLE addressing — the alternative to the template: each alias suffix
+         * lists its concrete key per pad, index 0 = pad 1.
+         *   padKeys: { pitch: ["bd_c_tune", "sd_c_tune", "ohh_pitch", ...] }
+         * Analog-drum modules (TR-909/606 clones) are one circuit per voice, so
+         * params are named after the VOICE and every voice has a different set —
+         * no template derives `ohh_pitch` from pad 8. Unlike the synthetic keys a
+         * template invents, these are the module's OWN declared params, so they
+         * need no alias in chain_params and automate by their own key (see
+         * aliasFromConcrete). One entry per pad; `null` means the voice has no
+         * such knob (a sampled cymbal has no Pitch Depth) — the knob then reads
+         * as unavailable and is inert, instead of showing the last pad's value.
+         * A pad past the end of the list falls back to the template, or stays
+         * unresolved when there is none. */
+        padKeys?: Record<string, (string | null)[]>;
+    };
+}
+
+export interface KnobParam {
+    key:            string;
+    label:          string;
+    shortLabel:     string | null;
+    type:           'float' | 'int' | 'enum' | 'file';
+    min:            number;
+    max:            number;
+    step:           number;
+    options:        string[] | null;
+    nameKey?:       string;
+    renderStyle:    'arc' | 'hbar' | 'vbar' | 'pan' | 'switch' | 'preset' | 'xbox' | 'steps' | 'items';
+    /* Item selector only (see model/items-param.ts): the module's own index for
+     * each option. knobValues holds the screen POSITION; this maps it back to
+     * the value written to select_param, which a sparse list makes different. */
+    itemIndices?:   number[];
+    /* The level's items_param key, kept so a knob touch can re-read the list —
+     * that is what makes a bank uploaded while movy is open show up. */
+    itemsKey?:      string;
+    /** Step cell whose value reads as an offset: show a leading + above zero. */
+    signed?:        boolean;
+    /** See KnobSlot.env — a stage name, or `false` vetoing the auto-detect. */
+    env?:           'a' | 'd' | 's' | 'r' | false;
+    lfo?:           'shape' | 'phase' | 'mode' | 'retrig' | 'rate' | 'depth' | 'deform';
+    filter?:        'cutoff' | 'resonance' | 'mode' | 'slope';
+    automatable:    boolean;
+    behavior?:      'trigger';
+    /** The module declared `access: "read"` — a readout. The value means
+     *  something and writing it means nothing, so the knob never scrubs it and
+     *  the picker never opens on it; the cell says so with a dotted frame. See
+     *  model/access.ts. */
+    readOnly?:      boolean;
+    /** See KnobSlot.capturesModuleState — resolved from the config, or implied
+     *  by `renderStyle === 'preset'`. */
+    capturesModuleState?: boolean;
+    knobAcceleration?: 'wide';
+    /* Set when type/range were guessed (no chain_params or hierarchy metadata).
+     * The first successful value read infers the real type/range, then clears
+     * this. See model/meta-infer.ts. */
+    metaGuessed?:   boolean;
+    fileRoot?:      string;
+    fileFilter?:    string[];
+    /* wav_position only: the key of the file param whose sample this marker
+     * indexes. Schwung declares the link explicitly, so the waveform never has
+     * to guess which of a page's file params it belongs to. */
+    /* Render hint that does NOT change the data type — schwung's `ui_type`.
+     * A wav_position is a float; treating it as its own type made the write
+     * path fall through to String(Math.round(v)) and store 0 for every value
+     * below 0.5. */
+    uiType?:        string;
+    filepathParam?: string;
+    /* Markers sharing a view group draw on one waveform (schwung's view_group). */
+    viewGroup?:     string;
+    fileStartPath?: string;
+    fileRequireContains?: string;
+    /* The browser's preview + hooks, when the module declares any
+     * (model/file-decl.ts). */
+    fileBrowse?:    FileBrowseDecl;
+}
+
+export interface FileHookAction { key: string; value: string; restore: boolean }
+export interface FileBrowseDecl {
+    live: boolean;
+    hooks: { onOpen: FileHookAction[]; onPreview: FileHookAction[];
+             onCancel: FileHookAction[]; onCommit: FileHookAction[] };
+}

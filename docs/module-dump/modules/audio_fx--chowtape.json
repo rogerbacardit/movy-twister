@@ -1,0 +1,547 @@
+{
+ "id": "chowtape",
+ "name": "CHOWTape",
+ "version": "0.1.2",
+ "author": "charlesvestal",
+ "category": "audio_fx",
+ "status": "ok",
+ "load_ms": 47,
+ "dsp_size": 27568,
+ "capabilities": {
+  "chainable": true,
+  "component_type": "audio_fx",
+  "ui_hierarchy": {
+   "levels": {
+    "root": {
+     "name": "CHOWTape",
+     "params": [
+      {
+       "key": "drive",
+       "label": "Drive",
+       "type": "float",
+       "min": 0,
+       "max": 1,
+       "default": 0.5,
+       "step": 0.01,
+       "unit": "%"
+      },
+      {
+       "key": "saturation",
+       "label": "Saturation",
+       "type": "float",
+       "min": 0,
+       "max": 1,
+       "default": 0.5,
+       "step": 0.01,
+       "unit": "%"
+      },
+      {
+       "key": "bias",
+       "label": "Bias",
+       "type": "float",
+       "min": 0,
+       "max": 1,
+       "default": 0.5,
+       "step": 0.01,
+       "unit": "%"
+      },
+      {
+       "key": "tone",
+       "label": "Tone",
+       "type": "float",
+       "min": 0,
+       "max": 1,
+       "default": 0.5,
+       "step": 0.01,
+       "unit": "%"
+      },
+      {
+       "key": "speed",
+       "label": "Speed",
+       "type": "float",
+       "min": 0,
+       "max": 1,
+       "default": 0.5,
+       "step": 0.01,
+       "unit": "%"
+      },
+      {
+       "key": "flutter",
+       "label": "Flutter",
+       "type": "float",
+       "min": 0,
+       "max": 1,
+       "default": 0,
+       "step": 0.01,
+       "unit": "%"
+      },
+      {
+       "key": "chew",
+       "label": "Chew",
+       "type": "float",
+       "min": 0,
+       "max": 1,
+       "default": 0,
+       "step": 0.01,
+       "unit": "%"
+      },
+      {
+       "key": "mix",
+       "label": "Mix",
+       "type": "float",
+       "min": 0,
+       "max": 1,
+       "default": 1,
+       "step": 0.01,
+       "unit": "%"
+      },
+      {
+       "key": "degrade",
+       "label": "Degrade",
+       "type": "float",
+       "min": 0,
+       "max": 1,
+       "default": 0,
+       "step": 0.01,
+       "unit": "%"
+      },
+      {
+       "key": "output",
+       "label": "Output",
+       "type": "float",
+       "min": 0,
+       "max": 1,
+       "default": 0.5,
+       "step": 0.01,
+       "unit": "%"
+      }
+     ],
+     "knobs": [
+      "drive",
+      "saturation",
+      "bias",
+      "tone",
+      "speed",
+      "flutter",
+      "chew",
+      "mix"
+     ]
+    }
+   }
+  }
+ },
+ "presets": null,
+ "native": {
+  "hierarchy_levels": [
+   "root"
+  ],
+  "params": [
+   {
+    "key": "drive",
+    "name": null,
+    "type": "float",
+    "min": 0,
+    "max": 1,
+    "step": 0.01,
+    "options": null,
+    "default": "0.50"
+   },
+   {
+    "key": "saturation",
+    "name": null,
+    "type": "float",
+    "min": 0,
+    "max": 1,
+    "step": 0.01,
+    "options": null,
+    "default": "0.50"
+   },
+   {
+    "key": "bias",
+    "name": null,
+    "type": "float",
+    "min": 0,
+    "max": 1,
+    "step": 0.01,
+    "options": null,
+    "default": "0.50"
+   },
+   {
+    "key": "tone",
+    "name": null,
+    "type": "float",
+    "min": 0,
+    "max": 1,
+    "step": 0.01,
+    "options": null,
+    "default": "0.50"
+   },
+   {
+    "key": "speed",
+    "name": null,
+    "type": "float",
+    "min": 0,
+    "max": 1,
+    "step": 0.01,
+    "options": null,
+    "default": "0.50"
+   },
+   {
+    "key": "flutter",
+    "name": null,
+    "type": "float",
+    "min": 0,
+    "max": 1,
+    "step": 0.01,
+    "options": null,
+    "default": "0.00"
+   },
+   {
+    "key": "chew",
+    "name": null,
+    "type": "float",
+    "min": 0,
+    "max": 1,
+    "step": 0.01,
+    "options": null,
+    "default": "0.00"
+   },
+   {
+    "key": "degrade",
+    "name": null,
+    "type": "float",
+    "min": 0,
+    "max": 1,
+    "step": 0.01,
+    "options": null,
+    "default": "0.00"
+   },
+   {
+    "key": "mix",
+    "name": null,
+    "type": "float",
+    "min": 0,
+    "max": 1,
+    "step": 0.01,
+    "options": null,
+    "default": "1.00"
+   },
+   {
+    "key": "output",
+    "name": null,
+    "type": "float",
+    "min": 0,
+    "max": 1,
+    "step": 0.01,
+    "options": null,
+    "default": "0.50"
+   }
+  ]
+ },
+ "movy": {
+  "hasConfig": false,
+  "usesMovyConfigFile": false,
+  "drum": null,
+  "banks": [
+   {
+    "name": "Main",
+    "global": false,
+    "padSpecific": false
+   },
+   {
+    "name": "Main - 2",
+    "global": false,
+    "padSpecific": false
+   }
+  ],
+  "pages": [
+   {
+    "name": "Main",
+    "envelopeLines": [
+     false,
+     false
+    ],
+    "lfoViz": false,
+    "rows": [
+     [
+      {
+       "shortName": "DRIVE",
+       "fullName": "Drive",
+       "renderStyle": "arc",
+       "type": "float",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "SATURA",
+       "fullName": "Saturation",
+       "renderStyle": "arc",
+       "type": "float",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "BIAS",
+       "fullName": "Bias",
+       "renderStyle": "arc",
+       "type": "float",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "TONE",
+       "fullName": "Tone",
+       "renderStyle": "arc",
+       "type": "float",
+       "displayValue": "..."
+      }
+     ],
+     [
+      {
+       "shortName": "SPEED",
+       "fullName": "Speed",
+       "renderStyle": "arc",
+       "type": "float",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "FLUTTE",
+       "fullName": "Flutter",
+       "renderStyle": "arc",
+       "type": "float",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "CHEW",
+       "fullName": "Chew",
+       "renderStyle": "arc",
+       "type": "float",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "MIX",
+       "fullName": "Mix",
+       "renderStyle": "arc",
+       "type": "float",
+       "displayValue": "..."
+      }
+     ]
+    ]
+   },
+   {
+    "name": "Main - 2",
+    "envelopeLines": [
+     false,
+     false
+    ],
+    "lfoViz": false,
+    "rows": [
+     [
+      {
+       "shortName": "DEGRA",
+       "fullName": "Degrade",
+       "renderStyle": "arc",
+       "type": "float",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "OUTPUT",
+       "fullName": "Output",
+       "renderStyle": "arc",
+       "type": "float",
+       "displayValue": "..."
+      },
+      null,
+      null
+     ],
+     [
+      null,
+      null,
+      null,
+      null
+     ]
+    ]
+   }
+  ],
+  "params": [
+   {
+    "key": "drive",
+    "label": "Drive",
+    "shortLabel": null,
+    "type": "float",
+    "options": null,
+    "min": 0,
+    "max": 1,
+    "step": 0.01,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "float",
+     "perDetent": 0.005,
+     "detentsFullSweep": 200
+    }
+   },
+   {
+    "key": "saturation",
+    "label": "Saturation",
+    "shortLabel": null,
+    "type": "float",
+    "options": null,
+    "min": 0,
+    "max": 1,
+    "step": 0.01,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "float",
+     "perDetent": 0.005,
+     "detentsFullSweep": 200
+    }
+   },
+   {
+    "key": "bias",
+    "label": "Bias",
+    "shortLabel": null,
+    "type": "float",
+    "options": null,
+    "min": 0,
+    "max": 1,
+    "step": 0.01,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "float",
+     "perDetent": 0.005,
+     "detentsFullSweep": 200
+    }
+   },
+   {
+    "key": "tone",
+    "label": "Tone",
+    "shortLabel": null,
+    "type": "float",
+    "options": null,
+    "min": 0,
+    "max": 1,
+    "step": 0.01,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "float",
+     "perDetent": 0.005,
+     "detentsFullSweep": 200
+    }
+   },
+   {
+    "key": "speed",
+    "label": "Speed",
+    "shortLabel": null,
+    "type": "float",
+    "options": null,
+    "min": 0,
+    "max": 1,
+    "step": 0.01,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "float",
+     "perDetent": 0.005,
+     "detentsFullSweep": 200
+    }
+   },
+   {
+    "key": "flutter",
+    "label": "Flutter",
+    "shortLabel": null,
+    "type": "float",
+    "options": null,
+    "min": 0,
+    "max": 1,
+    "step": 0.01,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "float",
+     "perDetent": 0.005,
+     "detentsFullSweep": 200
+    }
+   },
+   {
+    "key": "chew",
+    "label": "Chew",
+    "shortLabel": null,
+    "type": "float",
+    "options": null,
+    "min": 0,
+    "max": 1,
+    "step": 0.01,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "float",
+     "perDetent": 0.005,
+     "detentsFullSweep": 200
+    }
+   },
+   {
+    "key": "mix",
+    "label": "Mix",
+    "shortLabel": null,
+    "type": "float",
+    "options": null,
+    "min": 0,
+    "max": 1,
+    "step": 0.01,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "float",
+     "perDetent": 0.005,
+     "detentsFullSweep": 200
+    }
+   },
+   {
+    "key": "degrade",
+    "label": "Degrade",
+    "shortLabel": null,
+    "type": "float",
+    "options": null,
+    "min": 0,
+    "max": 1,
+    "step": 0.01,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "float",
+     "perDetent": 0.005,
+     "detentsFullSweep": 200
+    }
+   },
+   {
+    "key": "output",
+    "label": "Output",
+    "shortLabel": null,
+    "type": "float",
+    "options": null,
+    "min": 0,
+    "max": 1,
+    "step": 0.01,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "float",
+     "perDetent": 0.005,
+     "detentsFullSweep": 200
+    }
+   },
+   null,
+   null,
+   null,
+   null,
+   null,
+   null
+  ]
+ },
+ "analysis": {
+  "hiddenParams": [],
+  "noMetadata": [],
+  "warnings": []
+ }
+}

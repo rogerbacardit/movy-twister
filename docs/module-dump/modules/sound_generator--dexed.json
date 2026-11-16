@@ -1,0 +1,6641 @@
+{
+ "id": "dexed",
+ "name": "Dexed",
+ "version": "0.5.13",
+ "author": "Dexed/MSFA by google/asb2m10 (port: charlesvestal)",
+ "category": "sound_generator",
+ "status": "ok",
+ "load_ms": 40,
+ "dsp_size": 538792,
+ "capabilities": {
+  "audio_out": true,
+  "audio_in": false,
+  "midi_in": true,
+  "midi_out": false,
+  "aftertouch": true,
+  "chainable": true,
+  "component_type": "sound_generator",
+  "ui_hierarchy": {
+   "levels": {
+    "root": {
+     "name": "Dexed",
+     "params": [
+      {
+       "key": "preset",
+       "label": "Preset",
+       "type": "int",
+       "min": 0,
+       "max": 31,
+       "default": 0
+      },
+      {
+       "key": "output_level",
+       "short_name": "Output",
+       "label": "Output",
+       "type": "int",
+       "min": 0,
+       "max": 100,
+       "default": 50
+      },
+      {
+       "key": "octave_transpose",
+       "label": "Octave",
+       "type": "int",
+       "min": -3,
+       "max": 3,
+       "default": 0
+      },
+      {
+       "key": "algorithm",
+       "short_name": "ALGO",
+       "label": "Algorithm",
+       "type": "int",
+       "min": 1,
+       "max": 32,
+       "default": 1
+      },
+      {
+       "key": "feedback",
+       "label": "Feedback",
+       "type": "int",
+       "min": 0,
+       "max": 7,
+       "default": 0
+      },
+      {
+       "key": "osc_sync",
+       "short_name": "Sync",
+       "label": "Osc Sync",
+       "type": "int",
+       "min": 0,
+       "max": 1,
+       "default": 0
+      },
+      {
+       "key": "transpose",
+       "label": "Transpose",
+       "type": "int",
+       "min": 0,
+       "max": 48,
+       "default": 24
+      },
+      {
+       "key": "lfo_speed",
+       "short_name": "Spd",
+       "label": "LFO Spd",
+       "type": "int",
+       "min": 0,
+       "max": 99,
+       "default": 35
+      },
+      {
+       "key": "lfo_delay",
+       "short_name": "Dly",
+       "label": "LFO Dly",
+       "type": "int",
+       "min": 0,
+       "max": 99,
+       "default": 0
+      },
+      {
+       "key": "lfo_pmd",
+       "short_name": "PMD",
+       "label": "LFO PMD",
+       "type": "int",
+       "min": 0,
+       "max": 99,
+       "default": 0
+      },
+      {
+       "key": "lfo_amd",
+       "short_name": "AMD",
+       "label": "LFO AMD",
+       "type": "int",
+       "min": 0,
+       "max": 99,
+       "default": 0
+      },
+      {
+       "key": "lfo_pms",
+       "short_name": "PMS",
+       "label": "LFO PMS",
+       "type": "int",
+       "min": 0,
+       "max": 7,
+       "default": 0
+      },
+      {
+       "key": "lfo_wave",
+       "short_name": "Wave",
+       "label": "LFO Wave",
+       "type": "int",
+       "min": 0,
+       "max": 5,
+       "default": 0
+      },
+      {
+       "key": "lfo_sync",
+       "short_name": "Sync",
+       "label": "LFO Sync",
+       "type": "int",
+       "min": 0,
+       "max": 1,
+       "default": 0
+      },
+      {
+       "key": "op1_level",
+       "short_name": "Op1",
+       "label": "Op1 Lvl",
+       "type": "int",
+       "min": 0,
+       "max": 99,
+       "default": 0
+      },
+      {
+       "key": "op2_level",
+       "short_name": "Op2",
+       "label": "Op2 Lvl",
+       "type": "int",
+       "min": 0,
+       "max": 99,
+       "default": 0
+      },
+      {
+       "key": "op3_level",
+       "short_name": "Op3",
+       "label": "Op3 Lvl",
+       "type": "int",
+       "min": 0,
+       "max": 99,
+       "default": 0
+      },
+      {
+       "key": "op4_level",
+       "short_name": "Op4",
+       "label": "Op4 Lvl",
+       "type": "int",
+       "min": 0,
+       "max": 99,
+       "default": 0
+      },
+      {
+       "key": "op5_level",
+       "short_name": "Op5",
+       "label": "Op5 Lvl",
+       "type": "int",
+       "min": 0,
+       "max": 99,
+       "default": 0
+      },
+      {
+       "key": "op6_level",
+       "short_name": "Op6",
+       "label": "Op6 Lvl",
+       "type": "int",
+       "min": 0,
+       "max": 99,
+       "default": 0
+      }
+     ],
+     "knobs": [
+      "preset",
+      "output_level",
+      "octave_transpose",
+      "algorithm",
+      "feedback"
+     ]
+    }
+   }
+  }
+ },
+ "presets": {
+  "count": 32,
+  "sample": []
+ },
+ "native": {
+  "hierarchy_levels": [
+   "root",
+   "global",
+   "lfo",
+   "pitch_eg",
+   "operators",
+   "op1",
+   "op1_eg",
+   "op1_kbd",
+   "op2",
+   "op2_eg",
+   "op2_kbd",
+   "op3",
+   "op3_eg",
+   "op3_kbd",
+   "op4",
+   "op4_eg",
+   "op4_kbd",
+   "op5",
+   "op5_eg",
+   "op5_kbd",
+   "op6",
+   "op6_eg",
+   "op6_kbd",
+   "banks"
+  ],
+  "params": [
+   {
+    "key": "preset",
+    "name": "Preset",
+    "type": "int",
+    "min": 0,
+    "max": 31,
+    "step": null,
+    "options": null,
+    "default": "0"
+   },
+   {
+    "key": "output_level",
+    "name": "Output",
+    "type": "int",
+    "min": 0,
+    "max": 100,
+    "step": null,
+    "options": null,
+    "default": "50"
+   },
+   {
+    "key": "octave_transpose",
+    "name": "Octave",
+    "type": "int",
+    "min": -3,
+    "max": 3,
+    "step": null,
+    "options": null,
+    "default": "0"
+   },
+   {
+    "key": "algorithm",
+    "name": "Algorithm",
+    "type": "int",
+    "min": 1,
+    "max": 32,
+    "step": null,
+    "options": null,
+    "default": "32"
+   },
+   {
+    "key": "feedback",
+    "name": "Feedback",
+    "type": "int",
+    "min": 0,
+    "max": 7,
+    "step": null,
+    "options": null,
+    "default": "7"
+   },
+   {
+    "key": "osc_sync",
+    "name": "Osc Sync",
+    "type": "int",
+    "min": 0,
+    "max": 1,
+    "step": null,
+    "options": null,
+    "default": "1"
+   },
+   {
+    "key": "transpose",
+    "name": "Transpose",
+    "type": "int",
+    "min": 0,
+    "max": 48,
+    "step": null,
+    "options": null,
+    "default": "24"
+   },
+   {
+    "key": "lfo_speed",
+    "name": "LFO Spd",
+    "type": "int",
+    "min": 0,
+    "max": 99,
+    "step": null,
+    "options": null,
+    "default": "35"
+   },
+   {
+    "key": "lfo_delay",
+    "name": "LFO Dly",
+    "type": "int",
+    "min": 0,
+    "max": 99,
+    "step": null,
+    "options": null,
+    "default": "0"
+   },
+   {
+    "key": "lfo_pmd",
+    "name": "LFO PMD",
+    "type": "int",
+    "min": 0,
+    "max": 99,
+    "step": null,
+    "options": null,
+    "default": "0"
+   },
+   {
+    "key": "lfo_amd",
+    "name": "LFO AMD",
+    "type": "int",
+    "min": 0,
+    "max": 99,
+    "step": null,
+    "options": null,
+    "default": "0"
+   },
+   {
+    "key": "lfo_pms",
+    "name": "LFO PMS",
+    "type": "int",
+    "min": 0,
+    "max": 7,
+    "step": null,
+    "options": null,
+    "default": "3"
+   },
+   {
+    "key": "lfo_wave",
+    "name": "LFO Wave",
+    "type": "int",
+    "min": 0,
+    "max": 5,
+    "step": null,
+    "options": null,
+    "default": "0"
+   },
+   {
+    "key": "lfo_sync",
+    "name": "LFO Sync",
+    "type": "int",
+    "min": 0,
+    "max": 1,
+    "step": null,
+    "options": null,
+    "default": "1"
+   },
+   {
+    "key": "pitch_eg_r1",
+    "name": "PEG R1",
+    "type": "int",
+    "min": 0,
+    "max": 99,
+    "step": null,
+    "options": null,
+    "default": "99"
+   },
+   {
+    "key": "pitch_eg_r2",
+    "name": "PEG R2",
+    "type": "int",
+    "min": 0,
+    "max": 99,
+    "step": null,
+    "options": null,
+    "default": "99"
+   },
+   {
+    "key": "pitch_eg_r3",
+    "name": "PEG R3",
+    "type": "int",
+    "min": 0,
+    "max": 99,
+    "step": null,
+    "options": null,
+    "default": "99"
+   },
+   {
+    "key": "pitch_eg_r4",
+    "name": "PEG R4",
+    "type": "int",
+    "min": 0,
+    "max": 99,
+    "step": null,
+    "options": null,
+    "default": "99"
+   },
+   {
+    "key": "pitch_eg_l1",
+    "name": "PEG L1",
+    "type": "int",
+    "min": 0,
+    "max": 99,
+    "step": null,
+    "options": null,
+    "default": "50"
+   },
+   {
+    "key": "pitch_eg_l2",
+    "name": "PEG L2",
+    "type": "int",
+    "min": 0,
+    "max": 99,
+    "step": null,
+    "options": null,
+    "default": "50"
+   },
+   {
+    "key": "pitch_eg_l3",
+    "name": "PEG L3",
+    "type": "int",
+    "min": 0,
+    "max": 99,
+    "step": null,
+    "options": null,
+    "default": "50"
+   },
+   {
+    "key": "pitch_eg_l4",
+    "name": "PEG L4",
+    "type": "int",
+    "min": 0,
+    "max": 99,
+    "step": null,
+    "options": null,
+    "default": "50"
+   },
+   {
+    "key": "op1_level",
+    "name": "Op1 Lvl",
+    "type": "int",
+    "min": 0,
+    "max": 99,
+    "step": null,
+    "options": null,
+    "default": "99"
+   },
+   {
+    "key": "op1_coarse",
+    "name": "Op1 Crs",
+    "type": "int",
+    "min": 0,
+    "max": 31,
+    "step": null,
+    "options": null,
+    "default": "1"
+   },
+   {
+    "key": "op1_fine",
+    "name": "Op1 Fin",
+    "type": "int",
+    "min": 0,
+    "max": 99,
+    "step": null,
+    "options": null,
+    "default": "0"
+   },
+   {
+    "key": "op1_detune",
+    "name": "Op1 Det",
+    "type": "int",
+    "min": -7,
+    "max": 7,
+    "step": null,
+    "options": null,
+    "default": "0"
+   },
+   {
+    "key": "op1_osc_mode",
+    "name": "Op1 Mode",
+    "type": "int",
+    "min": 0,
+    "max": 1,
+    "step": null,
+    "options": null,
+    "default": "0"
+   },
+   {
+    "key": "op1_vel_sens",
+    "name": "Op1 Vel",
+    "type": "int",
+    "min": 0,
+    "max": 7,
+    "step": null,
+    "options": null,
+    "default": "0"
+   },
+   {
+    "key": "op1_amp_mod",
+    "name": "Op1 AMS",
+    "type": "int",
+    "min": 0,
+    "max": 3,
+    "step": null,
+    "options": null,
+    "default": "0"
+   },
+   {
+    "key": "op1_rate_scale",
+    "name": "Op1 RS",
+    "type": "int",
+    "min": 0,
+    "max": 7,
+    "step": null,
+    "options": null,
+    "default": "0"
+   },
+   {
+    "key": "op1_eg_r1",
+    "name": "Op1 R1",
+    "type": "int",
+    "min": 0,
+    "max": 99,
+    "step": null,
+    "options": null,
+    "default": "70"
+   },
+   {
+    "key": "op1_eg_r2",
+    "name": "Op1 R2",
+    "type": "int",
+    "min": 0,
+    "max": 99,
+    "step": null,
+    "options": null,
+    "default": "40"
+   },
+   {
+    "key": "op1_eg_r3",
+    "name": "Op1 R3",
+    "type": "int",
+    "min": 0,
+    "max": 99,
+    "step": null,
+    "options": null,
+    "default": "49"
+   },
+   {
+    "key": "op1_eg_r4",
+    "name": "Op1 R4",
+    "type": "int",
+    "min": 0,
+    "max": 99,
+    "step": null,
+    "options": null,
+    "default": "99"
+   },
+   {
+    "key": "op1_eg_l1",
+    "name": "Op1 L1",
+    "type": "int",
+    "min": 0,
+    "max": 99,
+    "step": null,
+    "options": null,
+    "default": "99"
+   },
+   {
+    "key": "op1_eg_l2",
+    "name": "Op1 L2",
+    "type": "int",
+    "min": 0,
+    "max": 99,
+    "step": null,
+    "options": null,
+    "default": "92"
+   },
+   {
+    "key": "op1_eg_l3",
+    "name": "Op1 L3",
+    "type": "int",
+    "min": 0,
+    "max": 99,
+    "step": null,
+    "options": null,
+    "default": "0"
+   },
+   {
+    "key": "op1_eg_l4",
+    "name": "Op1 L4",
+    "type": "int",
+    "min": 0,
+    "max": 99,
+    "step": null,
+    "options": null,
+    "default": "0"
+   },
+   {
+    "key": "op1_key_bp",
+    "name": "Op1 BP",
+    "type": "int",
+    "min": 0,
+    "max": 99,
+    "step": null,
+    "options": null,
+    "default": "0"
+   },
+   {
+    "key": "op1_key_ld",
+    "name": "Op1 LD",
+    "type": "int",
+    "min": 0,
+    "max": 99,
+    "step": null,
+    "options": null,
+    "default": "0"
+   },
+   {
+    "key": "op1_key_rd",
+    "name": "Op1 RD",
+    "type": "int",
+    "min": 0,
+    "max": 99,
+    "step": null,
+    "options": null,
+    "default": "0"
+   },
+   {
+    "key": "op1_key_lc",
+    "name": "Op1 LC",
+    "type": "int",
+    "min": 0,
+    "max": 3,
+    "step": null,
+    "options": null,
+    "default": "0"
+   },
+   {
+    "key": "op1_key_rc",
+    "name": "Op1 RC",
+    "type": "int",
+    "min": 0,
+    "max": 3,
+    "step": null,
+    "options": null,
+    "default": "0"
+   },
+   {
+    "key": "op2_level",
+    "name": "Op2 Lvl",
+    "type": "int",
+    "min": 0,
+    "max": 99,
+    "step": null,
+    "options": null,
+    "default": "99"
+   },
+   {
+    "key": "op2_coarse",
+    "name": "Op2 Crs",
+    "type": "int",
+    "min": 0,
+    "max": 31,
+    "step": null,
+    "options": null,
+    "default": "0"
+   },
+   {
+    "key": "op2_fine",
+    "name": "Op2 Fin",
+    "type": "int",
+    "min": 0,
+    "max": 99,
+    "step": null,
+    "options": null,
+    "default": "0"
+   },
+   {
+    "key": "op2_detune",
+    "name": "Op2 Det",
+    "type": "int",
+    "min": -7,
+    "max": 7,
+    "step": null,
+    "options": null,
+    "default": "0"
+   },
+   {
+    "key": "op2_osc_mode",
+    "name": "Op2 Mode",
+    "type": "int",
+    "min": 0,
+    "max": 1,
+    "step": null,
+    "options": null,
+    "default": "0"
+   },
+   {
+    "key": "op2_vel_sens",
+    "name": "Op2 Vel",
+    "type": "int",
+    "min": 0,
+    "max": 7,
+    "step": null,
+    "options": null,
+    "default": "0"
+   },
+   {
+    "key": "op2_amp_mod",
+    "name": "Op2 AMS",
+    "type": "int",
+    "min": 0,
+    "max": 3,
+    "step": null,
+    "options": null,
+    "default": "0"
+   },
+   {
+    "key": "op2_rate_scale",
+    "name": "Op2 RS",
+    "type": "int",
+    "min": 0,
+    "max": 7,
+    "step": null,
+    "options": null,
+    "default": "0"
+   },
+   {
+    "key": "op2_eg_r1",
+    "name": "Op2 R1",
+    "type": "int",
+    "min": 0,
+    "max": 99,
+    "step": null,
+    "options": null,
+    "default": "25"
+   },
+   {
+    "key": "op2_eg_r2",
+    "name": "Op2 R2",
+    "type": "int",
+    "min": 0,
+    "max": 99,
+    "step": null,
+    "options": null,
+    "default": "64"
+   },
+   {
+    "key": "op2_eg_r3",
+    "name": "Op2 R3",
+    "type": "int",
+    "min": 0,
+    "max": 99,
+    "step": null,
+    "options": null,
+    "default": "49"
+   },
+   {
+    "key": "op2_eg_r4",
+    "name": "Op2 R4",
+    "type": "int",
+    "min": 0,
+    "max": 99,
+    "step": null,
+    "options": null,
+    "default": "99"
+   },
+   {
+    "key": "op2_eg_l1",
+    "name": "Op2 L1",
+    "type": "int",
+    "min": 0,
+    "max": 99,
+    "step": null,
+    "options": null,
+    "default": "50"
+   },
+   {
+    "key": "op2_eg_l2",
+    "name": "Op2 L2",
+    "type": "int",
+    "min": 0,
+    "max": 99,
+    "step": null,
+    "options": null,
+    "default": "99"
+   },
+   {
+    "key": "op2_eg_l3",
+    "name": "Op2 L3",
+    "type": "int",
+    "min": 0,
+    "max": 99,
+    "step": null,
+    "options": null,
+    "default": "0"
+   },
+   {
+    "key": "op2_eg_l4",
+    "name": "Op2 L4",
+    "type": "int",
+    "min": 0,
+    "max": 99,
+    "step": null,
+    "options": null,
+    "default": "0"
+   },
+   {
+    "key": "op2_key_bp",
+    "name": "Op2 BP",
+    "type": "int",
+    "min": 0,
+    "max": 99,
+    "step": null,
+    "options": null,
+    "default": "0"
+   },
+   {
+    "key": "op2_key_ld",
+    "name": "Op2 LD",
+    "type": "int",
+    "min": 0,
+    "max": 99,
+    "step": null,
+    "options": null,
+    "default": "0"
+   },
+   {
+    "key": "op2_key_rd",
+    "name": "Op2 RD",
+    "type": "int",
+    "min": 0,
+    "max": 99,
+    "step": null,
+    "options": null,
+    "default": "0"
+   },
+   {
+    "key": "op2_key_lc",
+    "name": "Op2 LC",
+    "type": "int",
+    "min": 0,
+    "max": 3,
+    "step": null,
+    "options": null,
+    "default": "0"
+   },
+   {
+    "key": "op2_key_rc",
+    "name": "Op2 RC",
+    "type": "int",
+    "min": 0,
+    "max": 3,
+    "step": null,
+    "options": null,
+    "default": "0"
+   },
+   {
+    "key": "op3_level",
+    "name": "Op3 Lvl",
+    "type": "int",
+    "min": 0,
+    "max": 99,
+    "step": null,
+    "options": null,
+    "default": "99"
+   },
+   {
+    "key": "op3_coarse",
+    "name": "Op3 Crs",
+    "type": "int",
+    "min": 0,
+    "max": 31,
+    "step": null,
+    "options": null,
+    "default": "2"
+   },
+   {
+    "key": "op3_fine",
+    "name": "Op3 Fin",
+    "type": "int",
+    "min": 0,
+    "max": 99,
+    "step": null,
+    "options": null,
+    "default": "0"
+   },
+   {
+    "key": "op3_detune",
+    "name": "Op3 Det",
+    "type": "int",
+    "min": -7,
+    "max": 7,
+    "step": null,
+    "options": null,
+    "default": "0"
+   },
+   {
+    "key": "op3_osc_mode",
+    "name": "Op3 Mode",
+    "type": "int",
+    "min": 0,
+    "max": 1,
+    "step": null,
+    "options": null,
+    "default": "0"
+   },
+   {
+    "key": "op3_vel_sens",
+    "name": "Op3 Vel",
+    "type": "int",
+    "min": 0,
+    "max": 7,
+    "step": null,
+    "options": null,
+    "default": "0"
+   },
+   {
+    "key": "op3_amp_mod",
+    "name": "Op3 AMS",
+    "type": "int",
+    "min": 0,
+    "max": 3,
+    "step": null,
+    "options": null,
+    "default": "0"
+   },
+   {
+    "key": "op3_rate_scale",
+    "name": "Op3 RS",
+    "type": "int",
+    "min": 0,
+    "max": 7,
+    "step": null,
+    "options": null,
+    "default": "0"
+   },
+   {
+    "key": "op3_eg_r1",
+    "name": "Op3 R1",
+    "type": "int",
+    "min": 0,
+    "max": 99,
+    "step": null,
+    "options": null,
+    "default": "15"
+   },
+   {
+    "key": "op3_eg_r2",
+    "name": "Op3 R2",
+    "type": "int",
+    "min": 0,
+    "max": 99,
+    "step": null,
+    "options": null,
+    "default": "64"
+   },
+   {
+    "key": "op3_eg_r3",
+    "name": "Op3 R3",
+    "type": "int",
+    "min": 0,
+    "max": 99,
+    "step": null,
+    "options": null,
+    "default": "49"
+   },
+   {
+    "key": "op3_eg_r4",
+    "name": "Op3 R4",
+    "type": "int",
+    "min": 0,
+    "max": 99,
+    "step": null,
+    "options": null,
+    "default": "99"
+   },
+   {
+    "key": "op3_eg_l1",
+    "name": "Op3 L1",
+    "type": "int",
+    "min": 0,
+    "max": 99,
+    "step": null,
+    "options": null,
+    "default": "44"
+   },
+   {
+    "key": "op3_eg_l2",
+    "name": "Op3 L2",
+    "type": "int",
+    "min": 0,
+    "max": 99,
+    "step": null,
+    "options": null,
+    "default": "99"
+   },
+   {
+    "key": "op3_eg_l3",
+    "name": "Op3 L3",
+    "type": "int",
+    "min": 0,
+    "max": 99,
+    "step": null,
+    "options": null,
+    "default": "0"
+   },
+   {
+    "key": "op3_eg_l4",
+    "name": "Op3 L4",
+    "type": "int",
+    "min": 0,
+    "max": 99,
+    "step": null,
+    "options": null,
+    "default": "0"
+   },
+   {
+    "key": "op3_key_bp",
+    "name": "Op3 BP",
+    "type": "int",
+    "min": 0,
+    "max": 99,
+    "step": null,
+    "options": null,
+    "default": "0"
+   },
+   {
+    "key": "op3_key_ld",
+    "name": "Op3 LD",
+    "type": "int",
+    "min": 0,
+    "max": 99,
+    "step": null,
+    "options": null,
+    "default": "0"
+   },
+   {
+    "key": "op3_key_rd",
+    "name": "Op3 RD",
+    "type": "int",
+    "min": 0,
+    "max": 99,
+    "step": null,
+    "options": null,
+    "default": "0"
+   },
+   {
+    "key": "op3_key_lc",
+    "name": "Op3 LC",
+    "type": "int",
+    "min": 0,
+    "max": 3,
+    "step": null,
+    "options": null,
+    "default": "0"
+   },
+   {
+    "key": "op3_key_rc",
+    "name": "Op3 RC",
+    "type": "int",
+    "min": 0,
+    "max": 3,
+    "step": null,
+    "options": null,
+    "default": "0"
+   },
+   {
+    "key": "op4_level",
+    "name": "Op4 Lvl",
+    "type": "int",
+    "min": 0,
+    "max": 99,
+    "step": null,
+    "options": null,
+    "default": "99"
+   },
+   {
+    "key": "op4_coarse",
+    "name": "Op4 Crs",
+    "type": "int",
+    "min": 0,
+    "max": 31,
+    "step": null,
+    "options": null,
+    "default": "0"
+   },
+   {
+    "key": "op4_fine",
+    "name": "Op4 Fin",
+    "type": "int",
+    "min": 0,
+    "max": 99,
+    "step": null,
+    "options": null,
+    "default": "0"
+   },
+   {
+    "key": "op4_detune",
+    "name": "Op4 Det",
+    "type": "int",
+    "min": -7,
+    "max": 7,
+    "step": null,
+    "options": null,
+    "default": "0"
+   },
+   {
+    "key": "op4_osc_mode",
+    "name": "Op4 Mode",
+    "type": "int",
+    "min": 0,
+    "max": 1,
+    "step": null,
+    "options": null,
+    "default": "0"
+   },
+   {
+    "key": "op4_vel_sens",
+    "name": "Op4 Vel",
+    "type": "int",
+    "min": 0,
+    "max": 7,
+    "step": null,
+    "options": null,
+    "default": "0"
+   },
+   {
+    "key": "op4_amp_mod",
+    "name": "Op4 AMS",
+    "type": "int",
+    "min": 0,
+    "max": 3,
+    "step": null,
+    "options": null,
+    "default": "0"
+   },
+   {
+    "key": "op4_rate_scale",
+    "name": "Op4 RS",
+    "type": "int",
+    "min": 0,
+    "max": 7,
+    "step": null,
+    "options": null,
+    "default": "0"
+   },
+   {
+    "key": "op4_eg_r1",
+    "name": "Op4 R1",
+    "type": "int",
+    "min": 0,
+    "max": 99,
+    "step": null,
+    "options": null,
+    "default": "13"
+   },
+   {
+    "key": "op4_eg_r2",
+    "name": "Op4 R2",
+    "type": "int",
+    "min": 0,
+    "max": 99,
+    "step": null,
+    "options": null,
+    "default": "64"
+   },
+   {
+    "key": "op4_eg_r3",
+    "name": "Op4 R3",
+    "type": "int",
+    "min": 0,
+    "max": 99,
+    "step": null,
+    "options": null,
+    "default": "49"
+   },
+   {
+    "key": "op4_eg_r4",
+    "name": "Op4 R4",
+    "type": "int",
+    "min": 0,
+    "max": 99,
+    "step": null,
+    "options": null,
+    "default": "99"
+   },
+   {
+    "key": "op4_eg_l1",
+    "name": "Op4 L1",
+    "type": "int",
+    "min": 0,
+    "max": 99,
+    "step": null,
+    "options": null,
+    "default": "46"
+   },
+   {
+    "key": "op4_eg_l2",
+    "name": "Op4 L2",
+    "type": "int",
+    "min": 0,
+    "max": 99,
+    "step": null,
+    "options": null,
+    "default": "99"
+   },
+   {
+    "key": "op4_eg_l3",
+    "name": "Op4 L3",
+    "type": "int",
+    "min": 0,
+    "max": 99,
+    "step": null,
+    "options": null,
+    "default": "0"
+   },
+   {
+    "key": "op4_eg_l4",
+    "name": "Op4 L4",
+    "type": "int",
+    "min": 0,
+    "max": 99,
+    "step": null,
+    "options": null,
+    "default": "0"
+   },
+   {
+    "key": "op4_key_bp",
+    "name": "Op4 BP",
+    "type": "int",
+    "min": 0,
+    "max": 99,
+    "step": null,
+    "options": null,
+    "default": "0"
+   },
+   {
+    "key": "op4_key_ld",
+    "name": "Op4 LD",
+    "type": "int",
+    "min": 0,
+    "max": 99,
+    "step": null,
+    "options": null,
+    "default": "0"
+   },
+   {
+    "key": "op4_key_rd",
+    "name": "Op4 RD",
+    "type": "int",
+    "min": 0,
+    "max": 99,
+    "step": null,
+    "options": null,
+    "default": "0"
+   },
+   {
+    "key": "op4_key_lc",
+    "name": "Op4 LC",
+    "type": "int",
+    "min": 0,
+    "max": 3,
+    "step": null,
+    "options": null,
+    "default": "0"
+   },
+   {
+    "key": "op4_key_rc",
+    "name": "Op4 RC",
+    "type": "int",
+    "min": 0,
+    "max": 3,
+    "step": null,
+    "options": null,
+    "default": "0"
+   },
+   {
+    "key": "op5_level",
+    "name": "Op5 Lvl",
+    "type": "int",
+    "min": 0,
+    "max": 99,
+    "step": null,
+    "options": null,
+    "default": "99"
+   },
+   {
+    "key": "op5_coarse",
+    "name": "Op5 Crs",
+    "type": "int",
+    "min": 0,
+    "max": 31,
+    "step": null,
+    "options": null,
+    "default": "2"
+   },
+   {
+    "key": "op5_fine",
+    "name": "Op5 Fin",
+    "type": "int",
+    "min": 0,
+    "max": 99,
+    "step": null,
+    "options": null,
+    "default": "0"
+   },
+   {
+    "key": "op5_detune",
+    "name": "Op5 Det",
+    "type": "int",
+    "min": -7,
+    "max": 7,
+    "step": null,
+    "options": null,
+    "default": "0"
+   },
+   {
+    "key": "op5_osc_mode",
+    "name": "Op5 Mode",
+    "type": "int",
+    "min": 0,
+    "max": 1,
+    "step": null,
+    "options": null,
+    "default": "0"
+   },
+   {
+    "key": "op5_vel_sens",
+    "name": "Op5 Vel",
+    "type": "int",
+    "min": 0,
+    "max": 7,
+    "step": null,
+    "options": null,
+    "default": "0"
+   },
+   {
+    "key": "op5_amp_mod",
+    "name": "Op5 AMS",
+    "type": "int",
+    "min": 0,
+    "max": 3,
+    "step": null,
+    "options": null,
+    "default": "0"
+   },
+   {
+    "key": "op5_rate_scale",
+    "name": "Op5 RS",
+    "type": "int",
+    "min": 0,
+    "max": 7,
+    "step": null,
+    "options": null,
+    "default": "0"
+   },
+   {
+    "key": "op5_eg_r1",
+    "name": "Op5 R1",
+    "type": "int",
+    "min": 0,
+    "max": 99,
+    "step": null,
+    "options": null,
+    "default": "10"
+   },
+   {
+    "key": "op5_eg_r2",
+    "name": "Op5 R2",
+    "type": "int",
+    "min": 0,
+    "max": 99,
+    "step": null,
+    "options": null,
+    "default": "64"
+   },
+   {
+    "key": "op5_eg_r3",
+    "name": "Op5 R3",
+    "type": "int",
+    "min": 0,
+    "max": 99,
+    "step": null,
+    "options": null,
+    "default": "49"
+   },
+   {
+    "key": "op5_eg_r4",
+    "name": "Op5 R4",
+    "type": "int",
+    "min": 0,
+    "max": 99,
+    "step": null,
+    "options": null,
+    "default": "99"
+   },
+   {
+    "key": "op5_eg_l1",
+    "name": "Op5 L1",
+    "type": "int",
+    "min": 0,
+    "max": 99,
+    "step": null,
+    "options": null,
+    "default": "46"
+   },
+   {
+    "key": "op5_eg_l2",
+    "name": "Op5 L2",
+    "type": "int",
+    "min": 0,
+    "max": 99,
+    "step": null,
+    "options": null,
+    "default": "99"
+   },
+   {
+    "key": "op5_eg_l3",
+    "name": "Op5 L3",
+    "type": "int",
+    "min": 0,
+    "max": 99,
+    "step": null,
+    "options": null,
+    "default": "0"
+   },
+   {
+    "key": "op5_eg_l4",
+    "name": "Op5 L4",
+    "type": "int",
+    "min": 0,
+    "max": 99,
+    "step": null,
+    "options": null,
+    "default": "0"
+   },
+   {
+    "key": "op5_key_bp",
+    "name": "Op5 BP",
+    "type": "int",
+    "min": 0,
+    "max": 99,
+    "step": null,
+    "options": null,
+    "default": "0"
+   },
+   {
+    "key": "op5_key_ld",
+    "name": "Op5 LD",
+    "type": "int",
+    "min": 0,
+    "max": 99,
+    "step": null,
+    "options": null,
+    "default": "0"
+   },
+   {
+    "key": "op5_key_rd",
+    "name": "Op5 RD",
+    "type": "int",
+    "min": 0,
+    "max": 99,
+    "step": null,
+    "options": null,
+    "default": "0"
+   },
+   {
+    "key": "op5_key_lc",
+    "name": "Op5 LC",
+    "type": "int",
+    "min": 0,
+    "max": 3,
+    "step": null,
+    "options": null,
+    "default": "0"
+   },
+   {
+    "key": "op5_key_rc",
+    "name": "Op5 RC",
+    "type": "int",
+    "min": 0,
+    "max": 3,
+    "step": null,
+    "options": null,
+    "default": "0"
+   },
+   {
+    "key": "op6_level",
+    "name": "Op6 Lvl",
+    "type": "int",
+    "min": 0,
+    "max": 99,
+    "step": null,
+    "options": null,
+    "default": "99"
+   },
+   {
+    "key": "op6_coarse",
+    "name": "Op6 Crs",
+    "type": "int",
+    "min": 0,
+    "max": 31,
+    "step": null,
+    "options": null,
+    "default": "0"
+   },
+   {
+    "key": "op6_fine",
+    "name": "Op6 Fin",
+    "type": "int",
+    "min": 0,
+    "max": 99,
+    "step": null,
+    "options": null,
+    "default": "0"
+   },
+   {
+    "key": "op6_detune",
+    "name": "Op6 Det",
+    "type": "int",
+    "min": -7,
+    "max": 7,
+    "step": null,
+    "options": null,
+    "default": "0"
+   },
+   {
+    "key": "op6_osc_mode",
+    "name": "Op6 Mode",
+    "type": "int",
+    "min": 0,
+    "max": 1,
+    "step": null,
+    "options": null,
+    "default": "0"
+   },
+   {
+    "key": "op6_vel_sens",
+    "name": "Op6 Vel",
+    "type": "int",
+    "min": 0,
+    "max": 7,
+    "step": null,
+    "options": null,
+    "default": "0"
+   },
+   {
+    "key": "op6_amp_mod",
+    "name": "Op6 AMS",
+    "type": "int",
+    "min": 0,
+    "max": 3,
+    "step": null,
+    "options": null,
+    "default": "0"
+   },
+   {
+    "key": "op6_rate_scale",
+    "name": "Op6 RS",
+    "type": "int",
+    "min": 0,
+    "max": 7,
+    "step": null,
+    "options": null,
+    "default": "0"
+   },
+   {
+    "key": "op6_eg_r1",
+    "name": "Op6 R1",
+    "type": "int",
+    "min": 0,
+    "max": 99,
+    "step": null,
+    "options": null,
+    "default": "7"
+   },
+   {
+    "key": "op6_eg_r2",
+    "name": "Op6 R2",
+    "type": "int",
+    "min": 0,
+    "max": 99,
+    "step": null,
+    "options": null,
+    "default": "64"
+   },
+   {
+    "key": "op6_eg_r3",
+    "name": "Op6 R3",
+    "type": "int",
+    "min": 0,
+    "max": 99,
+    "step": null,
+    "options": null,
+    "default": "45"
+   },
+   {
+    "key": "op6_eg_r4",
+    "name": "Op6 R4",
+    "type": "int",
+    "min": 0,
+    "max": 99,
+    "step": null,
+    "options": null,
+    "default": "99"
+   },
+   {
+    "key": "op6_eg_l1",
+    "name": "Op6 L1",
+    "type": "int",
+    "min": 0,
+    "max": 99,
+    "step": null,
+    "options": null,
+    "default": "45"
+   },
+   {
+    "key": "op6_eg_l2",
+    "name": "Op6 L2",
+    "type": "int",
+    "min": 0,
+    "max": 99,
+    "step": null,
+    "options": null,
+    "default": "99"
+   },
+   {
+    "key": "op6_eg_l3",
+    "name": "Op6 L3",
+    "type": "int",
+    "min": 0,
+    "max": 99,
+    "step": null,
+    "options": null,
+    "default": "0"
+   },
+   {
+    "key": "op6_eg_l4",
+    "name": "Op6 L4",
+    "type": "int",
+    "min": 0,
+    "max": 99,
+    "step": null,
+    "options": null,
+    "default": "0"
+   },
+   {
+    "key": "op6_key_bp",
+    "name": "Op6 BP",
+    "type": "int",
+    "min": 0,
+    "max": 99,
+    "step": null,
+    "options": null,
+    "default": "0"
+   },
+   {
+    "key": "op6_key_ld",
+    "name": "Op6 LD",
+    "type": "int",
+    "min": 0,
+    "max": 99,
+    "step": null,
+    "options": null,
+    "default": "0"
+   },
+   {
+    "key": "op6_key_rd",
+    "name": "Op6 RD",
+    "type": "int",
+    "min": 0,
+    "max": 99,
+    "step": null,
+    "options": null,
+    "default": "0"
+   },
+   {
+    "key": "op6_key_lc",
+    "name": "Op6 LC",
+    "type": "int",
+    "min": 0,
+    "max": 3,
+    "step": null,
+    "options": null,
+    "default": "0"
+   },
+   {
+    "key": "op6_key_rc",
+    "name": "Op6 RC",
+    "type": "int",
+    "min": 0,
+    "max": 3,
+    "step": null,
+    "options": null,
+    "default": "0"
+   }
+  ]
+ },
+ "movy": {
+  "hasConfig": false,
+  "usesMovyConfigFile": false,
+  "drum": null,
+  "banks": [
+   {
+    "name": "Main",
+    "global": false,
+    "padSpecific": false
+   },
+   {
+    "name": "Global",
+    "global": false,
+    "padSpecific": false
+   },
+   {
+    "name": "LFO",
+    "global": false,
+    "padSpecific": false
+   },
+   {
+    "name": "Pitch EG",
+    "global": false,
+    "padSpecific": false
+   },
+   {
+    "name": "Operators",
+    "global": false,
+    "padSpecific": false
+   },
+   {
+    "name": "Operat/Operator 1",
+    "global": false,
+    "padSpecific": false
+   },
+   {
+    "name": "Operat/Operator 1 - 2",
+    "global": false,
+    "padSpecific": false
+   },
+   {
+    "name": "Oper1/Envelope",
+    "global": false,
+    "padSpecific": false
+   },
+   {
+    "name": "Oper1/Kbd Scaling",
+    "global": false,
+    "padSpecific": false
+   },
+   {
+    "name": "Operat/Operator 2",
+    "global": false,
+    "padSpecific": false
+   },
+   {
+    "name": "Operat/Operator 2 - 2",
+    "global": false,
+    "padSpecific": false
+   },
+   {
+    "name": "Oper2/Envelope",
+    "global": false,
+    "padSpecific": false
+   },
+   {
+    "name": "Oper2/Kbd Scaling",
+    "global": false,
+    "padSpecific": false
+   },
+   {
+    "name": "Operat/Operator 3",
+    "global": false,
+    "padSpecific": false
+   },
+   {
+    "name": "Operat/Operator 3 - 2",
+    "global": false,
+    "padSpecific": false
+   },
+   {
+    "name": "Oper3/Envelope",
+    "global": false,
+    "padSpecific": false
+   },
+   {
+    "name": "Oper3/Kbd Scaling",
+    "global": false,
+    "padSpecific": false
+   },
+   {
+    "name": "Operat/Operator 4",
+    "global": false,
+    "padSpecific": false
+   },
+   {
+    "name": "Operat/Operator 4 - 2",
+    "global": false,
+    "padSpecific": false
+   },
+   {
+    "name": "Oper4/Envelope",
+    "global": false,
+    "padSpecific": false
+   },
+   {
+    "name": "Oper4/Kbd Scaling",
+    "global": false,
+    "padSpecific": false
+   },
+   {
+    "name": "Operat/Operator 5",
+    "global": false,
+    "padSpecific": false
+   },
+   {
+    "name": "Operat/Operator 5 - 2",
+    "global": false,
+    "padSpecific": false
+   },
+   {
+    "name": "Oper5/Envelope",
+    "global": false,
+    "padSpecific": false
+   },
+   {
+    "name": "Oper5/Kbd Scaling",
+    "global": false,
+    "padSpecific": false
+   },
+   {
+    "name": "Operat/Operator 6",
+    "global": false,
+    "padSpecific": false
+   },
+   {
+    "name": "Operat/Operator 6 - 2",
+    "global": false,
+    "padSpecific": false
+   },
+   {
+    "name": "Oper6/Envelope",
+    "global": false,
+    "padSpecific": false
+   },
+   {
+    "name": "Oper6/Kbd Scaling",
+    "global": false,
+    "padSpecific": false
+   }
+  ],
+  "pages": [
+   {
+    "name": "Main",
+    "envelopeLines": [
+     false,
+     false
+    ],
+    "lfoViz": false,
+    "rows": [
+     [
+      {
+       "shortName": "SYX",
+       "fullName": "SYX Banks",
+       "renderStyle": "items",
+       "type": "enum",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "PRESET",
+       "fullName": "Preset",
+       "renderStyle": "preset",
+       "type": "enum",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "OUTPUT",
+       "fullName": "Output",
+       "renderStyle": "vbar",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "OCTAVE",
+       "fullName": "Octave",
+       "renderStyle": "steps",
+       "type": "int",
+       "displayValue": "..."
+      }
+     ],
+     [
+      {
+       "shortName": "FEEDB",
+       "fullName": "Feedback",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "SPD",
+       "fullName": "LFO Spd",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "PMD",
+       "fullName": "LFO PMD",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "AMD",
+       "fullName": "LFO AMD",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      }
+     ]
+    ]
+   },
+   {
+    "name": "Global",
+    "envelopeLines": [
+     false,
+     false
+    ],
+    "lfoViz": false,
+    "rows": [
+     [
+      {
+       "shortName": "OUTPUT",
+       "fullName": "Output",
+       "renderStyle": "vbar",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "OCTAVE",
+       "fullName": "Octave",
+       "renderStyle": "steps",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "ALGORI",
+       "fullName": "Algorithm",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "FEEDB",
+       "fullName": "Feedback",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      }
+     ],
+     [
+      {
+       "shortName": "OSC",
+       "fullName": "Osc Sync",
+       "renderStyle": "switch",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "TRANSP",
+       "fullName": "Transpose",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      null,
+      null
+     ]
+    ]
+   },
+   {
+    "name": "LFO",
+    "envelopeLines": [
+     false,
+     false
+    ],
+    "lfoViz": false,
+    "rows": [
+     [
+      {
+       "shortName": "SPD",
+       "fullName": "LFO Spd",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "DLY",
+       "fullName": "LFO Dly",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "PMD",
+       "fullName": "LFO PMD",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "AMD",
+       "fullName": "LFO AMD",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      }
+     ],
+     [
+      {
+       "shortName": "PMS",
+       "fullName": "LFO PMS",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "WAVE",
+       "fullName": "LFO Wave",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "SYNC",
+       "fullName": "LFO Sync",
+       "renderStyle": "switch",
+       "type": "int",
+       "displayValue": "..."
+      },
+      null
+     ]
+    ]
+   },
+   {
+    "name": "Pitch EG",
+    "envelopeLines": [
+     false,
+     false
+    ],
+    "lfoViz": false,
+    "rows": [
+     [
+      {
+       "shortName": "PEG R1",
+       "fullName": "PEG R1",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "PEGR2",
+       "fullName": "PEG R2",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "PEGR3",
+       "fullName": "PEG R3",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "PEGR4",
+       "fullName": "PEG R4",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      }
+     ],
+     [
+      {
+       "shortName": "PEG L1",
+       "fullName": "PEG L1",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "PEGL2",
+       "fullName": "PEG L2",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "PEGL3",
+       "fullName": "PEG L3",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "PEGL4",
+       "fullName": "PEG L4",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      }
+     ]
+    ]
+   },
+   {
+    "name": "Operators",
+    "envelopeLines": [
+     false,
+     false
+    ],
+    "lfoViz": false,
+    "rows": [
+     [
+      {
+       "shortName": "OP1",
+       "fullName": "Op1 Lvl",
+       "renderStyle": "vbar",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "OP2",
+       "fullName": "Op2 Lvl",
+       "renderStyle": "vbar",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "OP3",
+       "fullName": "Op3 Lvl",
+       "renderStyle": "vbar",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "OP4",
+       "fullName": "Op4 Lvl",
+       "renderStyle": "vbar",
+       "type": "int",
+       "displayValue": "..."
+      }
+     ],
+     [
+      {
+       "shortName": "OP5",
+       "fullName": "Op5 Lvl",
+       "renderStyle": "vbar",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "OP6",
+       "fullName": "Op6 Lvl",
+       "renderStyle": "vbar",
+       "type": "int",
+       "displayValue": "..."
+      },
+      null,
+      null
+     ]
+    ]
+   },
+   {
+    "name": "Operat/Operator 1",
+    "envelopeLines": [
+     false,
+     false
+    ],
+    "lfoViz": false,
+    "rows": [
+     [
+      {
+       "shortName": "LVL",
+       "fullName": "Op1 Lvl",
+       "renderStyle": "vbar",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "CRS",
+       "fullName": "Op1 Crs",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "FIN",
+       "fullName": "Op1 Fin",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "DET",
+       "fullName": "Op1 Det",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      }
+     ],
+     [
+      {
+       "shortName": "OP1 R1",
+       "fullName": "Op1 R1",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "OP1 R4",
+       "fullName": "Op1 R4",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "MODE",
+       "fullName": "Op1 Mode",
+       "renderStyle": "switch",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "VEL",
+       "fullName": "Op1 Vel",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      }
+     ]
+    ]
+   },
+   {
+    "name": "Operat/Operator 1 - 2",
+    "envelopeLines": [
+     false,
+     false
+    ],
+    "lfoViz": false,
+    "rows": [
+     [
+      {
+       "shortName": "AMS",
+       "fullName": "Op1 AMS",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "OP1 RS",
+       "fullName": "Op1 RS",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      null,
+      null
+     ],
+     [
+      null,
+      null,
+      null,
+      null
+     ]
+    ]
+   },
+   {
+    "name": "Oper1/Envelope",
+    "envelopeLines": [
+     false,
+     false
+    ],
+    "lfoViz": false,
+    "rows": [
+     [
+      {
+       "shortName": "OP1 R1",
+       "fullName": "Op1 R1",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "OP1 R2",
+       "fullName": "Op1 R2",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "OP1 R3",
+       "fullName": "Op1 R3",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "OP1 R4",
+       "fullName": "Op1 R4",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      }
+     ],
+     [
+      {
+       "shortName": "OP1 L1",
+       "fullName": "Op1 L1",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "OP1 L2",
+       "fullName": "Op1 L2",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "OP1 L3",
+       "fullName": "Op1 L3",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "OP1 L4",
+       "fullName": "Op1 L4",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      }
+     ]
+    ]
+   },
+   {
+    "name": "Oper1/Kbd Scaling",
+    "envelopeLines": [
+     false,
+     false
+    ],
+    "lfoViz": false,
+    "rows": [
+     [
+      {
+       "shortName": "OP1 BP",
+       "fullName": "Op1 BP",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "OP1 LD",
+       "fullName": "Op1 LD",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "OP1 RD",
+       "fullName": "Op1 RD",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "OP1 LC",
+       "fullName": "Op1 LC",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      }
+     ],
+     [
+      {
+       "shortName": "OP1 RC",
+       "fullName": "Op1 RC",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      null,
+      null,
+      null
+     ]
+    ]
+   },
+   {
+    "name": "Operat/Operator 2",
+    "envelopeLines": [
+     false,
+     false
+    ],
+    "lfoViz": false,
+    "rows": [
+     [
+      {
+       "shortName": "LVL",
+       "fullName": "Op2 Lvl",
+       "renderStyle": "vbar",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "CRS",
+       "fullName": "Op2 Crs",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "FIN",
+       "fullName": "Op2 Fin",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "DET",
+       "fullName": "Op2 Det",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      }
+     ],
+     [
+      {
+       "shortName": "OP2 R1",
+       "fullName": "Op2 R1",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "OP2R4",
+       "fullName": "Op2 R4",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "MODE",
+       "fullName": "Op2 Mode",
+       "renderStyle": "switch",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "VEL",
+       "fullName": "Op2 Vel",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      }
+     ]
+    ]
+   },
+   {
+    "name": "Operat/Operator 2 - 2",
+    "envelopeLines": [
+     false,
+     false
+    ],
+    "lfoViz": false,
+    "rows": [
+     [
+      {
+       "shortName": "AMS",
+       "fullName": "Op2 AMS",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "OP2",
+       "fullName": "Op2 RS",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      null,
+      null
+     ],
+     [
+      null,
+      null,
+      null,
+      null
+     ]
+    ]
+   },
+   {
+    "name": "Oper2/Envelope",
+    "envelopeLines": [
+     false,
+     false
+    ],
+    "lfoViz": false,
+    "rows": [
+     [
+      {
+       "shortName": "OP2 R1",
+       "fullName": "Op2 R1",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "OP2R2",
+       "fullName": "Op2 R2",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "OP2R3",
+       "fullName": "Op2 R3",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "OP2R4",
+       "fullName": "Op2 R4",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      }
+     ],
+     [
+      {
+       "shortName": "OP2 L1",
+       "fullName": "Op2 L1",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "OP2L2",
+       "fullName": "Op2 L2",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "OP2L3",
+       "fullName": "Op2 L3",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "OP2L4",
+       "fullName": "Op2 L4",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      }
+     ]
+    ]
+   },
+   {
+    "name": "Oper2/Kbd Scaling",
+    "envelopeLines": [
+     false,
+     false
+    ],
+    "lfoViz": false,
+    "rows": [
+     [
+      {
+       "shortName": "OP2BP",
+       "fullName": "Op2 BP",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "OP2LD",
+       "fullName": "Op2 LD",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "OP2RD",
+       "fullName": "Op2 RD",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "OP2LC",
+       "fullName": "Op2 LC",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      }
+     ],
+     [
+      {
+       "shortName": "OP2RC",
+       "fullName": "Op2 RC",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      null,
+      null,
+      null
+     ]
+    ]
+   },
+   {
+    "name": "Operat/Operator 3",
+    "envelopeLines": [
+     false,
+     false
+    ],
+    "lfoViz": false,
+    "rows": [
+     [
+      {
+       "shortName": "LVL",
+       "fullName": "Op3 Lvl",
+       "renderStyle": "vbar",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "CRS",
+       "fullName": "Op3 Crs",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "FIN",
+       "fullName": "Op3 Fin",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "DET",
+       "fullName": "Op3 Det",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      }
+     ],
+     [
+      {
+       "shortName": "OP3 R1",
+       "fullName": "Op3 R1",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "OP3R4",
+       "fullName": "Op3 R4",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "MODE",
+       "fullName": "Op3 Mode",
+       "renderStyle": "switch",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "VEL",
+       "fullName": "Op3 Vel",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      }
+     ]
+    ]
+   },
+   {
+    "name": "Operat/Operator 3 - 2",
+    "envelopeLines": [
+     false,
+     false
+    ],
+    "lfoViz": false,
+    "rows": [
+     [
+      {
+       "shortName": "AMS",
+       "fullName": "Op3 AMS",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "OP3",
+       "fullName": "Op3 RS",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      null,
+      null
+     ],
+     [
+      null,
+      null,
+      null,
+      null
+     ]
+    ]
+   },
+   {
+    "name": "Oper3/Envelope",
+    "envelopeLines": [
+     false,
+     false
+    ],
+    "lfoViz": false,
+    "rows": [
+     [
+      {
+       "shortName": "OP3 R1",
+       "fullName": "Op3 R1",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "OP3R2",
+       "fullName": "Op3 R2",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "OP3R3",
+       "fullName": "Op3 R3",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "OP3R4",
+       "fullName": "Op3 R4",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      }
+     ],
+     [
+      {
+       "shortName": "OP3 L1",
+       "fullName": "Op3 L1",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "OP3L2",
+       "fullName": "Op3 L2",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "OP3L3",
+       "fullName": "Op3 L3",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "OP3L4",
+       "fullName": "Op3 L4",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      }
+     ]
+    ]
+   },
+   {
+    "name": "Oper3/Kbd Scaling",
+    "envelopeLines": [
+     false,
+     false
+    ],
+    "lfoViz": false,
+    "rows": [
+     [
+      {
+       "shortName": "OP3BP",
+       "fullName": "Op3 BP",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "OP3LD",
+       "fullName": "Op3 LD",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "OP3RD",
+       "fullName": "Op3 RD",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "OP3LC",
+       "fullName": "Op3 LC",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      }
+     ],
+     [
+      {
+       "shortName": "OP3RC",
+       "fullName": "Op3 RC",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      null,
+      null,
+      null
+     ]
+    ]
+   },
+   {
+    "name": "Operat/Operator 4",
+    "envelopeLines": [
+     false,
+     false
+    ],
+    "lfoViz": false,
+    "rows": [
+     [
+      {
+       "shortName": "LVL",
+       "fullName": "Op4 Lvl",
+       "renderStyle": "vbar",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "CRS",
+       "fullName": "Op4 Crs",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "FIN",
+       "fullName": "Op4 Fin",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "DET",
+       "fullName": "Op4 Det",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      }
+     ],
+     [
+      {
+       "shortName": "OP4 R1",
+       "fullName": "Op4 R1",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "OP4R4",
+       "fullName": "Op4 R4",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "MODE",
+       "fullName": "Op4 Mode",
+       "renderStyle": "switch",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "VEL",
+       "fullName": "Op4 Vel",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      }
+     ]
+    ]
+   },
+   {
+    "name": "Operat/Operator 4 - 2",
+    "envelopeLines": [
+     false,
+     false
+    ],
+    "lfoViz": false,
+    "rows": [
+     [
+      {
+       "shortName": "AMS",
+       "fullName": "Op4 AMS",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "OP4",
+       "fullName": "Op4 RS",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      null,
+      null
+     ],
+     [
+      null,
+      null,
+      null,
+      null
+     ]
+    ]
+   },
+   {
+    "name": "Oper4/Envelope",
+    "envelopeLines": [
+     false,
+     false
+    ],
+    "lfoViz": false,
+    "rows": [
+     [
+      {
+       "shortName": "OP4 R1",
+       "fullName": "Op4 R1",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "OP4R2",
+       "fullName": "Op4 R2",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "OP4R3",
+       "fullName": "Op4 R3",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "OP4R4",
+       "fullName": "Op4 R4",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      }
+     ],
+     [
+      {
+       "shortName": "OP4 L1",
+       "fullName": "Op4 L1",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "OP4L2",
+       "fullName": "Op4 L2",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "OP4L3",
+       "fullName": "Op4 L3",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "OP4L4",
+       "fullName": "Op4 L4",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      }
+     ]
+    ]
+   },
+   {
+    "name": "Oper4/Kbd Scaling",
+    "envelopeLines": [
+     false,
+     false
+    ],
+    "lfoViz": false,
+    "rows": [
+     [
+      {
+       "shortName": "OP4BP",
+       "fullName": "Op4 BP",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "OP4LD",
+       "fullName": "Op4 LD",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "OP4RD",
+       "fullName": "Op4 RD",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "OP4LC",
+       "fullName": "Op4 LC",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      }
+     ],
+     [
+      {
+       "shortName": "OP4RC",
+       "fullName": "Op4 RC",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      null,
+      null,
+      null
+     ]
+    ]
+   },
+   {
+    "name": "Operat/Operator 5",
+    "envelopeLines": [
+     false,
+     false
+    ],
+    "lfoViz": false,
+    "rows": [
+     [
+      {
+       "shortName": "LVL",
+       "fullName": "Op5 Lvl",
+       "renderStyle": "vbar",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "CRS",
+       "fullName": "Op5 Crs",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "FIN",
+       "fullName": "Op5 Fin",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "DET",
+       "fullName": "Op5 Det",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      }
+     ],
+     [
+      {
+       "shortName": "OP5 R1",
+       "fullName": "Op5 R1",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "OP5R4",
+       "fullName": "Op5 R4",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "MODE",
+       "fullName": "Op5 Mode",
+       "renderStyle": "switch",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "VEL",
+       "fullName": "Op5 Vel",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      }
+     ]
+    ]
+   },
+   {
+    "name": "Operat/Operator 5 - 2",
+    "envelopeLines": [
+     false,
+     false
+    ],
+    "lfoViz": false,
+    "rows": [
+     [
+      {
+       "shortName": "AMS",
+       "fullName": "Op5 AMS",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "OP5",
+       "fullName": "Op5 RS",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      null,
+      null
+     ],
+     [
+      null,
+      null,
+      null,
+      null
+     ]
+    ]
+   },
+   {
+    "name": "Oper5/Envelope",
+    "envelopeLines": [
+     false,
+     false
+    ],
+    "lfoViz": false,
+    "rows": [
+     [
+      {
+       "shortName": "OP5 R1",
+       "fullName": "Op5 R1",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "OP5R2",
+       "fullName": "Op5 R2",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "OP5R3",
+       "fullName": "Op5 R3",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "OP5R4",
+       "fullName": "Op5 R4",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      }
+     ],
+     [
+      {
+       "shortName": "OP5 L1",
+       "fullName": "Op5 L1",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "OP5L2",
+       "fullName": "Op5 L2",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "OP5L3",
+       "fullName": "Op5 L3",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "OP5L4",
+       "fullName": "Op5 L4",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      }
+     ]
+    ]
+   },
+   {
+    "name": "Oper5/Kbd Scaling",
+    "envelopeLines": [
+     false,
+     false
+    ],
+    "lfoViz": false,
+    "rows": [
+     [
+      {
+       "shortName": "OP5BP",
+       "fullName": "Op5 BP",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "OP5LD",
+       "fullName": "Op5 LD",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "OP5RD",
+       "fullName": "Op5 RD",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "OP5LC",
+       "fullName": "Op5 LC",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      }
+     ],
+     [
+      {
+       "shortName": "OP5RC",
+       "fullName": "Op5 RC",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      null,
+      null,
+      null
+     ]
+    ]
+   },
+   {
+    "name": "Operat/Operator 6",
+    "envelopeLines": [
+     false,
+     false
+    ],
+    "lfoViz": false,
+    "rows": [
+     [
+      {
+       "shortName": "LVL",
+       "fullName": "Op6 Lvl",
+       "renderStyle": "vbar",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "CRS",
+       "fullName": "Op6 Crs",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "FIN",
+       "fullName": "Op6 Fin",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "DET",
+       "fullName": "Op6 Det",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      }
+     ],
+     [
+      {
+       "shortName": "OP6 R1",
+       "fullName": "Op6 R1",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "OP6R4",
+       "fullName": "Op6 R4",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "MODE",
+       "fullName": "Op6 Mode",
+       "renderStyle": "switch",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "VEL",
+       "fullName": "Op6 Vel",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      }
+     ]
+    ]
+   },
+   {
+    "name": "Operat/Operator 6 - 2",
+    "envelopeLines": [
+     false,
+     false
+    ],
+    "lfoViz": false,
+    "rows": [
+     [
+      {
+       "shortName": "AMS",
+       "fullName": "Op6 AMS",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "OP6",
+       "fullName": "Op6 RS",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      null,
+      null
+     ],
+     [
+      null,
+      null,
+      null,
+      null
+     ]
+    ]
+   },
+   {
+    "name": "Oper6/Envelope",
+    "envelopeLines": [
+     false,
+     false
+    ],
+    "lfoViz": false,
+    "rows": [
+     [
+      {
+       "shortName": "OP6 R1",
+       "fullName": "Op6 R1",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "OP6R2",
+       "fullName": "Op6 R2",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "OP6R3",
+       "fullName": "Op6 R3",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "OP6R4",
+       "fullName": "Op6 R4",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      }
+     ],
+     [
+      {
+       "shortName": "OP6 L1",
+       "fullName": "Op6 L1",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "OP6L2",
+       "fullName": "Op6 L2",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "OP6L3",
+       "fullName": "Op6 L3",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "OP6L4",
+       "fullName": "Op6 L4",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      }
+     ]
+    ]
+   },
+   {
+    "name": "Oper6/Kbd Scaling",
+    "envelopeLines": [
+     false,
+     false
+    ],
+    "lfoViz": false,
+    "rows": [
+     [
+      {
+       "shortName": "OP6BP",
+       "fullName": "Op6 BP",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "OP6LD",
+       "fullName": "Op6 LD",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "OP6RD",
+       "fullName": "Op6 RD",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "OP6LC",
+       "fullName": "Op6 LC",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      }
+     ],
+     [
+      {
+       "shortName": "OP6RC",
+       "fullName": "Op6 RC",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      null,
+      null,
+      null
+     ]
+    ]
+   }
+  ],
+  "params": [
+   {
+    "key": "syx_bank_index",
+    "label": "SYX Banks",
+    "shortLabel": null,
+    "type": "enum",
+    "min": 0,
+    "max": 32,
+    "step": 1,
+    "options": [
+     "Dexed_01.syx",
+     "SynprezFM_01.syx",
+     "SynprezFM_02.syx",
+     "SynprezFM_03.syx",
+     "SynprezFM_04.syx",
+     "SynprezFM_05.syx",
+     "SynprezFM_06.syx",
+     "SynprezFM_07.syx",
+     "SynprezFM_08.syx",
+     "SynprezFM_09.syx",
+     "SynprezFM_10.syx",
+     "SynprezFM_11.syx",
+     "SynprezFM_12.syx",
+     "SynprezFM_13.syx",
+     "SynprezFM_14.syx",
+     "SynprezFM_15.syx",
+     "SynprezFM_16.syx",
+     "SynprezFM_17.syx",
+     "SynprezFM_18.syx",
+     "SynprezFM_19.syx",
+     "SynprezFM_20.syx",
+     "SynprezFM_21.syx",
+     "SynprezFM_22.syx",
+     "SynprezFM_23.syx",
+     "SynprezFM_24.syx",
+     "SynprezFM_25.syx",
+     "SynprezFM_26.syx",
+     "SynprezFM_27.syx",
+     "SynprezFM_28.syx",
+     "SynprezFM_29.syx",
+     "SynprezFM_30.syx",
+     "SynprezFM_31.syx",
+     "SynprezFM_32.syx"
+    ],
+    "itemIndices": [
+     0,
+     1,
+     2,
+     3,
+     4,
+     5,
+     6,
+     7,
+     8,
+     9,
+     10,
+     11,
+     12,
+     13,
+     14,
+     15,
+     16,
+     17,
+     18,
+     19,
+     20,
+     21,
+     22,
+     23,
+     24,
+     25,
+     26,
+     27,
+     28,
+     29,
+     30,
+     31,
+     32
+    ],
+    "itemsKey": "syx_bank_list",
+    "renderStyle": "items",
+    "capturesModuleState": true,
+    "automatable": false,
+    "increment": {
+     "kind": "enum",
+     "detentsPerStep": 4,
+     "steps": 33
+    }
+   },
+   {
+    "key": "preset",
+    "label": "Preset",
+    "shortLabel": null,
+    "type": "enum",
+    "min": 0,
+    "max": 31,
+    "step": 1,
+    "options": null,
+    "nameKey": "preset_name",
+    "renderStyle": "preset",
+    "capturesModuleState": true,
+    "automatable": false,
+    "increment": {
+     "kind": "enum",
+     "detentsPerStep": 4,
+     "steps": 32
+    }
+   },
+   {
+    "key": "output_level",
+    "label": "Output",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 100,
+    "step": 1,
+    "renderStyle": "vbar",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 1,
+     "detentsFullSweep": 100
+    }
+   },
+   {
+    "key": "octave_transpose",
+    "label": "Octave",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": -3,
+    "max": 3,
+    "step": 1,
+    "renderStyle": "steps",
+    "signed": true,
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 1,
+     "detentsFullSweep": 6
+    }
+   },
+   {
+    "key": "feedback",
+    "label": "Feedback",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 7,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 14
+    }
+   },
+   {
+    "key": "lfo_speed",
+    "label": "LFO Spd",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 198
+    }
+   },
+   {
+    "key": "lfo_pmd",
+    "label": "LFO PMD",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 198
+    }
+   },
+   {
+    "key": "lfo_amd",
+    "label": "LFO AMD",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 198
+    }
+   },
+   {
+    "key": "output_level",
+    "label": "Output",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 100,
+    "step": 1,
+    "renderStyle": "vbar",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 1,
+     "detentsFullSweep": 100
+    }
+   },
+   {
+    "key": "octave_transpose",
+    "label": "Octave",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": -3,
+    "max": 3,
+    "step": 1,
+    "renderStyle": "steps",
+    "signed": true,
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 1,
+     "detentsFullSweep": 6
+    }
+   },
+   {
+    "key": "algorithm",
+    "label": "Algorithm",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 1,
+    "max": 32,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 62
+    }
+   },
+   {
+    "key": "feedback",
+    "label": "Feedback",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 7,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 14
+    }
+   },
+   {
+    "key": "osc_sync",
+    "label": "Osc Sync",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 1,
+    "step": 1,
+    "renderStyle": "switch",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 1,
+     "detentsFullSweep": 1
+    }
+   },
+   {
+    "key": "transpose",
+    "label": "Transpose",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 48,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 96
+    }
+   },
+   null,
+   null,
+   {
+    "key": "lfo_speed",
+    "label": "LFO Spd",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 198
+    }
+   },
+   {
+    "key": "lfo_delay",
+    "label": "LFO Dly",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 198
+    }
+   },
+   {
+    "key": "lfo_pmd",
+    "label": "LFO PMD",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 198
+    }
+   },
+   {
+    "key": "lfo_amd",
+    "label": "LFO AMD",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 198
+    }
+   },
+   {
+    "key": "lfo_pms",
+    "label": "LFO PMS",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 7,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 14
+    }
+   },
+   {
+    "key": "lfo_wave",
+    "label": "LFO Wave",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 5,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 10
+    }
+   },
+   {
+    "key": "lfo_sync",
+    "label": "LFO Sync",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 1,
+    "step": 1,
+    "renderStyle": "switch",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 1,
+     "detentsFullSweep": 1
+    }
+   },
+   null,
+   {
+    "key": "pitch_eg_r1",
+    "label": "PEG R1",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 198
+    }
+   },
+   {
+    "key": "pitch_eg_r2",
+    "label": "PEG R2",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 198
+    }
+   },
+   {
+    "key": "pitch_eg_r3",
+    "label": "PEG R3",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 198
+    }
+   },
+   {
+    "key": "pitch_eg_r4",
+    "label": "PEG R4",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 198
+    }
+   },
+   {
+    "key": "pitch_eg_l1",
+    "label": "PEG L1",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 198
+    }
+   },
+   {
+    "key": "pitch_eg_l2",
+    "label": "PEG L2",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 198
+    }
+   },
+   {
+    "key": "pitch_eg_l3",
+    "label": "PEG L3",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 198
+    }
+   },
+   {
+    "key": "pitch_eg_l4",
+    "label": "PEG L4",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 198
+    }
+   },
+   {
+    "key": "op1_level",
+    "label": "Op1 Lvl",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "vbar",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 1,
+     "detentsFullSweep": 99
+    }
+   },
+   {
+    "key": "op2_level",
+    "label": "Op2 Lvl",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "vbar",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 1,
+     "detentsFullSweep": 99
+    }
+   },
+   {
+    "key": "op3_level",
+    "label": "Op3 Lvl",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "vbar",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 1,
+     "detentsFullSweep": 99
+    }
+   },
+   {
+    "key": "op4_level",
+    "label": "Op4 Lvl",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "vbar",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 1,
+     "detentsFullSweep": 99
+    }
+   },
+   {
+    "key": "op5_level",
+    "label": "Op5 Lvl",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "vbar",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 1,
+     "detentsFullSweep": 99
+    }
+   },
+   {
+    "key": "op6_level",
+    "label": "Op6 Lvl",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "vbar",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 1,
+     "detentsFullSweep": 99
+    }
+   },
+   null,
+   null,
+   {
+    "key": "op1_level",
+    "label": "Op1 Lvl",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "vbar",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 1,
+     "detentsFullSweep": 99
+    }
+   },
+   {
+    "key": "op1_coarse",
+    "label": "Op1 Crs",
+    "shortLabel": "Crs",
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 31,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 62
+    }
+   },
+   {
+    "key": "op1_fine",
+    "label": "Op1 Fin",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 198
+    }
+   },
+   {
+    "key": "op1_detune",
+    "label": "Op1 Det",
+    "shortLabel": "Det",
+    "type": "int",
+    "options": null,
+    "min": -7,
+    "max": 7,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 28
+    }
+   },
+   {
+    "key": "op1_eg_r1",
+    "label": "Op1 R1",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 198
+    }
+   },
+   {
+    "key": "op1_eg_r4",
+    "label": "Op1 R4",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 198
+    }
+   },
+   {
+    "key": "op1_osc_mode",
+    "label": "Op1 Mode",
+    "shortLabel": "Mode",
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 1,
+    "step": 1,
+    "renderStyle": "switch",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 1,
+     "detentsFullSweep": 1
+    }
+   },
+   {
+    "key": "op1_vel_sens",
+    "label": "Op1 Vel",
+    "shortLabel": "Vel",
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 7,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 14
+    }
+   },
+   {
+    "key": "op1_amp_mod",
+    "label": "Op1 AMS",
+    "shortLabel": "AMS",
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 3,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 6
+    }
+   },
+   {
+    "key": "op1_rate_scale",
+    "label": "Op1 RS",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 7,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 14
+    }
+   },
+   null,
+   null,
+   null,
+   null,
+   null,
+   null,
+   {
+    "key": "op1_eg_r1",
+    "label": "Op1 R1",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 198
+    }
+   },
+   {
+    "key": "op1_eg_r2",
+    "label": "Op1 R2",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 198
+    }
+   },
+   {
+    "key": "op1_eg_r3",
+    "label": "Op1 R3",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 198
+    }
+   },
+   {
+    "key": "op1_eg_r4",
+    "label": "Op1 R4",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 198
+    }
+   },
+   {
+    "key": "op1_eg_l1",
+    "label": "Op1 L1",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 198
+    }
+   },
+   {
+    "key": "op1_eg_l2",
+    "label": "Op1 L2",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 198
+    }
+   },
+   {
+    "key": "op1_eg_l3",
+    "label": "Op1 L3",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 198
+    }
+   },
+   {
+    "key": "op1_eg_l4",
+    "label": "Op1 L4",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 198
+    }
+   },
+   {
+    "key": "op1_key_bp",
+    "label": "Op1 BP",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 198
+    }
+   },
+   {
+    "key": "op1_key_ld",
+    "label": "Op1 LD",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 198
+    }
+   },
+   {
+    "key": "op1_key_rd",
+    "label": "Op1 RD",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 198
+    }
+   },
+   {
+    "key": "op1_key_lc",
+    "label": "Op1 LC",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 3,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 6
+    }
+   },
+   {
+    "key": "op1_key_rc",
+    "label": "Op1 RC",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 3,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 6
+    }
+   },
+   null,
+   null,
+   null,
+   {
+    "key": "op2_level",
+    "label": "Op2 Lvl",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "vbar",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 1,
+     "detentsFullSweep": 99
+    }
+   },
+   {
+    "key": "op2_coarse",
+    "label": "Op2 Crs",
+    "shortLabel": "Crs",
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 31,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 62
+    }
+   },
+   {
+    "key": "op2_fine",
+    "label": "Op2 Fin",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 198
+    }
+   },
+   {
+    "key": "op2_detune",
+    "label": "Op2 Det",
+    "shortLabel": "Det",
+    "type": "int",
+    "options": null,
+    "min": -7,
+    "max": 7,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 28
+    }
+   },
+   {
+    "key": "op2_eg_r1",
+    "label": "Op2 R1",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 198
+    }
+   },
+   {
+    "key": "op2_eg_r4",
+    "label": "Op2 R4",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 198
+    }
+   },
+   {
+    "key": "op2_osc_mode",
+    "label": "Op2 Mode",
+    "shortLabel": "Mode",
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 1,
+    "step": 1,
+    "renderStyle": "switch",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 1,
+     "detentsFullSweep": 1
+    }
+   },
+   {
+    "key": "op2_vel_sens",
+    "label": "Op2 Vel",
+    "shortLabel": "Vel",
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 7,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 14
+    }
+   },
+   {
+    "key": "op2_amp_mod",
+    "label": "Op2 AMS",
+    "shortLabel": "AMS",
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 3,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 6
+    }
+   },
+   {
+    "key": "op2_rate_scale",
+    "label": "Op2 RS",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 7,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 14
+    }
+   },
+   null,
+   null,
+   null,
+   null,
+   null,
+   null,
+   {
+    "key": "op2_eg_r1",
+    "label": "Op2 R1",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 198
+    }
+   },
+   {
+    "key": "op2_eg_r2",
+    "label": "Op2 R2",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 198
+    }
+   },
+   {
+    "key": "op2_eg_r3",
+    "label": "Op2 R3",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 198
+    }
+   },
+   {
+    "key": "op2_eg_r4",
+    "label": "Op2 R4",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 198
+    }
+   },
+   {
+    "key": "op2_eg_l1",
+    "label": "Op2 L1",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 198
+    }
+   },
+   {
+    "key": "op2_eg_l2",
+    "label": "Op2 L2",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 198
+    }
+   },
+   {
+    "key": "op2_eg_l3",
+    "label": "Op2 L3",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 198
+    }
+   },
+   {
+    "key": "op2_eg_l4",
+    "label": "Op2 L4",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 198
+    }
+   },
+   {
+    "key": "op2_key_bp",
+    "label": "Op2 BP",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 198
+    }
+   },
+   {
+    "key": "op2_key_ld",
+    "label": "Op2 LD",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 198
+    }
+   },
+   {
+    "key": "op2_key_rd",
+    "label": "Op2 RD",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 198
+    }
+   },
+   {
+    "key": "op2_key_lc",
+    "label": "Op2 LC",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 3,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 6
+    }
+   },
+   {
+    "key": "op2_key_rc",
+    "label": "Op2 RC",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 3,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 6
+    }
+   },
+   null,
+   null,
+   null,
+   {
+    "key": "op3_level",
+    "label": "Op3 Lvl",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "vbar",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 1,
+     "detentsFullSweep": 99
+    }
+   },
+   {
+    "key": "op3_coarse",
+    "label": "Op3 Crs",
+    "shortLabel": "Crs",
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 31,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 62
+    }
+   },
+   {
+    "key": "op3_fine",
+    "label": "Op3 Fin",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 198
+    }
+   },
+   {
+    "key": "op3_detune",
+    "label": "Op3 Det",
+    "shortLabel": "Det",
+    "type": "int",
+    "options": null,
+    "min": -7,
+    "max": 7,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 28
+    }
+   },
+   {
+    "key": "op3_eg_r1",
+    "label": "Op3 R1",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 198
+    }
+   },
+   {
+    "key": "op3_eg_r4",
+    "label": "Op3 R4",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 198
+    }
+   },
+   {
+    "key": "op3_osc_mode",
+    "label": "Op3 Mode",
+    "shortLabel": "Mode",
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 1,
+    "step": 1,
+    "renderStyle": "switch",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 1,
+     "detentsFullSweep": 1
+    }
+   },
+   {
+    "key": "op3_vel_sens",
+    "label": "Op3 Vel",
+    "shortLabel": "Vel",
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 7,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 14
+    }
+   },
+   {
+    "key": "op3_amp_mod",
+    "label": "Op3 AMS",
+    "shortLabel": "AMS",
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 3,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 6
+    }
+   },
+   {
+    "key": "op3_rate_scale",
+    "label": "Op3 RS",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 7,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 14
+    }
+   },
+   null,
+   null,
+   null,
+   null,
+   null,
+   null,
+   {
+    "key": "op3_eg_r1",
+    "label": "Op3 R1",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 198
+    }
+   },
+   {
+    "key": "op3_eg_r2",
+    "label": "Op3 R2",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 198
+    }
+   },
+   {
+    "key": "op3_eg_r3",
+    "label": "Op3 R3",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 198
+    }
+   },
+   {
+    "key": "op3_eg_r4",
+    "label": "Op3 R4",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 198
+    }
+   },
+   {
+    "key": "op3_eg_l1",
+    "label": "Op3 L1",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 198
+    }
+   },
+   {
+    "key": "op3_eg_l2",
+    "label": "Op3 L2",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 198
+    }
+   },
+   {
+    "key": "op3_eg_l3",
+    "label": "Op3 L3",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 198
+    }
+   },
+   {
+    "key": "op3_eg_l4",
+    "label": "Op3 L4",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 198
+    }
+   },
+   {
+    "key": "op3_key_bp",
+    "label": "Op3 BP",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 198
+    }
+   },
+   {
+    "key": "op3_key_ld",
+    "label": "Op3 LD",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 198
+    }
+   },
+   {
+    "key": "op3_key_rd",
+    "label": "Op3 RD",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 198
+    }
+   },
+   {
+    "key": "op3_key_lc",
+    "label": "Op3 LC",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 3,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 6
+    }
+   },
+   {
+    "key": "op3_key_rc",
+    "label": "Op3 RC",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 3,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 6
+    }
+   },
+   null,
+   null,
+   null,
+   {
+    "key": "op4_level",
+    "label": "Op4 Lvl",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "vbar",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 1,
+     "detentsFullSweep": 99
+    }
+   },
+   {
+    "key": "op4_coarse",
+    "label": "Op4 Crs",
+    "shortLabel": "Crs",
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 31,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 62
+    }
+   },
+   {
+    "key": "op4_fine",
+    "label": "Op4 Fin",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 198
+    }
+   },
+   {
+    "key": "op4_detune",
+    "label": "Op4 Det",
+    "shortLabel": "Det",
+    "type": "int",
+    "options": null,
+    "min": -7,
+    "max": 7,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 28
+    }
+   },
+   {
+    "key": "op4_eg_r1",
+    "label": "Op4 R1",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 198
+    }
+   },
+   {
+    "key": "op4_eg_r4",
+    "label": "Op4 R4",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 198
+    }
+   },
+   {
+    "key": "op4_osc_mode",
+    "label": "Op4 Mode",
+    "shortLabel": "Mode",
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 1,
+    "step": 1,
+    "renderStyle": "switch",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 1,
+     "detentsFullSweep": 1
+    }
+   },
+   {
+    "key": "op4_vel_sens",
+    "label": "Op4 Vel",
+    "shortLabel": "Vel",
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 7,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 14
+    }
+   },
+   {
+    "key": "op4_amp_mod",
+    "label": "Op4 AMS",
+    "shortLabel": "AMS",
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 3,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 6
+    }
+   },
+   {
+    "key": "op4_rate_scale",
+    "label": "Op4 RS",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 7,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 14
+    }
+   },
+   null,
+   null,
+   null,
+   null,
+   null,
+   null,
+   {
+    "key": "op4_eg_r1",
+    "label": "Op4 R1",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 198
+    }
+   },
+   {
+    "key": "op4_eg_r2",
+    "label": "Op4 R2",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 198
+    }
+   },
+   {
+    "key": "op4_eg_r3",
+    "label": "Op4 R3",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 198
+    }
+   },
+   {
+    "key": "op4_eg_r4",
+    "label": "Op4 R4",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 198
+    }
+   },
+   {
+    "key": "op4_eg_l1",
+    "label": "Op4 L1",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 198
+    }
+   },
+   {
+    "key": "op4_eg_l2",
+    "label": "Op4 L2",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 198
+    }
+   },
+   {
+    "key": "op4_eg_l3",
+    "label": "Op4 L3",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 198
+    }
+   },
+   {
+    "key": "op4_eg_l4",
+    "label": "Op4 L4",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 198
+    }
+   },
+   {
+    "key": "op4_key_bp",
+    "label": "Op4 BP",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 198
+    }
+   },
+   {
+    "key": "op4_key_ld",
+    "label": "Op4 LD",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 198
+    }
+   },
+   {
+    "key": "op4_key_rd",
+    "label": "Op4 RD",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 198
+    }
+   },
+   {
+    "key": "op4_key_lc",
+    "label": "Op4 LC",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 3,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 6
+    }
+   },
+   {
+    "key": "op4_key_rc",
+    "label": "Op4 RC",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 3,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 6
+    }
+   },
+   null,
+   null,
+   null,
+   {
+    "key": "op5_level",
+    "label": "Op5 Lvl",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "vbar",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 1,
+     "detentsFullSweep": 99
+    }
+   },
+   {
+    "key": "op5_coarse",
+    "label": "Op5 Crs",
+    "shortLabel": "Crs",
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 31,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 62
+    }
+   },
+   {
+    "key": "op5_fine",
+    "label": "Op5 Fin",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 198
+    }
+   },
+   {
+    "key": "op5_detune",
+    "label": "Op5 Det",
+    "shortLabel": "Det",
+    "type": "int",
+    "options": null,
+    "min": -7,
+    "max": 7,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 28
+    }
+   },
+   {
+    "key": "op5_eg_r1",
+    "label": "Op5 R1",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 198
+    }
+   },
+   {
+    "key": "op5_eg_r4",
+    "label": "Op5 R4",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 198
+    }
+   },
+   {
+    "key": "op5_osc_mode",
+    "label": "Op5 Mode",
+    "shortLabel": "Mode",
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 1,
+    "step": 1,
+    "renderStyle": "switch",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 1,
+     "detentsFullSweep": 1
+    }
+   },
+   {
+    "key": "op5_vel_sens",
+    "label": "Op5 Vel",
+    "shortLabel": "Vel",
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 7,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 14
+    }
+   },
+   {
+    "key": "op5_amp_mod",
+    "label": "Op5 AMS",
+    "shortLabel": "AMS",
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 3,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 6
+    }
+   },
+   {
+    "key": "op5_rate_scale",
+    "label": "Op5 RS",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 7,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 14
+    }
+   },
+   null,
+   null,
+   null,
+   null,
+   null,
+   null,
+   {
+    "key": "op5_eg_r1",
+    "label": "Op5 R1",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 198
+    }
+   },
+   {
+    "key": "op5_eg_r2",
+    "label": "Op5 R2",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 198
+    }
+   },
+   {
+    "key": "op5_eg_r3",
+    "label": "Op5 R3",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 198
+    }
+   },
+   {
+    "key": "op5_eg_r4",
+    "label": "Op5 R4",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 198
+    }
+   },
+   {
+    "key": "op5_eg_l1",
+    "label": "Op5 L1",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 198
+    }
+   },
+   {
+    "key": "op5_eg_l2",
+    "label": "Op5 L2",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 198
+    }
+   },
+   {
+    "key": "op5_eg_l3",
+    "label": "Op5 L3",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 198
+    }
+   },
+   {
+    "key": "op5_eg_l4",
+    "label": "Op5 L4",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 198
+    }
+   },
+   {
+    "key": "op5_key_bp",
+    "label": "Op5 BP",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 198
+    }
+   },
+   {
+    "key": "op5_key_ld",
+    "label": "Op5 LD",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 198
+    }
+   },
+   {
+    "key": "op5_key_rd",
+    "label": "Op5 RD",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 198
+    }
+   },
+   {
+    "key": "op5_key_lc",
+    "label": "Op5 LC",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 3,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 6
+    }
+   },
+   {
+    "key": "op5_key_rc",
+    "label": "Op5 RC",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 3,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 6
+    }
+   },
+   null,
+   null,
+   null,
+   {
+    "key": "op6_level",
+    "label": "Op6 Lvl",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "vbar",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 1,
+     "detentsFullSweep": 99
+    }
+   },
+   {
+    "key": "op6_coarse",
+    "label": "Op6 Crs",
+    "shortLabel": "Crs",
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 31,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 62
+    }
+   },
+   {
+    "key": "op6_fine",
+    "label": "Op6 Fin",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 198
+    }
+   },
+   {
+    "key": "op6_detune",
+    "label": "Op6 Det",
+    "shortLabel": "Det",
+    "type": "int",
+    "options": null,
+    "min": -7,
+    "max": 7,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 28
+    }
+   },
+   {
+    "key": "op6_eg_r1",
+    "label": "Op6 R1",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 198
+    }
+   },
+   {
+    "key": "op6_eg_r4",
+    "label": "Op6 R4",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 198
+    }
+   },
+   {
+    "key": "op6_osc_mode",
+    "label": "Op6 Mode",
+    "shortLabel": "Mode",
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 1,
+    "step": 1,
+    "renderStyle": "switch",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 1,
+     "detentsFullSweep": 1
+    }
+   },
+   {
+    "key": "op6_vel_sens",
+    "label": "Op6 Vel",
+    "shortLabel": "Vel",
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 7,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 14
+    }
+   },
+   {
+    "key": "op6_amp_mod",
+    "label": "Op6 AMS",
+    "shortLabel": "AMS",
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 3,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 6
+    }
+   },
+   {
+    "key": "op6_rate_scale",
+    "label": "Op6 RS",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 7,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 14
+    }
+   },
+   null,
+   null,
+   null,
+   null,
+   null,
+   null,
+   {
+    "key": "op6_eg_r1",
+    "label": "Op6 R1",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 198
+    }
+   },
+   {
+    "key": "op6_eg_r2",
+    "label": "Op6 R2",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 198
+    }
+   },
+   {
+    "key": "op6_eg_r3",
+    "label": "Op6 R3",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 198
+    }
+   },
+   {
+    "key": "op6_eg_r4",
+    "label": "Op6 R4",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 198
+    }
+   },
+   {
+    "key": "op6_eg_l1",
+    "label": "Op6 L1",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 198
+    }
+   },
+   {
+    "key": "op6_eg_l2",
+    "label": "Op6 L2",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 198
+    }
+   },
+   {
+    "key": "op6_eg_l3",
+    "label": "Op6 L3",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 198
+    }
+   },
+   {
+    "key": "op6_eg_l4",
+    "label": "Op6 L4",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 198
+    }
+   },
+   {
+    "key": "op6_key_bp",
+    "label": "Op6 BP",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 198
+    }
+   },
+   {
+    "key": "op6_key_ld",
+    "label": "Op6 LD",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 198
+    }
+   },
+   {
+    "key": "op6_key_rd",
+    "label": "Op6 RD",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 99,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 198
+    }
+   },
+   {
+    "key": "op6_key_lc",
+    "label": "Op6 LC",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 3,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 6
+    }
+   },
+   {
+    "key": "op6_key_rc",
+    "label": "Op6 RC",
+    "shortLabel": null,
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 3,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 6
+    }
+   },
+   null,
+   null,
+   null
+  ]
+ },
+ "analysis": {
+  "hiddenParams": [],
+  "noMetadata": [
+   "syx_bank_index"
+  ],
+  "warnings": [
+   "1 shown params lack chain_params metadata (movy guesses type/range): syx_bank_index"
+  ]
+ }
+}

@@ -1,0 +1,411 @@
+/* browser-test/logic/page-freshness.mjs — SP-19: once movy has moved a
+ * parameter, how soon does the DRAWN page show it?
+ *
+ * Under `page` Schwung draws and Schwung reads: one key a tick, from a cursor
+ * that walks the page and comes back round. movy answers that read from the
+ * epoch cache in front of the port (`src/renderer/schwung-page-cache.ts`),
+ * whose claim is FRESHNESS — a write movy made is visible on the next read of
+ * that key, not whenever the batch next fills. Two writers that reach the page
+ * without going through the page's own input path are asserted here, because
+ * they are the ones the freshness rule exists for:
+ *
+ *   1. an automation lane, which writes every tick while the page is drawn —
+ *      the page must not look frozen while the sound moves;
+ *   2. an undo, which writes the OLD value back after the page drew the new one.
+ *
+ * The second uses a key the model cannot map, deliberately: it removes the
+ * `off`-mode confound, where `syncParamsToModels` could redraw the cell
+ * directly. That is all the key buys. What tells the drain from the fill under
+ * `page` is the ARRIVAL BOUND, not the key being unmapped — the page holds two
+ * keys, so the cursor returns within one rotation, while the batch behind it
+ * is eight ticks away, and a value that arrives inside the rotation was the
+ * write's own, not the fill's copy of it.
+ *
+ * Run by browser-test/logic.mjs.
+ */
+
+import { eq, ok, _log,
+         env, portFor, MOCK_SYNTHS, schwungPageFor, schwungGridReload,
+         createModel, appState, bootModel, settleModel,
+         beginEdit, recordParamOp, endEdit, undoOnce, CLOSE } from './harness.mjs';
+
+export async function run() {
+
+_log('\nlogic: page freshness (SP-19)');
+
+function pageFor16() {
+    schwungGridReload();
+    env.setParams(MOCK_SYNTHS.test16);
+    const p = schwungPageFor(0, 'synth');
+    for (let i = 0; i < 12 * 60 && !p.ready; i++) p.tick();
+    return p;
+}
+
+_log('\nTest: the arc follows an automation lane on every read of that key');
+{
+    /* Eight keys, so the cursor reaches a given key only every 9-10 ticks —
+     * longer than the 8-tick fill, which means an ARRIVAL bound is useless
+     * here: the fill alone puts *a* value in the cell well within a rotation,
+     * so "the value turned up" would pass with the write never drained. What
+     * tells the two apart is which value the read saw, because the lane writes
+     * a DISTINCT value every tick and the fill's copy is already several ticks
+     * behind the lane. */
+    const p = pageFor16();
+    ok('the page resolved', p.ready);
+    eq('eight keys, so one rotation is longer than the fill',
+       p.ctl.page.keys.length, 8);
+
+    const key = p.ctl.page.keys[0];
+    const port = portFor(0);
+    let reads = 0, stale = 0, latest = '';
+
+    for (let t = 0; t < 40; t++) {
+        latest = (0.02 + (t % 40) * 0.02).toFixed(3);
+        port.setParam('synth:' + key, latest);   // exactly what a lane does
+        const before = p.ctl.state.values[key];
+        p.tick();
+        const after = p.ctl.state.values[key];
+        if (after === before) continue;          // this tick was another key's stop
+        reads++;
+        if (after !== latest) stale++;
+    }
+    _log(`    (${reads} reads of the lane's key, ${stale} of them behind the lane)`);
+    ok('the cursor came round at least three times', reads >= 3);
+    eq('and every one of them saw the value the lane had just written', stale, 0);
+
+    /* The arcer reads the same `state.values`, so this is the level the knob is
+     * drawn from — the page's own arc, not a second opinion about it. */
+    for (let i = 0; i < 20 && p.ctl.state.values[key] !== latest; i++) p.tick();
+    eq('the drawn arc wears the lane’s last value', p.knobLevels()[0], Number(latest));
+
+    schwungGridReload();
+    env.setParams(MOCK_SYNTHS.test16);
+}
+
+_log('\nTest: an undo redraws a page whose key the model cannot map');
+{
+    /* The model boots on ONE declaration; the page is planned from ANOTHER.
+     * That is the `page` divergence in its pure form — the plan is the
+     * module's, and the model's own knobs can be a different set — and it is
+     * why the page has to see the undo itself — no model mirror stands in for
+     * it. */
+    schwungGridReload();
+    appState.activeTrack.index = 0;
+    env.setParams(MOCK_SYNTHS.test16);
+    const m = createModel(portFor(0), 'synth');
+    m.reload(); m.tick(); m.tick(); for (let i = 0; i < 20; i++) m.tick();
+    appState.trackModels[0] = [m];
+
+    env.setParams({ ...MOCK_SYNTHS.test16,
+        'synth:ui_hierarchy':
+            JSON.stringify({ levels: { root: { name: 'Main', knobs: ['q1', 'q2'] } } }),
+        'synth:q1': '0.10', 'synth:q2': '0.20' });
+    schwungGridReload();
+    const p = schwungPageFor(0, 'synth');
+    for (let i = 0; i < 12 * 60 && !p.ready; i++) p.tick();
+    ok('the page resolved', p.ready);
+    eq('the plan is the declaration the module published',
+       p.ctl.page.keys.join(','), 'q1,q2');
+
+    const IO = 'q1', KEY = 'synth:' + IO;
+    const port = portFor(0);
+    /* One key a tick, plus the page-name stop: two keys is a rotation of three,
+     * which is what makes this page able to tell the drain from the fill — the
+     * fill is eight ticks away. */
+    const ROT = p.ctl.page.keys.length + 1;
+    const delays = [];
+    let missed = 0, lo = '';
+
+    for (let round = 0; round < 6; round++) {
+        const hi = (0.30 + round * 0.05).toFixed(3);
+        lo = (0.05 + round * 0.05).toFixed(3);
+        port.setParam(KEY, hi);
+        beginEdit({ key: 'knob:0:' + IO, verb: 'K', close: CLOSE.TOUCH_RELEASE });
+        recordParamOp(0, KEY, lo, hi);
+        endEdit();
+        for (let i = 0; i < 30 && p.ctl.state.values[IO] !== hi; i++) p.tick();
+        if (p.ctl.state.values[IO] !== hi) missed++;
+
+        undoOnce();
+        let at = -1;
+        for (let i = 1; i <= 30; i++) { p.tick(); if (p.ctl.state.values[IO] === lo) { at = i; break; } }
+        delays.push(at);
+    }
+    _log(`    (undo reached the drawn value after ${delays.join(', ')} ticks; one rotation is ${ROT})`);
+    eq('the page drew the edited value before each undo', missed, 0);
+    eq('and no undo waited for anything but the cursor coming round',
+       delays.filter((d) => d <= 0 || d > ROT + 1).length, 0);
+    eq('the drawn arc wears the undone value', p.knobLevels()[0], Number(lo));
+
+    appState.trackModels[0] = [];
+    schwungGridReload();
+    env.setParams(MOCK_SYNTHS.test16);
+}
+
+_log('\nTest: SP-38 — the repaint decision while a widget is moving');
+{
+    /* WHY test_enum AND NOT test16. Only TWO widgets ever feed the animation
+     * store — the enum square's frame and the waveform morph — so a page of
+     * eight floats never touches it, `settled` is trivially true, and a test
+     * built on test16 would PASS WITH THE FIX REMOVED. test_enum's knob 0 is
+     * `mode`, a four-option enum, so a render of that page stamps a real entry.
+     * That choice is the difference between this block and a tautology. */
+    const { pageOwnerOf } = await import('../../dist/esm/app/page-owner.js');
+    const { pollDrawnPage } = await import('../../dist/esm/app/page-poll.js');
+
+    schwungGridReload();
+    appState.activeTrack.index = 0;
+    env.setParams(MOCK_SYNTHS.test_enum);
+    const m = settleModel(bootModel(MOCK_SYNTHS.test_enum));
+    appState.trackModels[0] = [m];
+    const owner = pageOwnerOf(m);
+
+    /* Driven through the SAME entry the tick uses, so this also exercises
+     * SP-12's poll half where it lives rather than beside it. */
+    for (let i = 0; i < 12 * 60 && !owner.page; i++) pollDrawnPage(owner);
+    ok('the enum page delegated to Schwung', !!owner.page);
+    const p = owner.page;
+
+    /* Is the page quiet for `n` consecutive ticks? Consecutive rather than
+     * once-in-n, because every assertion below turns on the SAME call site
+     * answering the same way twice running. */
+    const stable = (n) => {
+        for (let i = 0; i < n; i++) if (pollDrawnPage(owner)) return false;
+        return true;
+    };
+
+    /* (1) A STILL PAGE, before anything has been drawn: nothing has moved and
+     * the store is empty, so the answer is `false` — once the page has finished
+     * ARRIVING. The read cursor serves one key a tick, so the values are still
+     * landing for the first few dozen ticks. Poll until the decision has been
+     * quiet three ticks running and require that it got there, which is what
+     * makes this an assertion rather than a loop that always ends. */
+    let quiet = false;
+    for (let i = 0; i < 300 && !quiet; i += 3) quiet = stable(3);
+    ok('a still page asks for no frame', quiet);
+
+    /* (2) A RENDER FEEDS THE STORE. Without this the rest of the block would be
+     * testing movy's own book-keeping rather than the renderer's. */
+    p.render('ENUMS');
+    const anim = p.ctl.state.anim;
+    /* The two keys below are FIRST SIGHTINGS — `observe` stamps those already
+     * past, which is why (3) can assert on their age. What is being claimed here
+     * is only that the render is what put them there: the store is the
+     * RENDERER'S, and movy only ever asks it. */
+    ok('the render fed the store: [' + [...anim.since.keys()].join(',') + ']',
+       anim.since.size > 0);
+
+    /* (3) AN ARRIVAL IS NOT A CHANGE, which is `observe`'s rule and the reason
+     * a page does not animate itself in from values nobody set: a first
+     * sighting is stamped ALREADY PAST (`now - durationMs`), never at `now`.
+     * Asserted on the stamp rather than by waiting for it to age out — the
+     * window is wall clock, and waiting on 120 ms of it is a race, not a check. */
+    ok('nothing is stamped at the instant of arrival',
+       [...anim.since.values()].every((t) => Date.now() - t > 0));
+
+    /* (4) THE TEETH, AS AN A/B ON ONE FIELD. The control and the assertion are
+     * the same page, the same values, the same identity and the same call site;
+     * the only difference is that every store entry is placed at NOW instead of
+     * in the past. That field IS what `settled` reads and the only thing it
+     * reads, so the middle line below is the `!moved` term in `pollDrawnPage`
+     * and nothing else. Remove that term and it is the one that reddens while
+     * the two around it stay green — which is what makes it evidence.
+     *
+     * The stamps are PLACED rather than slept on because the elapsed time is
+     * `anim_state`'s own semantics, which movy does not implement: what is
+     * under test is the decision, not the clock that feeds it. */
+    const keys = [...anim.since.keys()];
+    const stampAt = (t) => { for (const k of keys) anim.since.set(k, t); };
+    stampAt(Date.now() - 10_000);
+    ok('control: quiet with every transition in the past', stable(3));
+    stampAt(Date.now());
+    eq('a page mid-transition asks for a frame', pollDrawnPage(owner), true);
+    stampAt(Date.now() - 10_000);
+    eq('and goes quiet again the moment they finish', pollDrawnPage(owner), false);
+
+    /* (5) THE TRIGGER BANG, which is time-driven the same way and has no value
+     * change to announce it. `triggerFiredAt` is the controller's own map and
+     * the predicate is key-agnostic — `buttonPhase` is asked about the STAMPS,
+     * not about what the cell is — so any key exercises it. The duration is
+     * asked of `buttonPhase` too, never restated here as 300 ms. */
+    const firedAt = p.ctl.triggerFiredAt;
+    firedAt.bang = [Date.now()];
+    eq('a trigger bang asks for a frame', pollDrawnPage(owner), true);
+    firedAt.bang = [Date.now() - 1000];
+    ok('and stops once the bang has drawn out', stable(3));
+    delete firedAt.bang;
+
+    /* (6) A CELL'S MARK FLIPPING IS A CHANGE. Clear + knob frees a lane; the
+     * controller learns it on its read rotation, a few ticks later, and by then
+     * the frame the gesture bought is already drawn — so the dot stayed until
+     * something else moved. The flag is placed on the controller's own cache,
+     * the thing the renderer draws from, so this is the decision alone. */
+    const k0 = p.keyAt(0);
+    const st = p.ctl.state;
+    /* The read cursor rewrites these caches on its own rotation, so each flip
+     * is put back to what the cursor holds before the next assertion — never
+     * toggled blind, or the cursor's correction lands as a second change. */
+    const flip = (cache, label) => {
+        const was = !!cache[k0];
+        ok('control: quiet before the ' + label + ' flips', stable(3));
+        cache[k0] = !was;
+        eq('a ' + label + ' flipping asks for a frame', pollDrawnPage(owner), true);
+        cache[k0] = was;
+        pollDrawnPage(owner);
+    };
+    flip(st.modCache, 'mod mark');
+    if (st.autoCache) flip(st.autoCache, 'lane mark');
+
+    appState.trackModels[0] = [];
+    schwungGridReload();
+    env.setParams(MOCK_SYNTHS.test16);
+}
+
+_log('\nTest: SP-48 — a stream is capped, a transition never is');
+{
+    /* Unit level: `repaintCap` alone, no schwung/model/device — the cheapest
+     * level that reproduces this bug (a synchronous state machine over the
+     * store's two bits and one clock), so it runs unconditionally. */
+    const { createRepaintCap, REPAINT_CAP_MS } =
+        await import('../../dist/esm/app/repaint-cap.js');
+    const MOVING = { moving: true, streaming: false };
+    const STREAM = { moving: false, streaming: true };
+    const BOTH = { moving: true, streaming: true };
+    const STILL = { moving: false, streaming: false };
+
+    const cap = createRepaintCap(REPAINT_CAP_MS);
+    const c = REPAINT_CAP_MS;
+
+    /* A transition draws every tick, however long it has been going — the
+     * cap is never allowed near SP-38's frames. */
+    eq('a transition asks every tick', [0, 1, 2, c * 10].map((t) => cap(MOVING, t)).every(Boolean), true);
+    eq('and still does while a stream runs beside it', cap(BOTH, c * 10 + 1), true);
+    eq('a still page asks nothing', cap(STILL, c * 10 + 2), false);
+
+    /* A stream: bounded, not continuous. Three independent windows, so a fix
+     * that only throttles the FIRST one (an off-by-one in the reset) still
+     * shows up. THE TEETH: replacing the body with `return a.moving ||
+     * a.streaming` (the uncapped predicate) turns every `false` below true. */
+    const t0 = c * 100;
+    eq('a stream asks once', cap(STREAM, t0), true);
+    eq('and not again inside the window', cap(STREAM, t0 + 1), false);
+    eq('a fresh window asks again', cap(STREAM, t0 + c), true);
+    eq('inside that window is refused', cap(STREAM, t0 + c + 1), false);
+    eq('a third window asks again', cap(STREAM, t0 + 2 * c), true);
+    eq('inside the third is refused too', cap(STREAM, t0 + 2 * c + 1), false);
+}
+
+_log('\nTest: a module-drawn page is redrawn at the canvas frame rate');
+{
+    /* Pixel Walkers: an `as_page` canvas animates off `nowMs` alone, so with
+     * nothing moving in the store it got one frame and froze. THE TEETH:
+     * dropping the `a.canvas` branch turns every `true` below false. */
+    const { createRepaintCap, REPAINT_CAP_MS, CANVAS_FRAME_MS: f } =
+        await import('../../dist/esm/app/repaint-cap.js');
+    const CANVAS = { moving: false, streaming: false, canvas: true };
+    const cap = createRepaintCap(REPAINT_CAP_MS, f);
+    ok('the canvas rate is a real frame rate, faster than a stream', f > 0 && f < REPAINT_CAP_MS);
+    const t0 = 1e6;
+    eq('a canvas page asks with nothing moving', cap(CANVAS, t0), true);
+    eq('...not again inside one frame', cap(CANVAS, t0 + 1), false);
+    eq('...and again every frame after', [1, 2, 3, 4].map((n) => cap(CANVAS, t0 + n * f)).every(Boolean), true);
+    eq('a stream on a canvas page rides the canvas frames', cap({ ...CANVAS, streaming: true }, t0 + 4 * f + 1), false);
+}
+
+{
+    /* Integration level: proves `pollDrawnPage` actually calls the cap — that
+     * a regression in the WIRING (someone reads `page.animating()` as a
+     * boolean again, which an object always satisfies) is caught even though
+     * the unit test above still passes. */
+    const { pageOwnerOf } = await import('../../dist/esm/app/page-owner.js');
+    const { pollDrawnPage } = await import('../../dist/esm/app/page-poll.js');
+    const { createRepaintCap, REPAINT_CAP_MS } =
+        await import('../../dist/esm/app/repaint-cap.js');
+
+    schwungGridReload();
+    appState.activeTrack.index = 0;
+    env.setParams(MOCK_SYNTHS.test_enum);
+    const m = settleModel(bootModel(MOCK_SYNTHS.test_enum));
+    appState.trackModels[0] = [m];
+    const owner = pageOwnerOf(m);
+    for (let i = 0; i < 12 * 60 && !owner.page; i++) pollDrawnPage(owner);
+    ok('the enum page delegated to Schwung (integration fixture)', !!owner.page);
+
+    /* Stub the store's answer — the real anim_state timing is Schwung's own
+     * `test_anim_activity.sh` — so this block isolates the wiring. */
+    const STREAM = { moving: false, streaming: true };
+    owner.page.animating = () => STREAM;
+
+    const c = REPAINT_CAP_MS, t0 = Date.now() + 1e7;   // after every real stamp earlier suites left
+    const ts = [t0, t0 + 1, t0 + c, t0 + c + 1, t0 + 2 * c, t0 + 3 * c, t0 + 3 * c + 1];
+    const expect = createRepaintCap(c);
+    let allMatch = true, any = 0;
+    for (const t of ts) {
+        const want = expect(STREAM, t);
+        const got = pollDrawnPage(owner, () => t);
+        if (got !== want) allMatch = false;
+        if (got) any++;
+    }
+    ok('pollDrawnPage matches repaintCap one-for-one through the real call site',
+       allMatch && any > 0 && any < ts.length);
+
+    appState.trackModels[0] = [];
+    schwungGridReload();
+    env.setParams(MOCK_SYNTHS.test16);
+}
+
+
+/* ── SP-57 H5: the enum peek asks for its own frames ──────────────────────── */
+
+_log('\nTest: the option list a turn raises moves the repaint decision');
+{
+    const { pageOwnerOf } = await import('../../dist/esm/app/page-owner.js');
+    const { pollDrawnPage } = await import('../../dist/esm/app/page-poll.js');
+
+    schwungGridReload();
+    appState.activeTrack.index = 0;
+    /* test_enum, not test16: knob 0 is a four-option enum, and an enum is the
+     * only thing that raises a peek at all. */
+    env.setParams(MOCK_SYNTHS.test_enum);
+    const m = settleModel(bootModel(MOCK_SYNTHS.test_enum));
+    appState.trackModels[0] = [m];
+    const owner = pageOwnerOf(m);
+    for (let i = 0; i < 12 * 60 && !owner.page; i++) pollDrawnPage(owner);
+    ok('the enum page delegated to Schwung', !!owner.page);
+
+    const p = owner.page;
+    const stable = (n) => { for (let i = 0; i < n; i++) if (pollDrawnPage(owner)) return false; return true; };
+
+    /* THE ISOLATION IS THE POINT. A turn normally moves a knob level too, so
+     * `pollDrawnPage` would answer true whether the peek counted or not. Walk
+     * to the LAST option first: from there a clockwise turn clamps — the value
+     * cannot move — while the peek is raised all the same, so the only thing
+     * left that can move the answer is the overlay. */
+    p.knobTouch(0, true);
+    for (let i = 0; i < 40; i++) { p.knobTurn(0, 1); pollDrawnPage(owner); }
+    let quiet = false;
+    for (let i = 0; i < 12 * 60 && !(quiet = stable(3)); i++) pollDrawnPage(owner);
+    ok('the page went quiet at the last option', quiet);
+
+    /* The walk above LEFT A PEEK UP — its 1500 ms clock does not elapse inside a
+     * test loop — so take it down and consume that edge first, or the "going
+     * up" assertion below has no edge to see and fails for the wrong reason.
+     * `dismissPeek` is the controller's own public way down, which also keeps
+     * both edges off the wall clock. */
+    p.ctl.dismissPeek();
+    pollDrawnPage(owner);
+    ok('quiet again with the list down', stable(2));
+
+    p.knobTurn(0, 1);
+    ok('a peek going up asks for a frame', pollDrawnPage(owner) === true);
+    ok('a peek that stays up asks for nothing', stable(2));
+
+    p.ctl.dismissPeek();
+    ok('a peek coming down asks for a frame', pollDrawnPage(owner) === true);
+    p.knobTouch(0, false);
+
+    appState.trackModels[0] = [];
+    schwungGridReload();
+    env.setParams(MOCK_SYNTHS.test16);
+}
+}

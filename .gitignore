@@ -1,0 +1,24 @@
+node_modules/
+# ...and the same name as a symlink: "node_modules/" matches directories
+# only, so a symlink slipped past it and got committed once.
+node_modules
+dist/
+# Root only. A bare `ui.js` also swallowed scripts/dump-tool/ui.js — the module
+# collector's SOURCE, not a build artifact — so that tool was never committed.
+/ui.js
+browser-test/screenshots/actual/
+*.js.map
+.DS_Store
+.aider*
+.test-out/
+test-device/dist/
+test-device/.flake-log.json
+test-device/.last-schwung-version
+# movy-host: the pinned schwung sources and QuickJS build (scripts/build-host.sh).
+host/build/
+# The virtual device (scripts/vdev.sh): snapshot, image context, ssh key.
+.vdev/
+# The generator bench's downloaded MIDI and cached replies (scripts/gen-bench).
+.gen-data/
+# The website build (mkdocs build, scripts/site/).
+/.site-build/
