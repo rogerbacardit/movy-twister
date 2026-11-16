@@ -1,0 +1,5895 @@
+//! The sequencer engine: transport + clock + per-tick note scheduling.
+//! Pure logic — emits `OutEvent`s into a caller buffer; the FFI layer turns
+//! them into host MIDI sends. One Engine instance == the whole 4-track
+//! sequencer.
+
+use crate::capture::{
+    estimate_tempos, CapEvent, CapMode, CapWhy, CaptureRing, TempoGuess, CAPTURE_MAX_BARS,
+};
+use crate::clip::{Clip, Lock, Trig, MAX_STEPS};
+use crate::clock::Clock;
+use crate::track::{Track, CLIPS_PER_TRACK, LANES, NUM_TRACKS};
+use crate::{PPQN, STEPS_PER_BAR, TICKS_PER_BAR, TICKS_PER_STEP};
+
+mod ai_clip;
+pub use ai_clip::{parse_ai_notes, AiClipWrite};
+mod note_view;
+mod phase;
+mod freeze_lock;
+mod link;
+#[cfg(test)]
+mod link_tests;
+pub use freeze_lock::{clip_edit_verb as freeze_lock_verb, FreezeLock, LoopPos, RecWindow, TrackWindows};
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum OutEvent {
+    NoteOn { track: u8, pitch: u8, vel: u8 },
+    NoteOff { track: u8, pitch: u8 },
+    /// Metronome click; `accent` marks the downbeat (bar start).
+    Click { accent: bool },
+    /// Parameter automation, value 0..=127. The DSP writes it to the lane's
+    /// bound param directly; it is not a CC.
+    Auto { track: u8, lane: u8, val: u8 },
+    /// MIDI transport out (schwung transport service): 0xFA on play,
+    /// 0xF8 at 24 PPQN while playing, 0xFC on stop — so schwung's synced
+    /// LFOs/params phase-lock to this sequencer's grid.
+    Start,
+    Stop,
+    Clock,
+}
+
+
+struct RecPending {
+    pitch: u8,
+    vel: u8,
+    /// Signed: negative means the note began inside the count-in, that many
+    /// ticks before the recording start (see `Engine::preroll_offset`).
+    start_tick: i32,
+    /// Where the note belongs, captured at the note-on. A tail note outlives
+    /// the recording state, so resolving either of these at the release would
+    /// write it into whatever happens to be active by then.
+    track: usize,
+    slot: usize,
+    /// The track's loop count when the note began, so a note held across one or
+    /// more wraps still measures its true length.
+    start_cycle: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Gate {
+    track: u8,
+    pitch: u8,
+    ticks_left: u32,
+}
+
+pub struct Engine {
+    pub clock: Clock,
+    /// Ableton Link: what the session last said and what we asked of it.
+    pub link: crate::link_follow::LinkFollow,
+    pub tracks: Vec<Track>,
+    pub playing: bool,
+    /// Track whose active clip the UI is watching (step LEDs / status).
+    pub watch_track: usize,
+    /// Pitch the watched step LEDs are filtered to (drum-lane view), or None
+    /// for the melodic "all notes" view.
+    pub watch_lane: Option<u8>,
+    /// Note clipboard for copy/paste of steps and ranges, across tracks and
+    /// clips. Ticks/steps are stored relative to the copy start.
+    clipboard: Vec<ClipboardNote>,
+    /// Automation locks captured alongside `clipboard`, steps stored relative
+    /// to the copy start so an empty (note-less) step's automation copies too.
+    lock_clipboard: Vec<Lock>,
+    /// Per-trig probability/condition/invert captured alongside `clipboard`
+    /// (the step page's props; velocity and length ride on the notes).
+    trig_clipboard: Vec<Trig>,
+    /// Width in steps of the last `copy_steps` source range, so a paste replaces
+    /// the destination span even when the source had no notes.
+    clipboard_span: u16,
+    /// The drum voice the clipboard was copied from, as (pitch, lane mask):
+    /// Move's per-voice paste. A paste then replaces only that pitch's notes
+    /// and those lanes' locks, leaving every other voice on the step alone.
+    /// None = whole-step (melodic, or a rack with no voice map).
+    clipboard_voice: Option<(u8, u32)>,
+    /// Whole-clip clipboard for Session copy/paste.
+    clip_clipboard: Option<Clip>,
+    /// Recording state (live capture into the active clip).
+    pub recording: bool,
+    rec_track: usize,
+    /// True when recording started into a clip with no notes (first take);
+    /// false during overdub. Auto-extend is suppressed on overdub.
+    rec_empty_start: bool,
+    /// Count-in ticks remaining before capture begins (0 = not counting in).
+    count_in_left: u32,
+    /// A take armed while the transport runs, waiting for the next bar. Only a
+    /// take that starts from an EMPTY clip queues: it is a clip launch like any
+    /// other, and starting it mid-bar plants the new clip's tick 0 off the
+    /// master grid for good. An overdub is already in phase and punches in now.
+    pending_rec: bool,
+    pub metronome: bool,
+    /// Set-level quantization stamped onto clips as they are created. Held in
+    /// every EMPTY clip too (see `reseed_empty_clips`), so a clip is born with
+    /// the right value and no creation path has to know about the default.
+    pub default_quant: u8,
+    rec_pending: Vec<RecPending>,
+    /// Notes still held when recording ended, kept until their release so the
+    /// pad you are sounding as you press Rec is not thrown away. Separate from
+    /// `rec_pending` on purpose: a new take pushes fresh entries, and a stale
+    /// same-pitch entry sharing that list would never be matched again.
+    rec_tail: Vec<RecPending>,
+    /// Retroactive capture input (Move manual §14.3). Runtime-only.
+    capture: CaptureRing,
+    /// A stopped capture's take, frame-stamped, kept while the overlay is up so
+    /// the selector can re-derive it at any tempo without accumulating rounding.
+    cap_take: Vec<CapEvent>,
+    cap_take_first: u64,
+    cap_track: usize,
+    cap_guess: Option<TempoGuess>,
+    cap_sel: usize,
+    cap_mode: CapMode,
+    cap_why: CapWhy,
+    /// How far the fitted take had to be stretched, in per mille (fixed mode).
+    cap_stretch_permille: i32,
+    /// Bumped on every commit / selector change so the UI knows to re-read
+    /// `capinfo` without polling it every tick.
+    capture_gen: u32,
+    /// Per-tick master counter (clock.tick advances per audio block, so it
+    /// can't time individual ticks; this increments inside service_tick).
+    master_tick: u64,
+    /// Set by edit commands, cleared when the state is serialized for saving.
+    /// The UI polls it to know when to write the autosave file.
+    pub dirty: bool,
+    /// Song mode: the raw sequence of scene presses, e.g. `[1,2,2,3]`. Empty =
+    /// no song. Consecutive duplicates fold into one entry with a repeat count
+    /// only at scheduling time (`song_entry_at`), so this stays the literal
+    /// gesture the user made — the same list the screen reads out and
+    /// persistence stores, with no second representation to keep in sync.
+    pub song: Vec<u8>,
+    /// Freeze's lock (engine/freeze_lock.rs): per track, the clip slot a
+    /// loop was captured from. Set by movy-dsp; refuses the clip edits.
+    pub freeze_lock: FreezeLock,
+    /// Raw index in `song` of the first press of the entry now playing.
+    song_pos: usize,
+    /// Master bar on which the current entry started. `None` until the song's
+    /// first scene actually falls in, which is the boundary its launch
+    /// resolves on.
+    song_start_bar: Option<u64>,
+    /// The transition out of the current entry has been prepared: either the
+    /// next scene was launched, or it needed no launch because it names the
+    /// same scene. The advance is gated on this — stepping to an entry whose
+    /// clips were never launched skips it silently.
+    song_armed: bool,
+    /// The scene that arming launched, or `None` when it needed no launch. A
+    /// no-op arm is the one that can go STALE: a song of one entry wraps onto
+    /// itself and launches nothing, and appending a different scene after that
+    /// makes the decision wrong (see `song_add`).
+    song_armed_launch: Option<usize>,
+    gates: Vec<Gate>,
+    /// (track, step) the UI is holding, for the step-length readout. None = not held.
+    held_query: Option<(usize, u16)>,
+    /// Free-running PRNG state for trig probability rolls (xorshift64*).
+    rng_state: u64,
+    /// Off-beat shuffle amount, percent (50 = straight … 80 = max). Applied by
+    /// the scheduler to odd-indexed 16th steps. UI-set via the `swing` command.
+    pub swing_pct: u32,
+    /// True while we are emitting MIDI transport clock (between Start and Stop).
+    /// Runtime-only edge tracker — never persisted.
+    emitting_clock: bool,
+    /// Per-track: the chain slot holds a drum module, so its pitches address
+    /// pads rather than notes and clip transpose must not shift them. Set by
+    /// the UI (`tdrum`), which owns module identity. Runtime-only: it is a
+    /// property of the loaded module, re-sent on load and after any swap.
+    track_drum: [bool; NUM_TRACKS],
+
+    // --- external (Move native) clock follow — design §7 Phase 3 ---
+    // All runtime-only (never persisted): they model Move's cable-0 transport,
+    // delivered to movy-dsp's on_midi and forwarded here.
+    /// Move's transport is running (between its 0xFA/first-tick and 0xFC).
+    ext_running: bool,
+    /// The next 0xF8 is the anchor tick — it seeds timing, no interval yet.
+    ext_awaiting_first: bool,
+    /// External 24-PPQN ticks counted since the anchor.
+    ext_ticks: u64,
+    /// `frame_now` at the last external tick (drives interval + staleness).
+    ext_last_frame: u64,
+    /// EMA-smoothed frames-per-external-tick (→ captured tempo).
+    ext_interval: f64,
+    /// Launch-quantize base: the external tick index of our bar-0 downbeat.
+    ext_base: u64,
+    /// `ext_base` is set — 0xFA anchors it; engaging mid-song sets it once.
+    ext_base_set: bool,
+    /// Monotonic audio-frame clock; advances once per block.
+    frame_now: u64,
+    /// Were we following on the previous block? (engage/disengage edges)
+    was_following: bool,
+    /// After a revert to internal clock, re-anchor emission at our next bar.
+    resume_anchor_pending: bool,
+
+    // --- always-on bidirectional transport link — design §7 Phase 4 ---
+    /// Undo snapshots, addressed by the id the UI assigns. Runtime-only: the
+    /// UI's stack is in-memory too, so persisting these would restore history
+    /// for a stack that no longer exists.
+    pub undo: crate::undo::UndoRing,
+    /// AI MIDI preview: full copies of a clip per option (0 = ORIG), keyed
+    /// (track, slot, option) because a generator session parked on one clip
+    /// outlives work on others. Never saved (engine/ai_clip.rs).
+    pub ai_stash: std::collections::HashMap<(usize, usize, usize), Clip>,
+}
+
+/// How far apart two tempos are, as a ratio >= 1 — direction-agnostic, so a
+/// candidate above and below the target compare fairly.
+fn cand_ratio(a: u32, b: u32) -> f64 {
+    let (a, b) = (a as f64, b.max(1) as f64);
+    if a > b { a / b } else { b / a }
+}
+
+#[derive(Clone, Copy)]
+struct ClipboardNote {
+    rel_step: u16,
+    rel_tick: u32,
+    gate: u32,
+    pitch: u8,
+    vel: u8,
+}
+
+impl Engine {
+    pub fn new(sample_rate: u32, bpm_x100: u32) -> Self {
+        Engine {
+            clock: Clock::new(sample_rate, bpm_x100),
+            link: Default::default(),
+            tracks: (0..NUM_TRACKS).map(|_| Track::new()).collect(),
+            playing: false,
+            watch_track: 0,
+            watch_lane: None,
+            clipboard: Vec::new(),
+            lock_clipboard: Vec::new(),
+            trig_clipboard: Vec::new(),
+            clipboard_span: 0,
+            clipboard_voice: None,
+            clip_clipboard: None,
+            recording: false,
+            song: Vec::new(),
+            freeze_lock: FreezeLock::default(),
+            song_pos: 0,
+            song_start_bar: None,
+            song_armed: false,
+            song_armed_launch: None,
+            rec_track: 0,
+            rec_empty_start: false,
+            count_in_left: 0,
+            pending_rec: false,
+            metronome: false,
+            default_quant: 0,
+            rec_pending: Vec::new(),
+            rec_tail: Vec::new(),
+            capture: CaptureRing::new(),
+            capture_gen: 0,
+            cap_take: Vec::new(),
+            cap_take_first: 0,
+            cap_track: 0,
+            cap_guess: None,
+            cap_sel: 0,
+            cap_mode: CapMode::None,
+            cap_why: CapWhy::None,
+            cap_stretch_permille: 0,
+            master_tick: 0,
+            dirty: false,
+            gates: Vec::with_capacity(128),
+            held_query: None,
+            rng_state: 0x9E3779B97F4A7C15,
+            swing_pct: 50,
+            emitting_clock: false,
+            track_drum: [false; NUM_TRACKS],
+            ext_running: false,
+            ext_awaiting_first: false,
+            ext_ticks: 0,
+            ext_last_frame: 0,
+            ext_interval: 0.0,
+            ext_base: 0,
+            ext_base_set: false,
+            frame_now: 0,
+            was_following: false,
+            resume_anchor_pending: false,
+            undo: crate::undo::UndoRing::new(),
+            ai_stash: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Mark a track's slot as holding a drum module (UI-owned — see `track_drum`).
+    pub fn set_track_drum(&mut self, track: usize, drum: bool) {
+        if track < NUM_TRACKS {
+            self.track_drum[track] = drum;
+        }
+    }
+
+    pub fn track_is_drum(&self, track: usize) -> bool {
+        track < NUM_TRACKS && self.track_drum[track]
+    }
+
+    /// Clip transpose in effect for a track's clip — 0 on a drum track, whose
+    /// pitches are pad addresses. Single source of truth for every site that
+    /// applies or undoes transpose (emit, live record, step entry), so the
+    /// three can never disagree about what a stored pitch means.
+    pub fn clip_transpose(&self, track: usize, slot: usize) -> i32 {
+        if self.track_is_drum(track) {
+            return 0;
+        }
+        self.tracks
+            .get(track)
+            .and_then(|t| t.clips.get(slot))
+            .map_or(0, |c| c.transpose as i32)
+    }
+
+    /// `clip_transpose` for the track's active (edited) clip.
+    pub fn active_clip_transpose(&self, track: usize) -> i32 {
+        if track >= NUM_TRACKS {
+            return 0;
+        }
+        self.clip_transpose(track, self.tracks[track].active_clip)
+    }
+
+    /// Ticks to delay an odd-indexed 16th step (the off-beat) for swing.
+    /// 0 at 50% (straight) … TICKS_PER_STEP/2 (12) at 80%. Even steps: 0.
+    /// Swing delay (clip-ticks) for a note on `step`, anchored to real 16th
+    /// notes so scaled clips swing the 16th feel rather than their (faster or
+    /// slower) step grid. A clip step lands on real-16th index `step*den/num`;
+    /// swing applies only when that is an odd integer (an off-beat 16th), and
+    /// the delay is a fraction of a real 16th (= num/den clip-steps).
+    fn swing_delay(&self, step: u16, scale_num: u8, scale_den: u8) -> u32 {
+        if self.swing_pct <= 50 {
+            return 0;
+        }
+        let (num, den) = (scale_num.max(1) as u32, scale_den.max(1) as u32);
+        let numer = step as u32 * den;
+        if numer % num != 0 || (numer / num) % 2 == 0 {
+            return 0; // not an off-beat 16th (on-beat, or a sub-16th position)
+        }
+        let sixteenth_ticks = num * TICKS_PER_STEP / den;
+        (self.swing_pct - 50) * sixteenth_ticks / 60
+    }
+
+    /// The step a note played at `tick` belongs to: the one whose SWUNG
+    /// position is nearest, not the nearest point on the straight grid.
+    ///
+    /// Swing moves an off-beat 16th later inside its own cell, so the moment
+    /// you hear — and play to — that step is `step*24 + swing_delay(step)`.
+    /// Rounding against the straight grid leaves only
+    /// `TICKS_PER_STEP/2 - swing_delay` ticks of late tolerance (4 ticks, ~21 ms
+    /// at 120 BPM, on swing 70), after which an upbeat anchors to the following
+    /// ON-beat step — where swing is zero, so at full quantization it lands on
+    /// top of the downbeat and the upbeat is lost.
+    ///
+    /// Ties go to the later step, matching the `(tick + TICKS_PER_STEP/2) /
+    /// TICKS_PER_STEP` rounding this replaces (identical at swing 50).
+    fn anchor_step(&self, tick: u32, scale_num: u8, scale_den: u8) -> u16 {
+        let straight = (tick / TICKS_PER_STEP) as u16;
+        let mut best = straight;
+        let mut best_d = u32::MAX;
+        for cand in [straight.saturating_sub(1), straight, straight + 1] {
+            let pos = cand as u32 * TICKS_PER_STEP + self.swing_delay(cand, scale_num, scale_den);
+            let d = pos.abs_diff(tick);
+            if d <= best_d {
+                best_d = d;
+                best = cand;
+            }
+        }
+        best
+    }
+
+    /// xorshift64* → a 0..=99 percent roll. Free-running (Elektron-style).
+    fn roll_pct(&mut self) -> u8 {
+        let mut x = self.rng_state;
+        x ^= x >> 12; x ^= x << 25; x ^= x >> 27;
+        self.rng_state = x;
+        ((x.wrapping_mul(0x2545F4914F6CDD1D) >> 33) % 100) as u8
+    }
+
+    /// Armed but not capturing yet — a count-in, or a take queued to the next
+    /// bar. One flag because the UI treats them identically: the Rec button
+    /// blinks and the undo pass is already open.
+    pub fn counting_in(&self) -> bool {
+        self.count_in_left > 0 || self.pending_rec
+    }
+
+    // ── Clip operations (Copy/Delete, manual §12) ─────────────────────────
+
+    /// Duplicate the track's active clip into the next empty slot and select
+    /// it (native Copy in Note mode). No-op if every slot is occupied.
+    pub fn duplicate_clip(&mut self, track: usize) {
+        if track >= NUM_TRACKS {
+            return;
+        }
+        let src = self.tracks[track].active_clip;
+        let mut dst = None;
+        for off in 1..=CLIPS_PER_TRACK {
+            let i = (src + off) % CLIPS_PER_TRACK;
+            if !self.tracks[track].clips[i].exists() {
+                dst = Some(i);
+                break;
+            }
+        }
+        if let Some(d) = dst {
+            self.tracks[track].clips[d] = self.tracks[track].clips[src].clone();
+            self.tracks[track].active_clip = d;
+        }
+    }
+
+    /// Free any assigned lane that no clip on the track locks any more (after a
+    /// clip delete or automation clear). A lane with zero locks anywhere is
+    /// inert — its base equals the static param value — so it's released back to
+    /// the lane pool, matching "clear lanes not used on other clips".
+    fn free_unused_lanes(&mut self, track: usize) {
+        if track >= NUM_TRACKS {
+            return;
+        }
+        for lane in 0..LANES {
+            if !self.tracks[track].lane_assigned[lane] {
+                continue;
+            }
+            let used = self.tracks[track]
+                .clips
+                .iter()
+                .any(|c| c.has_lock_on_lane(lane as u8));
+            if !used {
+                self.tracks[track].lane_assigned[lane] = false;
+                self.tracks[track].lane_label[lane].clear();
+                self.tracks[track].lane_base[lane] = 0;
+                self.tracks[track].auto_cur[lane] = -1;
+            }
+        }
+    }
+
+    pub fn delete_clip(&mut self, track: usize) {
+        if track < NUM_TRACKS {
+            let slot = self.tracks[track].active_clip;
+            self.tracks[track].active_mut().clear();
+            self.drop_rec_notes_for(track, slot);
+            self.free_unused_lanes(track);
+        }
+    }
+
+    /// Delete a specific clip slot (Session: hold Delete + clip pad).
+    pub fn delete_clip_at(&mut self, track: usize, slot: usize) {
+        if track < NUM_TRACKS && slot < CLIPS_PER_TRACK {
+            self.tracks[track].clips[slot].clear();
+            self.drop_rec_notes_for(track, slot);
+            self.free_unused_lanes(track);
+            /* A deleted clip has nothing left to play, so it stops now rather
+             * than at the bar (Live does the same). Left pointing at the empty
+             * slot, the grid kept painting it as a playing/queued clip in the
+             * track's colour. service_tick flushes the gates of a track it no
+             * longer services, so nothing hangs. */
+            let t = &mut self.tracks[track];
+            if t.playing_slot == Some(slot) {
+                t.playing_slot = None;
+                t.pending_stop = false;
+            }
+            if t.queued_slot == Some(slot) {
+                t.queued_slot = None;
+            }
+        }
+    }
+
+    /// Copy a whole clip to the clip clipboard (Session Copy).
+    pub fn copy_clip(&mut self, track: usize, slot: usize) {
+        if track < NUM_TRACKS && slot < CLIPS_PER_TRACK {
+            self.clip_clipboard = Some(self.tracks[track].clips[slot].clone());
+        }
+    }
+
+    /// Paste the clip clipboard into a slot (overwrites) and select it.
+    pub fn paste_clip(&mut self, track: usize, slot: usize) {
+        if track >= NUM_TRACKS || slot >= CLIPS_PER_TRACK {
+            return;
+        }
+        if let Some(c) = self.clip_clipboard.clone() {
+            self.tracks[track].clips[slot] = c;
+            self.tracks[track].active_clip = slot;
+            self.free_unused_lanes(track);
+        }
+    }
+
+    pub fn select_clip(&mut self, track: usize, slot: usize) {
+        if track < NUM_TRACKS && slot < CLIPS_PER_TRACK {
+            self.tracks[track].active_clip = slot;
+        }
+    }
+
+    pub fn delete_range(&mut self, track: usize, s0: u16, s1: u16, lane: Option<u8>) {
+        if track < NUM_TRACKS {
+            self.tracks[track].active_mut().delete_range(s0, s1, lane);
+            self.free_unused_lanes(track);
+        }
+    }
+
+    // ── Note clipboard (copy/paste steps + ranges) ────────────────────────
+
+    pub fn copy_steps(&mut self, track: usize, s0: u16, s1: u16) {
+        self.copy_steps_voice(track, s0, s1, None);
+    }
+
+    /// `voice` = (pitch, lane mask): copy only that drum voice's notes and the
+    /// locks on its lanes (the UI knows which lanes are the voice's keys).
+    pub fn copy_steps_voice(&mut self, track: usize, s0: u16, s1: u16, voice: Option<(u8, u32)>) {
+        if track >= NUM_TRACKS || s1 < s0 {
+            return;
+        }
+        self.clipboard_span = s1 - s0 + 1;
+        self.clipboard_voice = voice;
+        let base_tick = s0 as u32 * TICKS_PER_STEP;
+        self.clipboard = self.tracks[track]
+            .active()
+            .notes
+            .iter()
+            .filter(|n| n.step >= s0 && n.step <= s1)
+            .filter(|n| voice.map_or(true, |(p, _)| n.pitch == p))
+            .map(|n| ClipboardNote {
+                rel_step: n.step - s0,
+                rel_tick: n.tick.saturating_sub(base_tick),
+                gate: n.gate,
+                pitch: n.pitch,
+                vel: n.vel,
+            })
+            .collect();
+        self.lock_clipboard = self.tracks[track]
+            .active()
+            .locks
+            .iter()
+            .filter(|l| l.step >= s0 && l.step <= s1)
+            .filter(|l| voice.map_or(true, |(_, m)| lane_in(m, l.lane)))
+            .map(|l| Lock { lane: l.lane, step: l.step - s0, val: l.val })
+            .collect();
+        self.trig_clipboard = self.tracks[track].active().trigs_for_copy(s0, s1, voice.map(|(p, _)| p));
+    }
+
+    pub fn paste_steps(&mut self, track: usize, dest_step: u16) {
+        if track >= NUM_TRACKS || self.clipboard_span == 0 {
+            return;
+        }
+        let span = self.clipboard_span;
+        let voice = self.clipboard_voice;
+        // Replace, not merge: clear the destination span (notes + locks) first
+        // — only the copied voice's, for a per-voice copy.
+        {
+            let clip = self.tracks[track].active_mut();
+            clip.delete_range(dest_step, dest_step + span - 1, voice.map(|(p, _)| p));
+            let end = dest_step + span;
+            clip.locks.retain(|l| {
+                l.step < dest_step || l.step >= end || voice.map_or(false, |(_, m)| !lane_in(m, l.lane))
+            });
+            clip.paste_trigs(dest_step, span, voice.map(|(p, _)| p), &self.trig_clipboard);
+        }
+        let base_tick = dest_step as u32 * TICKS_PER_STEP;
+        let cb = self.clipboard.clone();
+        let clip = self.tracks[track].active_mut();
+        for cn in cb {
+            clip.add_note_raw(
+                dest_step + cn.rel_step,
+                base_tick + cn.rel_tick,
+                cn.gate,
+                cn.pitch,
+                cn.vel,
+            );
+        }
+        let lb = self.lock_clipboard.clone();
+        let clip = self.tracks[track].active_mut();
+        for l in lb {
+            clip.set_lock(l.lane, dest_step + l.step, l.val);
+        }
+    }
+
+    pub fn clear_clipboard(&mut self) {
+        self.clipboard.clear();
+        self.lock_clipboard.clear();
+        self.trig_clipboard.clear();
+        self.clipboard_voice = None;
+    }
+
+    pub fn watched_clip(&self) -> &Clip {
+        self.tracks[self.watch_track].active()
+    }
+
+    /// Flip transport on and reset the clock, seeding each track's playhead
+    /// to its playing clip's loop start. Leaves playing_slot selections
+    /// untouched (used by both Play and Session launch).
+    fn start_transport(&mut self) {
+        for t in &mut self.tracks {
+            let start = t.playing().map_or(0, |c| c.loop_start_ticks());
+            t.pos_tick = start;
+            // The playhead is back at the loop start, so every note is owed
+            // another turn — stale per-pass flags would silence the first pass.
+            if let Some(slot) = t.playing_slot {
+                t.clips[slot].release_pass_flags();
+            }
+            t.last_auto_step = -1; // re-emit automation from step 0 on (re)start
+            t.auto_step = -1;
+            t.auto_cur = [-1; LANES];
+            t.cycle = 1;           // restart the A:B trig-condition play count
+            t.scale_acc = 0;       // phase-align the clip-scale accumulator
+        }
+        self.clock.reset();
+        self.master_tick = 0;
+        self.playing = true;
+    }
+
+    /// Freeze's silent pass (movy-dsp `freeze_bank.rs`): start the transport
+    /// with ONLY `track` playing its active clip, from the loop start. `false`
+    /// — and nothing changes — when the transport already runs or the track
+    /// has no clip to play. The caller mutes the output and stops it again.
+    pub fn play_alone(&mut self, track: usize) -> bool {
+        match self.tracks.get(track) {
+            Some(t) => self.play_alone_slot(track, t.active_clip),
+            None => false,
+        }
+    }
+
+    /// `play_alone` for any clip `slot` of the track (a freeze records every
+    /// clip, one after another); the selection is left alone.
+    pub fn play_alone_slot(&mut self, track: usize, slot: usize) -> bool {
+        if self.playing || !self.tracks.get(track).and_then(|t| t.clips.get(slot)).is_some_and(|c| c.exists()) {
+            return false;
+        }
+        for (i, t) in self.tracks.iter_mut().enumerate() {
+            t.playing_slot = if i == track { Some(slot) } else { None };
+            t.queued_slot = None;
+            t.pending_stop = false;
+        }
+        self.start_transport();
+        true
+    }
+
+    /// Play button / auto-start: every track plays its selected clip (native
+    /// "Play starts all selected clips"), restarting from the loop start.
+    pub fn play(&mut self) {
+        /* A song owns what plays: Play restarts the arrangement from the top
+         * rather than resuming each track's own selection. */
+        if let Some((scene, _)) = self.song_entry_at(0) {
+            self.song_pos = 0;
+            self.song_start_bar = None;
+            self.song_armed = false;
+            self.song_armed_launch = None;
+            for t in &mut self.tracks {
+                t.active_clip = scene;
+                t.playing_slot = if t.clips[scene].exists() { Some(scene) } else { None };
+                t.queued_slot = None;
+                t.pending_stop = false;
+            }
+            self.capture.clear();
+            self.start_transport();
+            return;
+        }
+        for t in &mut self.tracks {
+            t.playing_slot = if t.active().exists() {
+                Some(t.active_clip)
+            } else {
+                None
+            };
+            t.queued_slot = None;
+            t.pending_stop = false;
+        }
+        self.capture.clear();
+        self.start_transport();
+    }
+
+    /// While the transport runs, entering a note into the selected slot launches
+    /// that slot — bar-quantized like a real clip launch — so the selected slot
+    /// becomes the playing slot. Queuing (rather than starting mid-bar) makes
+    /// the clip start cleanly from its loop start on the next bar boundary, in
+    /// sync with the metronome and the other playing clips (the queue resolves
+    /// in `service_tick`). No-op when stopped (preserves the
+    /// no-autostart-on-note-entry rule). Editing the slot that is already
+    /// playing must not requantize it — just cancel any pending stop so the note
+    /// keeps it alive.
+    pub fn ensure_selected_playing(&mut self, track: usize) {
+        if !self.playing || track >= NUM_TRACKS {
+            return;
+        }
+        let slot = self.tracks[track].active_clip;
+        if self.tracks[track].playing_slot == Some(slot) {
+            self.tracks[track].pending_stop = false;
+            return;
+        }
+        self.tracks[track].queued_slot = Some(slot);
+        self.tracks[track].pending_stop = false;
+    }
+
+    /// Session launch / empty-slot select. Always selects the slot. An
+    /// existing clip launches (queued to the next bar while running, immediate
+    /// + transport start when stopped); an empty slot stops the track (native:
+    /// selecting an empty slot stops the playing clip).
+    pub fn launch_clip(&mut self, track: usize, slot: usize) {
+        if track >= NUM_TRACKS || slot >= CLIPS_PER_TRACK {
+            return;
+        }
+        /* Launching a clip by hand is taking the wheel: the arrangement stops
+         * being an arrangement. What is playing keeps playing — only the
+         * sequencing stops. */
+        self.clear_song();
+        self.tracks[track].active_clip = slot;
+        /* The user just picked a slot by hand; a scene's deferred selection
+         * must not overwrite it when the bar lands. */
+        self.tracks[track].pending_select = None;
+        let exists = self.tracks[track].clips[slot].exists();
+        if self.playing {
+            if exists {
+                self.tracks[track].queued_slot = Some(slot);
+                self.tracks[track].pending_stop = false;
+            } else {
+                self.tracks[track].pending_stop = true;
+                self.tracks[track].queued_slot = None;
+            }
+        } else if exists {
+            self.tracks[track].playing_slot = Some(slot);
+            self.start_transport();
+        } else {
+            self.tracks[track].playing_slot = None;
+        }
+    }
+
+    /// How many bars a scene lasts: the longest clip in that column, rounded
+    /// up to whole bars, minimum 1. Rounding up is what keeps every scene
+    /// switch on the same 1-bar launch grid `service_tick` already resolves
+    /// against, which is in turn what makes the one-bar-ahead pulse exact.
+    pub fn scene_bars(&self, slot: usize) -> u32 {
+        if slot >= CLIPS_PER_TRACK {
+            return 1;
+        }
+        let mut bars = 1;
+        for t in &self.tracks {
+            let c = &t.clips[slot];
+            if c.exists() {
+                let b = (c.length_steps as u32 + crate::STEPS_PER_BAR - 1) / crate::STEPS_PER_BAR;
+                if b > bars {
+                    bars = b;
+                }
+            }
+        }
+        bars
+    }
+
+    /// True when no track has a clip in that column. Such a scene is TERMINAL
+    /// in a song: with no clip there is nothing to take a length from, so the
+    /// arrangement ends on it rather than guessing a duration.
+    pub fn scene_is_empty(&self, slot: usize) -> bool {
+        slot >= CLIPS_PER_TRACK || !self.tracks.iter().any(|t| t.clips[slot].exists())
+    }
+
+    /// Launch a whole column: every track's clip in `slot`. A track whose slot
+    /// is empty STOPS — a scene is a full snapshot of what plays, so what is
+    /// not in the column goes quiet.
+    ///
+    /// Deliberately the same per-track mechanics as `launch_clip`, reusing
+    /// `queued_slot` / `pending_stop` rather than inventing a scene-level
+    /// queue. That is what makes the Session grid's queued and stopping pulses
+    /// light up for a scene with no LED work of its own — and what stops the
+    /// empty case needing any gating beyond `playing_slot = None`, since
+    /// `service_tick` already flushes the gates of a track it is not servicing.
+    pub fn launch_scene(&mut self, slot: usize) {
+        if slot >= CLIPS_PER_TRACK {
+            return;
+        }
+        let playing = self.playing;
+        let mut any_clip = false;
+        for t in &mut self.tracks {
+            let exists = t.clips[slot].exists();
+            any_clip |= exists;
+            if playing {
+                if exists {
+                    t.queued_slot = Some(slot);
+                    t.pending_stop = false;
+                } else {
+                    t.pending_stop = true;
+                    t.queued_slot = None;
+                    /* No launch to carry the selection across, so it is
+                     * deferred by hand — the Session grid must not show this
+                     * track sitting in the previous scene's column. */
+                    t.pending_select = Some(slot);
+                }
+                /* The edit target is NOT moved here. The song arms the next
+                 * scene a bar early to light the queued pulse, and retargeting
+                 * now would move a running take into the next scene's clip a
+                 * whole bar before that clip plays. The queue-resolution block
+                 * in `service_tick` sets `active_clip` when the launch actually
+                 * lands, which is the moment the target really did change.
+                 * `launch_clip` selects immediately because pressing a cell IS
+                 * a selection; arming is not. */
+            } else {
+                t.active_clip = slot;
+                t.playing_slot = if exists { Some(slot) } else { None };
+                t.queued_slot = None;
+                t.pending_stop = false;
+            }
+        }
+        if !playing && any_clip {
+            self.start_transport();
+        }
+    }
+
+    /// Raw index of the first press of the entry now playing.
+    pub fn song_pos(&self) -> usize {
+        self.song_pos
+    }
+
+    /// The entry starting at raw index `i`: `(scene, repeat count)`. Pressing
+    /// the same scene twice in a row is one entry that plays twice as long, so
+    /// a run of identical presses folds here rather than being stored folded.
+    pub fn song_entry_at(&self, i: usize) -> Option<(usize, u32)> {
+        let scene = *self.song.get(i)? as usize;
+        let reps = self.song[i..]
+            .iter()
+            .take_while(|&&s| s as usize == scene)
+            .count() as u32;
+        Some((scene, reps))
+    }
+
+    /// Raw index of the entry after the one starting at `i`, wrapping to the
+    /// start of the song — that wrap is what makes a song loop.
+    pub fn song_next_pos(&self, i: usize) -> usize {
+        match self.song_entry_at(i) {
+            Some((_, reps)) => {
+                let n = i + reps as usize;
+                if n >= self.song.len() {
+                    0
+                } else {
+                    n
+                }
+            }
+            None => 0,
+        }
+    }
+
+    /// Forget the song. What is playing keeps playing — only the sequencing
+    /// stops.
+    pub fn clear_song(&mut self) {
+        self.song.clear();
+        self.song_pos = 0;
+        self.song_start_bar = None;
+        self.song_armed = false;
+        self.song_armed_launch = None;
+    }
+
+    /// Start a new song from one scene — the first Shift+scene press of a hold.
+    /// It launches straight away (bar-quantized like any clip launch) so the
+    /// song starts before the user has finished building it.
+    pub fn song_start(&mut self, slot: usize) {
+        if slot >= CLIPS_PER_TRACK {
+            return;
+        }
+        self.clear_song();
+        self.song.push(slot as u8);
+        self.launch_scene(slot);
+    }
+
+    /// Append a scene to the song being built. It does NOT launch: the song is
+    /// already running and will reach this scene in order. Appending to the
+    /// entry now playing lengthens it on this pass too, because the entry's
+    /// total is derived from the list every bar rather than latched at entry.
+    pub fn song_add(&mut self, slot: usize) {
+        if slot >= CLIPS_PER_TRACK || self.song.is_empty() {
+            return;
+        }
+        self.song.push(slot as u8);
+        /* An arm made while the song was SHORTER can be stale. A song of one
+         * entry wraps onto itself, so the scheduler correctly arms nothing —
+         * but appending a different scene after that makes the decision wrong,
+         * and the next boundary would advance onto an entry whose clips were
+         * never launched. That scene is then skipped outright, which is exactly
+         * what happens when a bar falls between two presses of a live build.
+         *
+         * Only a NO-OP arm is withdrawn: nothing went out, so re-arming is
+         * free. A launch that has already been issued stands — it cannot be
+         * recalled, and the scene it named is the one about to play. */
+        if self.song_armed && self.song_armed_launch.is_none() {
+            let cur = self.song_entry_at(self.song_pos).map(|(s, _)| s);
+            let next = self.song_next_pos(self.song_pos);
+            let nxt = self.song_entry_at(next).map(|(s, _)| s);
+            if cur.is_some() && nxt != cur {
+                self.song_armed = false;
+                self.song_armed_launch = None;
+            }
+        }
+        /* Then arm straight away rather than leaving it to the next boundary.
+         * A one-bar entry arms on the bar it STARTS, so by the time a scene is
+         * appended that window has usually gone by, and deferring would repeat
+         * the current scene for a bar nobody asked for. This only QUEUES — the
+         * switch still lands on the boundary — and it lights the queued pulse
+         * the moment the scene is added.
+         *
+         * Not before the song's opening scene has actually fallen in
+         * (`song_start_bar` is None until then): its own launch is still
+         * sitting in `queued_slot`, and arming would overwrite it — skipping
+         * the very scene the song starts on. */
+        if self.playing && self.song_start_bar.is_some() {
+            self.song_try_arm(self.master_tick / crate::TICKS_PER_BAR as u64);
+        }
+    }
+
+    /// One bar boundary of the song scheduler. Called from `service_tick`
+    /// AFTER the queue-resolution block, which is load-bearing twice over: the
+    /// entry we are leaving has already had its successor fall in on this very
+    /// boundary, and a one-bar entry must be able to arm on the same boundary
+    /// it starts without us resolving the launch we just made.
+    fn song_bar(&mut self) {
+        if self.song.is_empty() || !self.playing {
+            return;
+        }
+        let bar = self.master_tick / crate::TICKS_PER_BAR as u64;
+        let start = *self.song_start_bar.get_or_insert(bar);
+
+        // Advance first. The launch armed a bar ago resolved on this boundary,
+        // before we ran, so the entry that was current is now behind us.
+        if let Some((scene, reps)) = self.song_entry_at(self.song_pos) {
+            /* Parked on the end of the song. Checked here as well as in
+             * `song_try_arm`, or the next boundary would step off the terminal
+             * scene as if it had simply run its length. */
+            if self.scene_is_empty(scene) {
+                return;
+            }
+            /* Gated on the arm: without it the boundary steps onto an entry
+             * whose clips were never launched, and that scene is skipped
+             * outright — see the stale-arm note in `song_add`. */
+            if self.song_armed && (bar - start) as u32 >= self.scene_bars(scene) * reps {
+                self.song_pos = self.song_next_pos(self.song_pos);
+                self.song_start_bar = Some(bar);
+                self.song_armed = false;
+                self.song_armed_launch = None;
+            }
+        }
+
+        // Then arm: one bar to go, so the Session grid shows the next scene
+        // queued for a full bar before it happens.
+        self.song_try_arm(bar);
+    }
+
+    /// Arm the transition out of the entry now playing, once its LAST bar has
+    /// arrived — queueing the next scene a full bar before it lands, which is
+    /// what gives the Session grid its one-bar warning pulse.
+    ///
+    /// Shared by the bar boundary and by `song_add`, because appending a scene
+    /// during the current entry's last bar has to arm it THERE AND THEN: the
+    /// boundary that would have armed it has already gone by, and waiting for
+    /// the next one repeats the current scene for a bar nobody asked for.
+    fn song_try_arm(&mut self, bar: u64) {
+        if self.song_armed {
+            return;
+        }
+        let Some((scene, reps)) = self.song_entry_at(self.song_pos) else {
+            return;
+        };
+        /* An empty scene is where the arrangement ends, so nothing is armed
+         * after it. The transport keeps running — this is a stop in the song,
+         * not a stop of the machine — and launching a clip or building a new
+         * song leaves it. */
+        if self.scene_is_empty(scene) {
+            return;
+        }
+        let start = self.song_start_bar.unwrap_or(bar);
+        let total = self.scene_bars(scene) * reps;
+        if bar.saturating_sub(start) as u32 + 1 < total {
+            return;
+        }
+        /* Only arm when there IS an entry to arm for, and record what the
+         * arming actually DID — a no-op arm is the one that can go stale. */
+        let next = self.song_next_pos(self.song_pos);
+        if let Some((next_scene, _)) = self.song_entry_at(next) {
+            /* Identical scenes either side of the boundary: a repeat, or a
+             * one-entry song wrapping onto itself. Re-launching would restart
+             * every clip and reset each track's `cycle`, so an A:B trig
+             * condition would never reach B. */
+            if next_scene != scene {
+                self.launch_scene(next_scene);
+                self.song_armed_launch = Some(next_scene);
+            } else {
+                self.song_armed_launch = None;
+            }
+            self.song_armed = true;
+        }
+    }
+
+    /// Stop a track's clip — at the next bar while running, immediately when
+    /// stopped (used when pressing an empty slot in Session mode).
+    pub fn stop_track(&mut self, track: usize) {
+        if track >= NUM_TRACKS {
+            return;
+        }
+        if self.playing {
+            self.tracks[track].pending_stop = true;
+        } else {
+            self.tracks[track].playing_slot = None;
+        }
+    }
+
+    /// Stop transport and release everything still sounding. Ends recording.
+    pub fn stop(&mut self, out: &mut Vec<OutEvent>) {
+        self.playing = false;
+        self.recording = false;
+        self.count_in_left = 0;
+        self.pending_rec = false;
+        // The playhead is about to stop, so a held note has nothing left to
+        // measure against: end it here rather than throw it away.
+        self.rec_tail.append(&mut self.rec_pending);
+        self.commit_rec_tail();
+        self.capture.clear();
+        /* The song survives a stop — Play replays it from the top — but the
+         * cursor into it does not. */
+        self.song_pos = 0;
+        self.song_start_bar = None;
+        self.song_armed = false;
+        self.song_armed_launch = None;
+        for t in &mut self.tracks {
+            t.last_auto_step = -1;
+            t.auto_step = -1;
+            t.auto_cur = [-1; LANES];
+        }
+        self.flush_gates(out);
+    }
+
+    /// Release every note still sounding (all open gates → NoteOff).
+    fn flush_gates(&mut self, out: &mut Vec<OutEvent>) {
+        for g in self.gates.drain(..) {
+            out.push(OutEvent::NoteOff {
+                track: g.track,
+                pitch: g.pitch,
+            });
+        }
+    }
+
+    /// Release every note still sounding on one track, leaving other tracks
+    /// alone. Mute uses this so silencing a track takes effect now rather than
+    /// whenever the current gate happens to expire.
+    pub fn flush_track_gates(&mut self, track: usize, out: &mut Vec<OutEvent>) {
+        let mut gi = 0;
+        while gi < self.gates.len() {
+            if self.gates[gi].track as usize == track {
+                let g = self.gates.swap_remove(gi);
+                out.push(OutEvent::NoteOff {
+                    track: g.track,
+                    pitch: g.pitch,
+                });
+                continue; // re-examine the element swapped into this slot
+            }
+            gi += 1;
+        }
+    }
+
+    /// Stop the notes a drum-pad mute or solo just silenced, NOW rather than at
+    /// gate expiry — the guarantee `flush_track_gates` gives the track mute,
+    /// per voice. Only ever called from the two commands that move a pad mute
+    /// or solo, and it removes only what its own track's rules now call silent,
+    /// so soloing a voice does not cut the other tracks.
+    pub fn flush_silenced_pad_gates(&mut self, track: usize, out: &mut Vec<OutEvent>) {
+        let mut gi = 0;
+        while gi < self.gates.len() {
+            // Read the two fields out rather than moving the Gate: `Gate` is
+            // only borrowed here, and the swap_remove below needs `self.gates`
+            // mutably.
+            let (g_track, g_pitch) = (self.gates[gi].track, self.gates[gi].pitch);
+            if g_track as usize == track && self.tracks[track].pad_voice_silent(g_pitch) {
+                let g = self.gates.swap_remove(gi);
+                out.push(OutEvent::NoteOff {
+                    track: g.track,
+                    pitch: g.pitch,
+                });
+                continue; // re-examine the element swapped into this slot
+            }
+            gi += 1;
+        }
+    }
+
+    // ── Recording (manual §14) ────────────────────────────────────────────
+
+    /// Rec button: toggle recording on `track`. From stopped, this arms a
+    /// one-bar count-in (the metronome clicks; capture begins when it elapses)
+    /// and starts the transport. While the transport runs it punches in — now
+    /// for an overdub, at the next bar for a take that starts from an empty
+    /// clip (see `pending_rec`).
+    pub fn toggle_record(&mut self, track: usize) {
+        if track >= NUM_TRACKS {
+            return;
+        }
+        if self.recording || self.count_in_left > 0 || self.pending_rec {
+            // Cancelling a queued take also un-queues the launch it asked for:
+            // the clip would otherwise start on its own at the bar, silently,
+            // as if the Rec press had half-happened.
+            if self.pending_rec {
+                self.tracks[self.rec_track].queued_slot = None;
+            }
+            self.recording = false;
+            self.count_in_left = 0;
+            self.pending_rec = false;
+            // Whatever is still held becomes a tail: capture stops immediately,
+            // but a pad you are sounding as you press Rec belongs to the take
+            // and gets its real length when you let go. Clearing here erased it.
+            self.rec_tail.append(&mut self.rec_pending);
+            return;
+        }
+        // The previous take's tail cannot outlive the arming of the next one:
+        // it would be finalized against a position that no longer relates to it.
+        self.commit_rec_tail();
+        self.rec_track = track;
+        self.watch_track = track;
+        self.rec_empty_start = self.tracks[track].active().notes.is_empty();
+        let was_playing = self.playing;
+        // Ensure the selected clip exists and is the slot this track plays/records
+        // into, clearing any pending stop / queued launch left by selecting an
+        // empty slot in Session mode. Without this, punch-in recording into a
+        // freshly created empty clip never captures (playing_slot stayed None or
+        // pointed at the old clip) and never auto-extends.
+        let a = self.tracks[track].active_clip;
+        self.tracks[track].active_mut().ensure_exists();
+        self.tracks[track].pending_stop = false;
+        if !was_playing {
+            self.tracks[track].playing_slot = Some(a);
+            self.tracks[track].queued_slot = None;
+            self.play();                       // seeds playheads + starts transport
+            self.count_in_left = crate::TICKS_PER_BAR;
+        } else if self.rec_empty_start {
+            // A first take is a clip launch, so it is bar-quantized like one:
+            // queue the slot and let the boundary in `service_tick` seed the
+            // playhead from the clip's loop start. Starting here instead put the
+            // new clip's tick 0 wherever in the bar the press landed, leaving the
+            // track out of phase with the metronome and every other clip.
+            self.tracks[track].queued_slot = Some(a);
+            self.pending_rec = true;
+        } else {
+            // Overdub punch-in: the clip is already running in phase, so record
+            // from where the playhead is — waiting would swallow up to a bar.
+            self.tracks[track].playing_slot = Some(a);
+            /* Clearing the queue drops a STALE launch left by selecting an
+             * empty Session slot. A song's queue is not stale — it is the
+             * arrangement, armed a bar early — so punching in must not cancel
+             * the scene change underneath it. Recording follows the song into
+             * whatever ends up playing, which is what "record during a song"
+             * has to mean. */
+            if self.song.is_empty() {
+                self.tracks[track].queued_slot = None;
+            }
+            self.recording = true;
+        }
+    }
+
+    pub fn set_metronome(&mut self, on: bool) {
+        self.metronome = on;
+    }
+
+    /// Push the set default into every slot that holds no clip yet, so a clip
+    /// is born already carrying it. Cheap (32 checks) and idempotent, which is
+    /// why it can simply run after every command rather than being threaded
+    /// through `ensure_exists` and the four `Clip` methods that reach it.
+    pub fn reseed_empty_clips(&mut self) {
+        let q = self.default_quant;
+        for t in &mut self.tracks {
+            for c in &mut t.clips {
+                if !c.exists() {
+                    c.quant = q;
+                }
+            }
+        }
+    }
+
+    // ── Retroactive capture (manual §14.3) ───────────────────────────────
+
+    /// Silence after which buffered input is a finished phrase rather than the
+    /// take in progress: two bars, but never so short that a slow ballad
+    /// self-clears mid-phrase nor so long that a jam from minutes ago returns.
+    fn capture_gap_frames(&self) -> u64 {
+        let sr = self.clock.sample_rate() as u64;
+        (2 * self.capture_bar_frames()).clamp(2 * sr, 8 * sr)
+    }
+
+    /// One bar in audio frames at the current tempo.
+    fn capture_bar_frames(&self) -> u64 {
+        self.clock.sample_rate() as u64 * 60 * 4 * 100 / (self.clock.bpm_x100().max(1) as u64)
+    }
+
+    /// Buffer a live pad note for a later Capture. Armed input is excluded —
+    /// the record path is already writing it, and a count-in belongs to the
+    /// take about to be recorded.
+    fn capture_push(&mut self, track: usize, pitch: u8, vel: u8, on: bool) {
+        if track >= NUM_TRACKS || self.count_in_left > 0 {
+            return;
+        }
+        // The post-capture overlay owns the frozen take: anything played while
+        // auditioning candidates would otherwise be glued onto the next commit.
+        if self.cap_mode != CapMode::None {
+            return;
+        }
+        if self.recording && track == self.rec_track {
+            return;
+        }
+        // Coming round the loop and playing over a spot you already covered
+        // means you are redoing that part, not adding to it — so the earlier
+        // pass goes and Capture takes the one you are playing now. Positions
+        // that don't collide keep accumulating, so a phrase that crosses the
+        // loop end survives intact (clearing at the wrap itself would eat it).
+        // The cycle check is what keeps a chord — several notes at one position
+        // in the same pass — from clearing itself.
+        let here = self.tracks[track].pos_tick;
+        let cycle = self.tracks[track].cycle;
+        if on && self.playing {
+            let stale = self.capture.iter().any(|e| {
+                e.on
+                    && e.track == track as u8
+                    && e.cycle != cycle
+                    && e.clip_tick.abs_diff(here) < TICKS_PER_STEP
+            });
+            if stale {
+                self.capture.clear();
+            }
+        }
+        let gap = self.capture_gap_frames();
+        let window = CAPTURE_MAX_BARS as u64 * self.capture_bar_frames();
+        let ev = CapEvent {
+            frame: self.frame_now,
+            abs_tick: self.master_tick as u32,
+            clip_tick: here,
+            cycle,
+            track: track as u8,
+            on,
+            pitch,
+            vel,
+        };
+        self.capture.push(ev, gap, window);
+    }
+
+    /// Drop buffered input: Shift+Capture, a transport edge, or a track change
+    /// (Move parity — all three clear the Capture LED).
+    pub fn capture_clear(&mut self) {
+        self.capture.clear();
+    }
+
+    pub fn capture_pending(&self, track: usize) -> usize {
+        self.capture.pending(track as u8)
+    }
+
+    /// Turn buffered input into clip data on the active clip of `track`.
+    /// Returns false when there was nothing to keep.
+    pub fn capture_commit(&mut self, track: usize) -> bool {
+        if track >= NUM_TRACKS {
+            return false;
+        }
+        if self.capture.pending(track as u8) == 0 {
+            // Nothing to write, but the press still consumes: orphan note-offs
+            // left buffered would otherwise ride along into the next take. The
+            // buffer only ever holds the current track's input anyway — a track
+            // change clears it.
+            self.capture.clear();
+            return false;
+        }
+        let wrote = if self.playing {
+            self.capture_commit_playing(track)
+        } else {
+            self.capture_commit_stopped(track)
+        };
+        // Pressing Capture consumes the buffer whether or not anything could be
+        // written: input that failed to land once will not land any better on
+        // the next press, and leaving it buffered means the next take starts
+        // with someone else's notes in it.
+        self.capture.clear();
+        if wrote {
+            self.capture_gen = self.capture_gen.wrapping_add(1);
+            self.dirty = true;
+        }
+        wrote
+    }
+
+    /// Capture with the transport stopped: freeze the take, work out a tempo
+    /// for it, write it into the clip and roll so it plays back at once.
+    ///
+    /// Move detects a tempo for a fresh take only. An overdub inherits the
+    /// clip's grid, and under an external clock the tempo is not ours at all —
+    /// in both those cases the take is fitted to the tempo that already exists,
+    /// through whichever candidate sits closest to it (so, with the half- and
+    /// double-time readings in the list, the smallest possible stretch).
+    fn capture_commit_stopped(&mut self, track: usize) -> bool {
+        self.cap_take = self
+            .capture
+            .iter()
+            .copied()
+            .filter(|e| e.track == track as u8)
+            .collect();
+        let Some(first) = self.cap_take.iter().find(|e| e.on).map(|e| e.frame) else {
+            return false;
+        };
+        let last = self.cap_take.last().map(|e| e.frame).unwrap_or(first);
+        self.cap_take_first = first;
+        self.cap_track = track;
+
+        let onsets: Vec<u64> = self
+            .cap_take
+            .iter()
+            .filter(|e| e.on)
+            .map(|e| e.frame - first)
+            .collect();
+        let span = last.saturating_sub(first);
+        self.cap_guess = estimate_tempos(&onsets, span, self.clock.sample_rate());
+
+        let clip_has_notes = !self.tracks[track].active().notes.is_empty();
+        let existing = (self.clock.bpm_x100() / 100).max(1);
+        self.cap_why = if self.ext_running {
+            CapWhy::Ext
+        } else if clip_has_notes {
+            CapWhy::Notes
+        } else {
+            CapWhy::None
+        };
+        let free = self.cap_why == CapWhy::None;
+
+        let grid_bpm = match &self.cap_guess {
+            Some(g) if free => {
+                self.cap_sel = g.best;
+                g.cands[g.best]
+            }
+            Some(g) => {
+                let i = (0..g.n)
+                    .min_by(|&a, &b| {
+                        cand_ratio(g.cands[a], existing)
+                            .partial_cmp(&cand_ratio(g.cands[b], existing))
+                            .unwrap_or(core::cmp::Ordering::Equal)
+                    })
+                    .unwrap_or(0);
+                self.cap_sel = i;
+                g.cands[i]
+            }
+            None => {
+                self.cap_sel = 0;
+                existing
+            }
+        };
+        self.cap_stretch_permille = (existing as i64 * 1000 / grid_bpm.max(1) as i64) as i32 - 1000;
+        let candidates = self.cap_guess.as_ref().map_or(0, |g| g.n);
+        self.cap_mode = if free && candidates > 1 {
+            CapMode::Select
+        } else if !free {
+            CapMode::Fixed
+        } else {
+            CapMode::None
+        };
+
+        let wrote = self.capture_write_take(grid_bpm, free, clip_has_notes);
+        if wrote {
+            self.play();
+        } else {
+            self.cap_mode = CapMode::None;
+            self.cap_take.clear();
+        }
+        wrote
+    }
+
+    /// Write the frozen take into the track's active clip at `grid_bpm`.
+    /// `set_tempo` applies that tempo to the transport; `keep_length` overdubs
+    /// into the existing loop instead of resizing the clip to the take.
+    /// Re-runnable: the selector calls it once per candidate.
+    fn capture_write_take(&mut self, grid_bpm: u32, set_tempo: bool, keep_length: bool) -> bool {
+        let track = self.cap_track;
+        let a = self.tracks[track].active_clip;
+        self.tracks[track].active_mut().ensure_exists();
+        let frames_per_tick =
+            self.clock.sample_rate() as f64 * 60.0 / (grid_bpm.max(1) as f64 * PPQN as f64);
+        let span_ticks = self.tracks[track].active().length_ticks().max(1);
+        let loop_start = self.tracks[track].active().loop_start_ticks();
+        let len_steps = self.tracks[track].active().length_steps;
+        let (snum, sden) = {
+            let c = self.tracks[track].active();
+            (c.scale_num, c.scale_den)
+        };
+        if !keep_length {
+            self.tracks[track]
+                .active_mut()
+                .delete_range(0, MAX_STEPS - 1, None);
+        }
+
+        let take = core::mem::take(&mut self.cap_take);
+        let first = self.cap_take_first;
+        let transpose = self.active_clip_transpose(track);
+        let mut used = vec![false; take.len()];
+        let mut span_end = 0u32;
+        let mut wrote = false;
+
+        for i in 0..take.len() {
+            let ev = take[i];
+            if !ev.on {
+                continue;
+            }
+            let off = take[i + 1..].iter().enumerate().find_map(|(j, o)| {
+                let k = i + 1 + j;
+                if !o.on && o.pitch == ev.pitch && !used[k] {
+                    used[k] = true;
+                    Some(o.frame)
+                } else {
+                    None
+                }
+            });
+            let to_ticks = |f: u64| (f as f64 / frames_per_tick).round() as u32;
+            let start = to_ticks(ev.frame - first);
+            let gate = off
+                .map(|f| to_ticks(f.saturating_sub(ev.frame)).max(1))
+                .unwrap_or(TICKS_PER_STEP);
+            let tick = if keep_length {
+                loop_start + start % span_ticks
+            } else {
+                start
+            };
+            let mut step = self.anchor_step(tick, snum, sden);
+            if keep_length {
+                step = step.min(len_steps.saturating_sub(1));
+            }
+            let stored = (ev.pitch as i32 - transpose).clamp(0, 127) as u8;
+            self.tracks[track]
+                .active_mut()
+                .add_note_raw(step, tick, gate, stored, ev.vel);
+            span_end = span_end.max(start + gate);
+            wrote = true;
+        }
+        self.cap_take = take;
+
+        if !keep_length && wrote {
+            let bars = span_end.div_ceil(TICKS_PER_BAR).max(1);
+            let len = (bars * STEPS_PER_BAR).min(MAX_STEPS as u32) as u16;
+            self.tracks[track].clips[a].length_steps = len;
+        }
+        if set_tempo {
+            self.clock.set_bpm_x100(grid_bpm * 100);
+        }
+        wrote
+    }
+
+    /// Apply another tempo candidate from the post-capture selector, re-deriving
+    /// the take so the performance keeps its real-time feel at every tempo.
+    pub fn capture_select(&mut self, idx: usize) {
+        if self.cap_mode != CapMode::Select {
+            return;
+        }
+        let Some(bpm) = self
+            .cap_guess
+            .as_ref()
+            .filter(|g| idx < g.n)
+            .map(|g| g.cands[idx])
+        else {
+            return;
+        };
+        self.cap_sel = idx;
+        self.capture_write_take(bpm, true, false);
+        self.capture_gen = self.capture_gen.wrapping_add(1);
+        self.dirty = true;
+    }
+
+    /// Dismiss the post-capture overlay and release the frozen take.
+    pub fn capture_done(&mut self) {
+        if self.cap_mode == CapMode::None {
+            return;
+        }
+        self.cap_mode = CapMode::None;
+        self.cap_take.clear();
+        self.capture_gen = self.capture_gen.wrapping_add(1);
+    }
+
+    /// Overlay detail, read once per `capture_gen` change (the per-tick status
+    /// poll only carries the pending count and that generation).
+    pub fn capture_info(&self) -> String {
+        let mode = match self.cap_mode {
+            CapMode::Select => "sel",
+            CapMode::Fixed => "fix",
+            CapMode::None => "none",
+        };
+        let why = match self.cap_why {
+            CapWhy::Ext => "ext",
+            CapWhy::Notes => "notes",
+            CapWhy::None => "",
+        };
+        let cands = match (&self.cap_guess, self.cap_mode) {
+            (Some(g), CapMode::Select) => g.cands[..g.n]
+                .iter()
+                .map(|b| b.to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+            // Fixed mode shows "played → set", not a list to scroll.
+            _ => String::new(),
+        };
+        let det = self
+            .cap_guess
+            .as_ref()
+            .map(|g| g.cands[self.cap_sel.min(g.n.saturating_sub(1))])
+            .unwrap_or(0);
+        let bars = (self.tracks[self.cap_track].active().length_steps as u32)
+            .div_ceil(STEPS_PER_BAR)
+            .max(1);
+        format!(
+            "mode={mode} cands={cands} idx={} det={det} bpm={} why={why} bars={bars} stretch={}",
+            self.cap_sel,
+            self.clock.bpm_x100() / 100,
+            self.cap_stretch_permille,
+        )
+    }
+
+    /// Capture into a running transport: the take lands where it was heard.
+    /// An empty clip is laid out from the first played note and grown to whole
+    /// bars (the manual's "the first played note aligns with the start of the
+    /// clip"); a clip that already has notes is overdubbed and keeps its length.
+    fn capture_commit_playing(&mut self, track: usize) -> bool {
+        let a = self.tracks[track].active_clip;
+        self.tracks[track].active_mut().ensure_exists();
+        let fresh = self.tracks[track].active().notes.is_empty();
+        let span = self.tracks[track].active().length_ticks().max(1);
+        let loop_start = self.tracks[track].active().loop_start_ticks();
+        let (snum, sden) = {
+            let c = self.tracks[track].active();
+            (c.scale_num, c.scale_den)
+        };
+        let Some(first_abs) = self
+            .capture
+            .iter()
+            .find(|e| e.track == track as u8 && e.on)
+            .map(|e| e.abs_tick)
+        else {
+            return false;
+        };
+
+        let now_abs = self.master_tick as u32;
+        // Where in the transport's bar the phrase began — the phase a
+        // bar-quantized launch has to preserve.
+        let first_phase = first_abs % TICKS_PER_BAR;
+        let evs: Vec<CapEvent> = self.capture.iter().copied().collect();
+        let transpose = self.active_clip_transpose(track);
+        let mut used = vec![false; evs.len()];
+        let mut span_end = 0u32;
+        let mut wrote = false;
+
+        for i in 0..evs.len() {
+            let ev = evs[i];
+            if ev.track != track as u8 || !ev.on {
+                continue;
+            }
+            let end = evs[i + 1..].iter().enumerate().find_map(|(j, o)| {
+                let k = i + 1 + j;
+                if o.track == ev.track && !o.on && o.pitch == ev.pitch && !used[k] {
+                    used[k] = true;
+                    Some(o.abs_tick)
+                } else {
+                    None
+                }
+            });
+            let gate = end.unwrap_or(now_abs).saturating_sub(ev.abs_tick).max(1);
+            // A first take keeps the phase it was played at: the transport's
+            // bar grid already exists, so a phrase that started on beat three
+            // has to come back on beat three, not slide onto step 1. From there
+            // it is laid out unwrapped, so a phrase longer than the clip extends
+            // it instead of folding back onto itself. (A capture made while
+            // STOPPED is the other case — no grid exists yet, so there the first
+            // note does define the start.) An overdub wraps into the loop that
+            // already exists.
+            let tick = if fresh {
+                loop_start + first_phase + ev.abs_tick.saturating_sub(first_abs)
+            } else {
+                ev.clip_tick % span
+            };
+            let stored = (ev.pitch as i32 - transpose).clamp(0, 127) as u8;
+            // Unsuppressed, unlike live recording: suppression is there so a note
+            // you have only just played does not double-trigger as the playhead
+            // reaches it, but a captured note was played in the past. Anything
+            // now ahead of the playhead — a phrase that ran over the loop end —
+            // has to sound this time round rather than wait for the next repeat.
+            let step = self.anchor_step(tick, snum, sden);
+            self.tracks[track]
+                .active_mut()
+                .add_note_raw(step, tick, gate, stored, ev.vel);
+            span_end = span_end.max(tick + gate);
+            wrote = true;
+        }
+
+        if fresh && wrote {
+            let bars = span_end.div_ceil(TICKS_PER_BAR).max(1);
+            let len = (bars * STEPS_PER_BAR).min(MAX_STEPS as u32) as u16;
+            self.tracks[track].clips[a].length_steps = len;
+        }
+        if wrote {
+            if fresh {
+                // A first take has no grid of its own to fall into, so it gets
+                // the transport's: launched on the bar like any other clip, so
+                // it lines up with the other tracks. ensure_selected_playing is
+                // not enough — a note-less clip is already the playing slot, so
+                // it would no-op and the take would start wherever the playhead
+                // had got to. The tempo stays the transport's throughout; only a
+                // capture made while stopped ever sets one.
+                self.tracks[track].queued_slot = Some(a);
+                self.tracks[track].pending_stop = false;
+            } else {
+                // An overdub belongs to the pass already running — the manual's
+                // "the captured material will then be added to the clip".
+                self.ensure_selected_playing(track);
+            }
+        }
+        wrote
+    }
+
+    /// Record a live pad note-on. The UI sounds the note directly (zero
+    /// latency); this only captures it for recording, so there's no double
+    /// trigger. No-op unless recording this track.
+    /// How far before the recording start a note played right now sits, if it
+    /// still belongs to the take. During the count-in `pos_tick` never advances
+    /// (all of `step_tick` is gated on it), so `count_in_left` IS that distance;
+    /// for a take queued to the next bar it is the ticks left until that bar.
+    ///
+    /// Half a step is where `record_note` already puts the boundary between one
+    /// grid position and the next — this removes an artificial floor at zero
+    /// rather than inventing a rule, so time before the downbeat rounds like
+    /// time after it. At PPQN 96 that is ~62 ms at 120 BPM: wider than human
+    /// push, narrow enough not to swallow a deliberate pickup, and it scales
+    /// with tempo for free.
+    fn preroll_offset(&self) -> Option<i32> {
+        let left = if self.pending_rec {
+            let bar = crate::TICKS_PER_BAR as u64;
+            (bar - self.master_tick % bar) as u32
+        } else {
+            self.count_in_left
+        };
+        if left > 0 && left <= TICKS_PER_STEP / 2 {
+            Some(-(left as i32))
+        } else {
+            None
+        }
+    }
+
+    /// Write a captured note into the clip it was played into, ending it at the
+    /// track's current position. Every way a note can stop being pending — the
+    /// pad release, a transport stop, arming the next take, running out its
+    /// length — resolves through here, so they cannot disagree about placement.
+    fn commit_rec_note(&mut self, p: RecPending, tail: bool) {
+        if p.track >= NUM_TRACKS || p.slot >= CLIPS_PER_TRACK {
+            return;
+        }
+        // The clip can have been deleted while the note was held; recording into
+        // it again would resurrect a single note in an otherwise empty slot.
+        if !self.tracks[p.track].clips[p.slot].exists() {
+            return;
+        }
+        let now = self.tracks[p.track].pos_tick as i64;
+        let cycle = self.tracks[p.track].cycle;
+        let (span, end, snum, sden) = {
+            let c = &self.tracks[p.track].clips[p.slot];
+            (c.length_ticks().max(1) as i64, c.loop_end_ticks() as i64, c.scale_num, c.scale_den)
+        };
+        // Laps completed since the note began, so a note held across the loop
+        // point keeps its true length instead of wrapping to a negative one.
+        // The clamp also bounds the arithmetic.
+        let laps = cycle.wrapping_sub(p.start_cycle).min(64) as i64;
+        let limit = self.rec_gate_limit(&p, tail, span, end);
+        let gate = (laps * span + now - p.start_tick as i64).clamp(1, limit) as u32;
+        // Store the pad's concert pitch minus the clip transpose, so playback
+        // (which re-adds transpose at emit) reproduces exactly what the pad
+        // played. Keeps recorded notes aligned with the untransposed pads.
+        let stored = (p.pitch as i32 - self.clip_transpose(p.track, p.slot)).clamp(0, 127) as u8;
+        // A pre-roll note anchors at the clip start: the push itself is not
+        // preserved (that would need notes stored before their anchor), but
+        // the gate keeps its true length from the signed start.
+        let tick = p.start_tick.max(0) as u32;
+        let step = self.anchor_step(tick, snum, sden);
+        // Suppress only while the pass the note was played on is still running.
+        // A note finalized after the clip has wrapped — a tail expiring at the
+        // clip end, or a pad released on a later pass — is written just after
+        // `release_pass_flags` has run, so suppressing it would mute it until
+        // the NEXT wrap: recorded correctly, silent for a whole loop.
+        let same_pass = cycle == p.start_cycle;
+        self.tracks[p.track].clips[p.slot]
+            .record_note(step, tick, gate, stored, p.vel, same_pass);
+    }
+
+    /// The longest gate a captured note may be given.
+    ///
+    /// While recording, a note held across the loop point is a real musical
+    /// wrap and keeps the pattern length as its ceiling. A tail has no take
+    /// still running behind it, so it ends at the clip end instead: allowed to
+    /// wrap, a long hold becomes a note that is still sounding when it comes
+    /// round to its own start, i.e. a drone on every pass.
+    fn rec_gate_limit(&self, p: &RecPending, tail: bool, span: i64, end: i64) -> i64 {
+        if !tail {
+            return span;
+        }
+        (end - p.start_tick.max(0) as i64).clamp(1, span)
+    }
+
+    /// Resolve every note left holding when recording ended, ending each at the
+    /// current position. Used where a tail can no longer wait for its release:
+    /// the transport stopping, or the next take being armed over it.
+    fn commit_rec_tail(&mut self) {
+        for p in std::mem::take(&mut self.rec_tail) {
+            self.commit_rec_note(p, true);
+        }
+    }
+
+    /// A pad that is never released would leave its note invisible indefinitely.
+    /// The clip end caps it (`rec_gate_limit`), and that is also the moment it
+    /// can no longer grow — so it is written there and drops out of the tail,
+    /// becoming audible on the next pass like any other recorded note. Keeping
+    /// the two on the same boundary is what stops a long hold turning into a
+    /// note that is still sounding when it reaches its own start.
+    /// Runs per track per tick, behind an empty check.
+    fn expire_rec_tail(&mut self, track: usize) {
+        if self.rec_tail.is_empty() {
+            return;
+        }
+        let now = self.tracks[track].pos_tick as i64;
+        let cycle = self.tracks[track].cycle;
+        let mut i = 0;
+        while i < self.rec_tail.len() {
+            let p = &self.rec_tail[i];
+            if p.track != track || p.slot >= CLIPS_PER_TRACK {
+                i += 1;
+                continue;
+            }
+            let clip = &self.tracks[track].clips[p.slot];
+            let (span, end) = (clip.length_ticks().max(1) as i64, clip.loop_end_ticks() as i64);
+            let laps = cycle.wrapping_sub(p.start_cycle).min(64) as i64;
+            if laps * span + now - p.start_tick as i64 >= self.rec_gate_limit(p, true, span, end) {
+                let done = self.rec_tail.swap_remove(i); // swap_remove: do not advance
+                self.commit_rec_note(done, true);
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    /// Forget any captured note bound for `slot` on `track`. The clip it was
+    /// played into has been cleared, and writing the note now would leave a
+    /// single stray note in a slot the user just emptied.
+    fn drop_rec_notes_for(&mut self, track: usize, slot: usize) {
+        self.rec_pending
+            .retain(|p| p.track != track || p.slot != slot);
+        self.rec_tail.retain(|p| p.track != track || p.slot != slot);
+    }
+
+    pub fn live_note_on(&mut self, track: usize, pitch: u8, vel: u8) {
+        // A frozen track records nothing, from any keyboard (freeze_lock.rs).
+        if self.freeze_lock.locked(track) {
+            return;
+        }
+        self.capture_push(track, pitch, vel, true);
+        if track >= NUM_TRACKS || track != self.rec_track {
+            return;
+        }
+        // Gating on `recording` alone dropped the note you play a few
+        // milliseconds early on the count-in's last beat — not misplaced,
+        // lost outright, since nothing downstream could recover it.
+        let start_tick = if self.recording {
+            self.tracks[track].pos_tick as i32
+        } else if let Some(off) = self.preroll_offset() {
+            off
+        } else {
+            return;
+        };
+        self.rec_pending.push(RecPending {
+            pitch,
+            vel,
+            start_tick,
+            track,
+            slot: self.tracks[track].active_clip,
+            start_cycle: self.tracks[track].cycle,
+        });
+    }
+
+    /// Finalize a recorded note (start → now) into the clip on note-off,
+    /// handling loop wrap. No-op unless recording this track.
+    pub fn live_note_off(&mut self, track: usize, pitch: u8) {
+        self.capture_push(track, pitch, 0, false);
+        if track >= NUM_TRACKS || track != self.rec_track {
+            return;
+        }
+        // No `recording` guard: a note is written because it was captured, not
+        // because capture is still running. That is what lets the pad you are
+        // holding when you press Rec survive — and a note that was never
+        // captured simply finds no entry. Notes accepted by the pre-roll window
+        // during the count-in resolve through the same lookup.
+        // Which list it came from decides the ceiling on its length: a note
+        // still being recorded may wrap the loop, a tail may not (see
+        // `rec_gate_limit`).
+        if let Some(i) = self.rec_pending.iter().rposition(|p| p.pitch == pitch) {
+            let p = self.rec_pending.swap_remove(i);
+            self.commit_rec_note(p, false);
+        } else if let Some(i) = self.rec_tail.iter().rposition(|p| p.pitch == pitch) {
+            let p = self.rec_tail.swap_remove(i);
+            self.commit_rec_note(p, true);
+        }
+    }
+
+    /// Where the transport is, in quarter notes since it started; None while
+    /// stopped. This is what movy's chains lock synced LFOs to, so it matches
+    /// schwung's transport service, which they were written against: beat 0 is
+    /// the moment tick 0 is SERVICED (where the first 0xF8 used to go out), and
+    /// between ticks the accumulator supplies the fraction. A tick fires when
+    /// the accumulator fills, so tick 0 lands one period after Play — hence the
+    /// `- 1`, and the clamp for the block before it.
+    pub fn beat_position(&self) -> Option<f64> {
+        if !self.playing {
+            return None;
+        }
+        // While following, ticks come from Move's clock, not the accumulator.
+        let frac = if self.follow_active() { 0.0 } else { self.clock.tick_fraction() };
+        Some(((self.master_tick as f64 + frac - 1.0).max(0.0)) / PPQN as f64)
+    }
+
+    /// Follow is automatic (design §7 Phase 3): engaged while we play and
+    /// Move's transport runs.
+    fn follow_active(&self) -> bool {
+        // Link wins over MIDI clock while it has peers (link_follow.rs).
+        self.playing && self.ext_running && !self.link.active()
+    }
+
+    /// External MIDI transport, delivered to movy-dsp on_midi.
+    /// Follow is automatic: engaged while we play and the external transport
+    /// runs (design §7 Phase 3). Engage/disengage edges are handled in
+    /// advance_block; this only maintains the external-clock model.
+    pub fn on_external_realtime(&mut self, status: u8, out: &mut Vec<OutEvent>) {
+        if self.link.active() {
+            return;
+        }
+        match status {
+            0xFA => {
+                self.ext_running = true;
+                self.ext_awaiting_first = true;
+                self.ext_ticks = 0;
+                self.ext_base = 0;
+                self.ext_base_set = true; // FA anchors bar 0; engage must not re-quantize
+                self.ext_last_frame = self.frame_now;
+                if self.playing {
+                    // Both transports start the bar together.
+                    self.flush_gates(out);
+                    self.start_transport();
+                }
+            }
+            0xFB => self.ext_running = true,
+            0xFC => self.ext_running = false,
+            0xF8 => {
+                if !self.ext_running {
+                    // Attached mid-song (no 0xFA): tempo is right immediately,
+                    // bar alignment arrives with the next 0xFA.
+                    self.ext_running = true;
+                    self.ext_awaiting_first = true;
+                }
+                if self.ext_awaiting_first {
+                    self.ext_awaiting_first = false;
+                    self.ext_ticks = 0;
+                } else {
+                    self.ext_ticks += 1;
+                    let delta = (self.frame_now - self.ext_last_frame) as f64;
+                    let sr = self.clock.sample_rate() as f64;
+                    // Accept only intervals inside 20–999 BPM at 24 PPQN.
+                    if delta >= 60.0 * sr / (999.0 * 24.0) && delta <= 60.0 * sr / (20.0 * 24.0) {
+                        self.ext_interval = if self.ext_interval <= 0.0 {
+                            delta
+                        } else {
+                            self.ext_interval + 0.25 * (delta - self.ext_interval)
+                        };
+                        // Continuous capture: the UI shows Move's tempo and a
+                        // revert keeps playing at it.
+                        let bpm = (60.0 * 100.0 * sr / (self.ext_interval * 24.0)).round() as u32;
+                        self.clock.set_bpm_x100(bpm);
+                    }
+                }
+                self.ext_last_frame = self.frame_now;
+            }
+            _ => {}
+        }
+    }
+
+    /// Advance one audio block; pushes due MIDI into `out`.
+    pub fn advance_block(&mut self, frames: u32, out: &mut Vec<OutEvent>) {
+        self.frame_now += frames as u64;
+
+        // Staleness: Move wedged without 0xFC must not freeze the playhead
+        // (0.5 s, mirrors schwung's transport service).
+        if self.ext_running
+            && self.ext_last_frame > 0
+            && self.frame_now - self.ext_last_frame > self.clock.sample_rate() as u64 / 2
+        {
+            self.ext_running = false;
+        }
+
+        // Follow engage/disengage edges (design §7 Phase 3).
+        let following = self.follow_active();
+        if following && !self.was_following {
+            // Close the internal clock session; schwung's transport service
+            // switches to Move's clock.
+            if self.emitting_clock {
+                self.emitting_clock = false;
+                out.push(OutEvent::Stop);
+            }
+            self.resume_anchor_pending = false;
+            if !self.ext_base_set {
+                // Joined an already-running Move: launch-quantize to Move's
+                // next bar so we start on the downbeat (0xFA anchors base 0
+                // itself). 96 ext ticks = one 4/4 bar at 24 PPQN.
+                self.ext_base = (self.ext_ticks / 96 + 1) * 96;
+                self.ext_base_set = true;
+                self.start_transport();
+            }
+        } else if !following && self.was_following {
+            // Move stopped (or we did): resume the internal accumulator from
+            // the current position; re-anchor emission at our next bar.
+            self.clock.reset();
+            self.clock.tick = self.master_tick;
+            self.ext_base_set = false;
+            if self.playing {
+                self.resume_anchor_pending = true;
+            }
+        }
+        self.was_following = following;
+
+        let fired: u64 = if following {
+            // Playhead target from Move's ticks: 24 → 96 PPQN, plus a
+            // block-interpolated fraction, clamped to one beat per block.
+            let mut abs = self.ext_ticks * 4;
+            if self.ext_interval > 0.0 {
+                let frac =
+                    ((self.frame_now - self.ext_last_frame) as f64 / self.ext_interval).min(1.0);
+                abs += (frac * 4.0) as u64;
+            }
+            abs.saturating_sub(self.ext_base * 4)
+                .saturating_sub(self.master_tick)
+                .min(96)
+        } else {
+            self.clock.advance(frames) as u64
+        };
+
+        // Internal transport edges (play/stop arrive via commands between
+        // blocks) so Start/Stop always pair correctly. Suppressed while
+        // following — a revert re-anchors at the bar boundary in the loop.
+        if self.playing && !self.emitting_clock && !following && !self.resume_anchor_pending {
+            self.emitting_clock = true;
+            out.push(OutEvent::Start);
+        } else if !self.playing && self.emitting_clock {
+            self.emitting_clock = false;
+            out.push(OutEvent::Stop);
+        }
+        if !self.playing {
+            return;
+        }
+        for _ in 0..fired {
+            // After reverting to internal clock, re-open the session (0xFA)
+            // at movy's own next bar boundary so LFOs re-lock to our grid.
+            if self.resume_anchor_pending
+                && !following
+                && self.master_tick % crate::TICKS_PER_BAR as u64 == 0
+            {
+                self.resume_anchor_pending = false;
+                self.emitting_clock = true;
+                out.push(OutEvent::Start);
+            }
+            // 96-PPQN master clock -> 24-PPQN MIDI clock, emitted before the
+            // tick is serviced so 0xF8 aligns with that tick's notes. Silent
+            // while following (Move's clock drives the slots instead).
+            if self.emitting_clock && !following && self.master_tick % 4 == 0 {
+                out.push(OutEvent::Clock);
+            }
+            self.service_tick(out);
+        }
+    }
+
+    fn service_tick(&mut self, out: &mut Vec<OutEvent>) {
+        // Bar boundary: metronome click + resolve queued launches / stops
+        // (1-bar launch quantization).
+        if self.master_tick % PPQN as u64 == 0
+            && (self.count_in_left > 0 || self.metronome)
+        {
+            out.push(OutEvent::Click {
+                accent: self.master_tick % (PPQN as u64 * 4) == 0,
+            });
+        }
+        if self.master_tick % crate::TICKS_PER_BAR as u64 == 0 {
+            /* A track lent to a freeze capture keeps its launches waiting
+             * (engine/freeze_lock.rs `freeze_swap_in`). */
+            let lock = &self.freeze_lock;
+            for (_, t) in self.tracks.iter_mut().enumerate().filter(|(i, _)| !lock.swapped(*i)) {
+                if let Some(slot) = t.queued_slot.take() {
+                    t.playing_slot = Some(slot);
+                    t.active_clip = slot;
+                    t.pos_tick = t.clips[slot].loop_start_ticks();
+                    // Stale per-pass flags from an earlier playing pass would
+                    // silence the first bar of the take we just launched.
+                    t.clips[slot].release_pass_flags();
+                    t.last_auto_step = -1;
+                    t.auto_step = -1;
+                    t.auto_cur = [-1; LANES];
+                    t.cycle = 1;
+                }
+                if t.pending_stop {
+                    t.pending_stop = false;
+                    t.playing_slot = None;
+                }
+                if let Some(sel) = t.pending_select.take() {
+                    t.active_clip = sel;
+                }
+            }
+            // The queued take starts here, on the same tick its clip launched —
+            // so capture begins at the clip's loop start, on the grid.
+            if self.pending_rec {
+                self.pending_rec = false;
+                self.recording = true;
+                // The launch reset the track's cycle; a pre-roll note captured
+                // just before the boundary still carries the old one, and
+                // `commit_rec_note` would wrap its lap count into a maximal gate.
+                let cycle = self.tracks[self.rec_track].cycle;
+                let rt = self.rec_track;
+                for p in self.rec_pending.iter_mut().filter(|p| p.track == rt) {
+                    p.start_cycle = cycle;
+                }
+            }
+            /* The song advances only once the queue above has resolved: the
+             * scene it armed a bar ago has just fallen in, and a one-bar entry
+             * has to be able to arm the next one on this same boundary without
+             * that launch being resolved by the loop we just ran. */
+            self.song_bar();
+        }
+        // Gate countdown now lives in step_tick (scaled per track), which only
+        // runs for a track playing an existing clip. Flush hanging note-offs for
+        // any track that is not (stopped/cleared) so notes never stick.
+        let mut gi = 0;
+        while gi < self.gates.len() {
+            let t = self.gates[gi].track as usize;
+            let serviced = self.tracks[t]
+                .playing_slot
+                .map(|s| self.tracks[t].clips[s].exists())
+                .unwrap_or(false);
+            if serviced {
+                gi += 1;
+            } else {
+                let g = self.gates.swap_remove(gi);
+                out.push(OutEvent::NoteOff { track: g.track, pitch: g.pitch });
+            }
+        }
+        self.master_tick += 1;
+        // Count-in elapses → capture begins.
+        if self.count_in_left > 0 {
+            self.count_in_left -= 1;
+            if self.count_in_left == 0 {
+                self.recording = true;
+            }
+        }
+
+        // No clip playback (and no playhead advance) during the count-in: the
+        // pre-roll bar only clicks; playback starts cleanly from loop-start on
+        // the tick the count-in reaches 0. Each track runs `step_tick` 0..N
+        // times this master tick, where N is set by the clip's playback scale
+        // accumulator (faster clips advance several ticks, slower ones skip).
+        if self.count_in_left == 0 {
+            for ti in 0..NUM_TRACKS {
+                let Some(slot) = self.tracks[ti].playing_slot else {
+                    continue;
+                };
+                if !self.tracks[ti].clips[slot].exists() {
+                    continue;
+                }
+                let (num, den) = {
+                    let c = &self.tracks[ti].clips[slot];
+                    (c.scale_num.max(1) as u32, c.scale_den.max(1) as u32)
+                };
+                self.tracks[ti].scale_acc += num;
+                while self.tracks[ti].scale_acc >= den {
+                    self.tracks[ti].scale_acc -= den;
+                    self.step_tick(ti, out);
+                }
+            }
+        }
+    }
+
+    /// One sequencer tick for a single playing track: emit due notes, advance +
+    /// wrap the playhead, latch parameter automation. Driven 0..N times per
+    /// master tick by the clip-scale accumulator (see service_tick).
+    fn step_tick(&mut self, ti: usize, out: &mut Vec<OutEvent>) {
+        let Some(slot) = self.tracks[ti].playing_slot else {
+            return;
+        };
+        if !self.tracks[ti].clips[slot].exists() {
+            return;
+        }
+        // Count this track's note gates down at the clip's scaled rate (this fn
+        // runs N times per master tick), emitting note-offs first so a same-pitch
+        // note starting this tick retriggers. Keeping the whole note lifecycle on
+        // the scaled clock makes gate length scale with the clip speed.
+        let mut gi = 0;
+        while gi < self.gates.len() {
+            if self.gates[gi].track == ti as u8 {
+                self.gates[gi].ticks_left -= 1;
+                if self.gates[gi].ticks_left == 0 {
+                    let g = self.gates.swap_remove(gi);
+                    out.push(OutEvent::NoteOff { track: g.track, pitch: g.pitch });
+                    continue; // re-examine the element swapped into this slot
+                }
+            }
+            gi += 1;
+        }
+        {
+            let muted = self.tracks[ti].muted;
+            let pos = self.tracks[ti].pos_tick;
+            if !muted {
+                    let len = self.tracks[ti].clips[slot].notes.len();
+                    let cycle = self.tracks[ti].cycle;
+                    let (snum, sden) = (
+                        self.tracks[ti].clips[slot].scale_num,
+                        self.tracks[ti].clips[slot].scale_den,
+                    );
+                    let quant = self.tracks[ti].clips[slot].quant.min(100) as i64;
+                    let clip_end = self.tracks[ti].clips[slot].loop_end_ticks();
+                    let clip_span = self.tracks[ti].clips[slot].length_ticks().max(1);
+                    // Per-tick decision cache: (note.step, governing-lane) -> play?
+                    // so a chord on one trig shares a single condition+probability
+                    // decision (all notes play or all skip). Few notes fire per
+                    // tick, so a small Vec scan is cheap.
+                    let mut decided: Vec<((u16, Option<u8>), bool)> = Vec::new();
+                    for ni in 0..len {
+                        let n = self.tracks[ti].clips[slot].notes[ni];
+                        // Non-destructive quantization scales how far a note
+                        // sits from its `step` anchor: full strength lands it
+                        // on the grid (what the old destructive quantize did),
+                        // zero leaves the tick that was played. Swing is added
+                        // at full weight either way — it is a groove control,
+                        // not a quantization one, and scaling it here would
+                        // silently disable the SWING knob for programmed
+                        // patterns, which sit exactly on the anchor.
+                        let anchor = n.step as u32 * TICKS_PER_STEP;
+                        let dev = n.tick as i64 - anchor as i64;
+                        let half = if dev >= 0 { 50 } else { -50 };
+                        let pulled = dev - (dev * quant + half) / 100;
+                        let mut fire_tick = (anchor as i64 + pulled
+                            + self.swing_delay(n.step, snum, sden) as i64)
+                            .max(0) as u32;
+                        // A note played just before a bar line anchors to the
+                        // next bar's downbeat, which at full strength lands on
+                        // the loop end — i.e. the loop start. Interpolating
+                        // toward the UNwrapped target and wrapping the result
+                        // keeps partial strengths from sweeping the note
+                        // backwards through the whole bar.
+                        if fire_tick >= clip_end {
+                            fire_tick -= clip_span;
+                        }
+                        if fire_tick != pos || n.suppress || n.fired {
+                            continue;
+                        }
+                        // Claimed before the trig decision: a note that rolls
+                        // "skip" has still had its turn this pass.
+                        self.tracks[ti].clips[slot].notes[ni].fired = true;
+                        let clip = &self.tracks[ti].clips[slot];
+                        let lane_key = if clip.trigs.iter()
+                            .any(|t| t.step == n.step && t.lane == Some(n.pitch))
+                        { Some(n.pitch) } else { None };
+                        let key = (n.step, lane_key);
+                        let play = if let Some(&(_, p)) = decided.iter().find(|(k, _)| *k == key) {
+                            p
+                        } else {
+                            let tp = clip.governing_trig(n.step, n.pitch);
+                            let cond = crate::clip::condition_plays(tp.cond_a, tp.cond_b, tp.invert, cycle);
+                            let p = cond && (tp.prob >= 100 || self.roll_pct() < tp.prob);
+                            decided.push((key, p));
+                            p
+                        };
+                        if !play {
+                            continue;
+                        }
+                        // Non-destructive clip transpose: shift only the emitted
+                        // pitch (and its gate, so note-off matches); stored notes
+                        // and live pads stay at concert pitch.
+                        let emit_pitch =
+                            (n.pitch as i32 + self.clip_transpose(ti, slot)).clamp(0, 127) as u8;
+                        /* Per-voice drum-pad mute and solo. Gated on the
+                         * EMITTED pitch, which is the note the synth would
+                         * receive: drum tracks have their transpose suppressed,
+                         * so for them this is the voice's own note. The clip
+                         * still advances — the same trade the track mute makes.
+                         *
+                         * Solo silences the OTHER voices by comparison rather
+                         * than by being folded into `pad_mutes`: the two are
+                         * separate fields on the track (see track.rs), so
+                         * un-soloing restores the user's own mutes without
+                         * anyone having to remember them.
+                         *
+                         * While a solo is up the mute set is not consulted at
+                         * all — solo decides, so the soloed voice sounds even
+                         * if the user had muted it. Same precedence as the
+                         * track mute. */
+                        if self.tracks[ti].pad_voice_silent(emit_pitch) {
+                            continue;
+                        }
+                        /* THE LOCK MUST PRECEDE ITS NOTE. A drum voice
+                         * latches its params at note-on, so a lock applied
+                         * after it is heard on the NEXT hit. Step entry covers
+                         * a note on the grid (it is applied a tick early); a
+                         * note nudged early, one wrapped onto the previous
+                         * pass, and the first tick after Play all fire before
+                         * their step is entered, so they apply it here.
+                         * Emission is on-change, so the entry that follows
+                         * adds nothing. */
+                        if self.tracks[ti].auto_step != n.step as i32 {
+                            self.emit_automation(ti, slot, n.step, out);
+                        }
+                        /* LENGTHS ARE STORED AS ASKED; THIS IS WHERE THEY ARE
+                         * CUT (`Clip::max_gate_at` is the same rule, for the
+                         * UI). A note still sounding at its own pitch ends here,
+                         * or its later note-off would end the new one early; and
+                         * no gate rings past the loop end into the next pass.
+                         * Compared on the EMITTED pitch: that is the note the
+                         * synth holds. */
+                        if let Some(gi) = self.gates.iter()
+                            .position(|g| g.track == ti as u8 && g.pitch == emit_pitch)
+                        {
+                            self.gates.swap_remove(gi);
+                            out.push(OutEvent::NoteOff { track: ti as u8, pitch: emit_pitch });
+                        }
+                        out.push(OutEvent::NoteOn { track: ti as u8, pitch: emit_pitch, vel: n.vel });
+                        self.gates.push(Gate {
+                            track: ti as u8,
+                            pitch: emit_pitch,
+                            ticks_left: n.gate.min(clip_end.saturating_sub(pos)).max(1),
+                        });
+                    }
+                }
+                // Advance + wrap inside the loop window [start, start+len). On
+                // wrap, recorded notes become audible for the next pass. While
+                // recording into this track, the clip extends bar-by-bar (up to
+                // 16) instead of wrapping — native "length extends until stop".
+                let start = self.tracks[ti].clips[slot].loop_start_ticks();
+                let end = self.tracks[ti].clips[slot].loop_end_ticks();
+                let recording_here = self.recording && ti == self.rec_track;
+                let bar = crate::STEPS_PER_BAR as u16;
+                self.tracks[ti].pos_tick += 1;
+                if self.tracks[ti].pos_tick >= end {
+                    let c = &mut self.tracks[ti].clips[slot];
+                    // "Record until stop" grows a fresh clip bar by bar — but a
+                    // sub-bar length is a deliberate LENGTH-knob choice, so only
+                    // auto-grow bar-aligned clips and leave custom lengths fixed.
+                    if recording_here && self.rec_empty_start
+                        && c.length_steps % bar == 0
+                        && c.loop_start_steps + c.length_steps + bar <= crate::clip::MAX_STEPS
+                    {
+                        c.set_loop(c.loop_start_steps, c.length_steps + bar);
+                    } else {
+                        self.tracks[ti].pos_tick = start;
+                        self.tracks[ti].clips[slot].release_pass_flags();
+                        self.tracks[ti].cycle = self.tracks[ti].cycle.wrapping_add(1);
+                    }
+                }
+                self.expire_rec_tail(ti);
+                // Parameter automation: emit on step entry (revert-to-base).
+                let cur = (self.tracks[ti].pos_tick / TICKS_PER_STEP) as i32;
+                if cur != self.tracks[ti].last_auto_step {
+                    self.tracks[ti].last_auto_step = cur;
+                    self.emit_automation(ti, slot, cur as u16, out);
+                }
+        }
+    }
+
+    /// Emit automation values for `track` entering `step` (the latch). Each
+    /// assigned lane resolves to: its lock at this step (a new automation
+    /// point), else base if a note is anchored here (a note on a step other
+    /// than the latch origin ends it), else the carried value (latch holds).
+    /// Emits only when the value changes; carry persists across the loop
+    /// boundary because `auto_cur` is not reset on wrap.
+    fn emit_automation(&mut self, track: usize, slot: usize, step: u16, out: &mut Vec<OutEvent>) {
+        /* One pass over the clip's locks, not one `lock_at` scan per lane: with
+         * 32 lanes and up to MAX_LOCKS locks that is the difference between
+         * O(locks) and O(lanes × locks) on the audio thread, every step. */
+        let mut here = [-1i16; LANES];
+        let has_notes = {
+            let clip = &self.tracks[track].clips[slot];
+            for l in clip.locks.iter().filter(|l| l.step == step) {
+                if let Some(h) = here.get_mut(l.lane as usize) {
+                    *h = l.val as i16;
+                }
+            }
+            clip.step_has_notes(step)
+        };
+        let t = &mut self.tracks[track];
+        t.auto_step = step as i32;
+        for lane in 0..LANES {
+            if !t.lane_assigned[lane] {
+                continue;
+            }
+            let v: i16 = if here[lane] >= 0 {
+                here[lane]
+            } else if has_notes || t.auto_cur[lane] < 0 {
+                t.lane_base[lane] as i16
+            } else {
+                t.auto_cur[lane]
+            };
+            if v != t.auto_cur[lane] {
+                t.auto_cur[lane] = v;
+                out.push(OutEvent::Auto { track: track as u8, lane: lane as u8, val: v as u8 });
+            }
+        }
+    }
+
+    pub fn set_held_query(&mut self, q: Option<(usize, u16)>) {
+        self.held_query = q;
+    }
+
+    // ── Parameter automation commands (lane 0..LANES, val 0..=127) ─────────────
+
+    pub fn auto_label(&mut self, track: usize, lane: usize, label: &str) {
+        if track < NUM_TRACKS && lane < LANES {
+            self.tracks[track].lane_assigned[lane] = true;
+            self.tracks[track].lane_label[lane] = label.to_string();
+        }
+    }
+
+    pub fn auto_base(&mut self, track: usize, lane: usize, val: u8, out: &mut Vec<OutEvent>) {
+        if track < NUM_TRACKS && lane < LANES {
+            self.tracks[track].lane_base[lane] = val;
+            if self.tracks[track].lane_assigned[lane] {
+                out.push(OutEvent::Auto { track: track as u8, lane: lane as u8, val });
+            }
+        }
+    }
+
+    /// Set the lane base WITHOUT emitting a CC. The UI uses this when the user
+    /// edits the original value via the normal param path (which already applied
+    /// it to the synth) — the base only needs to update so playback reverts to
+    /// it on un-locked steps.
+    pub fn auto_base_quiet(&mut self, track: usize, lane: usize, val: u8) {
+        if track < NUM_TRACKS && lane < LANES {
+            self.tracks[track].lane_base[lane] = val;
+        }
+    }
+
+    pub fn auto_set(&mut self, track: usize, lane: usize, step: u16, val: u8, audition: bool,
+                    out: &mut Vec<OutEvent>) {
+        if track < NUM_TRACKS && lane < LANES {
+            self.tracks[track].active_mut().set_lock(lane as u8, step, val);
+            // Audition: apply now (stopped) / refresh (playing) for the edited lane.
+            if audition && self.tracks[track].lane_assigned[lane] {
+                out.push(OutEvent::Auto { track: track as u8, lane: lane as u8, val });
+            }
+        }
+    }
+
+    /// Set one lane's lock for every step in [s0, s1] (hold-a-bar set). Emits a
+    /// single audition CC with the value if the lane is assigned and `audition`.
+    pub fn auto_set_range(&mut self, track: usize, lane: usize, s0: u16, s1: u16, val: u8,
+                          audition: bool, out: &mut Vec<OutEvent>) {
+        if track < NUM_TRACKS && lane < LANES {
+            self.tracks[track].active_mut().set_lock_range(lane as u8, s0, s1, val);
+            if audition && self.tracks[track].lane_assigned[lane] {
+                out.push(OutEvent::Auto { track: track as u8, lane: lane as u8, val });
+            }
+        }
+    }
+
+    pub fn auto_clear(&mut self, track: usize, lane: usize) {
+        if track < NUM_TRACKS && lane < LANES {
+            for c in &mut self.tracks[track].clips {
+                c.clear_lane(lane as u8);
+            }
+            self.tracks[track].lane_assigned[lane] = false;
+            self.tracks[track].lane_label[lane].clear();
+        }
+    }
+
+    /// Remove one lane's lock at a single step (active clip). The step reverts
+    /// to base; the lane is freed if that was its last lock across all clips.
+    pub fn auto_clear_step(&mut self, track: usize, lane: usize, step: u16) {
+        if track < NUM_TRACKS && lane < LANES {
+            self.tracks[track].active_mut().clear_lock(lane as u8, step);
+            self.free_unused_lanes(track);
+        }
+    }
+
+    /// Remove all lanes' locks at a single step (active clip) — clear all
+    /// automation on that step. Any lane left with no locks anywhere is freed.
+    pub fn auto_clear_step_all(&mut self, track: usize, step: u16) {
+        if track < NUM_TRACKS {
+            self.tracks[track].active_mut().clear_step_locks(step);
+            self.free_unused_lanes(track);
+        }
+    }
+
+    /// All lanes' labels for every track, for the UI to rebuild its registry +
+    /// re-apply chain knob mappings after a load. Format: tracks ',', lanes '.',
+    /// each label or '-'.
+    pub fn auto_labels(&self) -> String {
+        let mut out = String::new();
+        for (ti, t) in self.tracks.iter().enumerate() {
+            if ti > 0 {
+                out.push(',');
+            }
+            for lane in 0..LANES {
+                if lane > 0 {
+                    out.push('.');
+                }
+                let l = &t.lane_label[lane];
+                out.push_str(if l.is_empty() { "-" } else { l });
+            }
+        }
+        out
+    }
+
+    /// The value each assigned lane REVERTS to — what the user dialled in,
+    /// which is not what the parameter holds while a lane is driving it.
+    ///
+    /// Same shape as `auto_labels` so the two strings index identically:
+    /// tracks ',', lanes '.', an unassigned lane '-'. The UI knows this number
+    /// already for every base IT sent (`abase`/`abaseq`); this read-back exists
+    /// for the one case it cannot know — a Set the engine restored, whose lanes
+    /// the UI rebuilds from `alabels` without ever having emitted their bases.
+    /// Without it a loaded Set has no base to show until the knob is turned
+    /// once (SP-36).
+    pub fn auto_bases(&self) -> String {
+        let mut out = String::new();
+        for (ti, t) in self.tracks.iter().enumerate() {
+            if ti > 0 {
+                out.push(',');
+            }
+            for lane in 0..LANES {
+                if lane > 0 {
+                    out.push('.');
+                }
+                if t.lane_assigned[lane] {
+                    out.push_str(&t.lane_base[lane].to_string());
+                } else {
+                    out.push('-');
+                }
+            }
+        }
+        out
+    }
+
+    fn held_len_steps(&self) -> u16 {
+        match self.held_query {
+            Some((t, step)) if t < NUM_TRACKS => self.tracks[t].active().note_len_steps_at(step),
+            _ => 0,
+        }
+    }
+
+    /// Held-step readout: (avg velocity, gate ticks of first note, mixed-gate
+    /// flag). lane filtered by watch_lane (None = melodic). Zeros when no step
+    /// held / empty.
+    fn held_note_stats(&self) -> (u8, u32, bool) {
+        let Some((t, step)) = self.held_query else { return (0, 0, false); };
+        if t >= NUM_TRACKS { return (0, 0, false); }
+        let lane = self.watch_lane;
+        let clip = self.tracks[t].active();
+        let mut sum: u32 = 0;
+        let mut count: u32 = 0;
+        let mut gate0: Option<u32> = None;
+        let mut mixed = false;
+        for n in clip.notes.iter().filter(|n| n.step == step && lane.map_or(true, |p| n.pitch == p)) {
+            sum += n.vel as u32;
+            count += 1;
+            match gate0 {
+                None => gate0 = Some(n.gate),
+                Some(g) if g != n.gate => mixed = true,
+                _ => {}
+            }
+        }
+        if count == 0 { return (0, 0, false); }
+        ((sum / count) as u8, gate0.unwrap_or(0), mixed)
+    }
+
+    /// Max gate ticks the held note can grow to (cap by next note / clip end),
+    /// 0 when none — lets the UI flag "can't be longer (blocked by next note)".
+    fn held_max_gate(&self) -> u32 {
+        match self.held_query {
+            Some((t, step)) if t < NUM_TRACKS => {
+                self.tracks[t].active().held_note_max_gate(step, self.watch_lane)
+            }
+            _ => 0,
+        }
+    }
+
+    /// Resolved trig props at the held step (lane = watch_lane), defaults otherwise.
+    fn held_trig(&self) -> crate::clip::TrigProps {
+        match self.held_query {
+            Some((t, step)) if t < NUM_TRACKS => {
+                let pitch = self.watch_lane.unwrap_or(0);
+                self.tracks[t].active().governing_trig(step, pitch)
+            }
+            _ => crate::clip::TrigProps::DEFAULT,
+        }
+    }
+
+    /// `hnotes=` payload: dot-separated pitches in the held step, empty when no step held.
+    fn held_notes_state(&self) -> String {
+        match self.held_query {
+            Some((t, step)) if t < NUM_TRACKS => {
+                let mut pitches: Vec<u8> = self.tracks[t]
+                    .active()
+                    .notes_at_step(step)
+                    .map(|n| n.pitch)
+                    .collect();
+                pitches.sort_unstable();
+                pitches.dedup();
+                pitches.iter().enumerate().fold(String::new(), |mut s, (i, p)| {
+                    if i > 0 { s.push('.'); }
+                    s.push_str(&p.to_string());
+                    s
+                })
+            }
+            _ => String::new(),
+        }
+    }
+
+    /// Serialize the whole persistent state for the undo ring. Same bytes the
+    /// autosave uses, so one format serves both and cannot drift.
+    pub fn undo_snapshot(&self) -> String {
+        crate::persist::serialize(self)
+    }
+
+    /// Restore a snapshot **without stopping the music**.
+    ///
+    /// Transport is deliberately absent from the serialized format (see
+    /// `persist.rs`), so `persist::load` clears the playing/queued slots on its
+    /// way through. That is right for a set load and wrong for an undo: fixing
+    /// a mistake mid-jam must not silence the tracks. So the fields `load`
+    /// clobbers are carried across it by hand.
+    pub fn undo_restore(&mut self, blob: &str) -> bool {
+        let transport: Vec<(Option<usize>, Option<usize>, bool)> = self
+            .tracks
+            .iter()
+            .map(|t| (t.playing_slot, t.queued_slot, t.pending_stop))
+            .collect();
+
+        /* A frozen track's clips are what its loop was recorded from: an undo
+         * of an edit made before the freeze must not change them under it. */
+        let kept = self.freeze_lock.keep_clips(&self.tracks);
+        if !crate::persist::load(self, blob) {
+            return false;
+        }
+        self.freeze_lock.put_back(&mut self.tracks, kept);
+
+        for (t, (playing, queued, pending)) in self.tracks.iter_mut().zip(transport) {
+            t.playing_slot = playing;
+            t.queued_slot = queued;
+            t.pending_stop = pending;
+            /* A restore that shortens (or removes) the clip under the playhead
+             * can leave pos_tick past its end, where the wrap test never fires
+             * and the track plays silence forever. */
+            let len = t.playing().map(|c| c.length_ticks()).unwrap_or(0);
+            if len == 0 {
+                t.pos_tick = 0;
+            } else if t.pos_tick >= len {
+                t.pos_tick %= len;
+            }
+        }
+        /* The UI's autosave only writes when the engine reports dirty; without
+         * this an undo is silently dropped at the next save. */
+        self.dirty = true;
+        true
+    }
+
+    /// Compact status string the UI polls (space-separated key=value; the
+    /// UI ignores unknown keys, so this can grow freely).
+    pub fn status(&self) -> String {
+        let wt = &self.tracks[self.watch_track];
+        let clip = wt.active();
+        let alanes = wt
+            .lane_assigned
+            .iter()
+            .enumerate()
+            .fold(0u32, |m, (i, &a)| if a { m | (1 << i) } else { m });
+        let aauto = clip.automated_lanes();
+        let hauto = match self.held_query {
+            Some((t, step)) if t < NUM_TRACKS => {
+                let mut v: Vec<(u8, u8)> = self.tracks[t].active().locks_at_step(step).collect();
+                v.sort_unstable();
+                v.iter().enumerate().fold(String::new(), |mut s, (i, (l, val))| {
+                    if i > 0 {
+                        s.push('.');
+                    }
+                    s.push_str(&format!("{l}:{val}"));
+                    s
+                })
+            }
+            _ => String::new(),
+        };
+        let (hvel, hgate, hgmix) = self.held_note_stats();
+        let htp = self.held_trig();
+        let hlmax = self.held_max_gate();
+        format!(
+            "play={} tick={} bpm={} ext={} trk={} step={} pos={} len={} lstart={} rec={} cin={} metro={} dirty={} sess={} act={} mute={} wpad={} hlen={} hnotes={} occ={} alanes={:08x} aauto={:08x} hauto={} hvel={} hgate={} hgmix={} hprob={} hcond={}:{} hinv={} hlmax={} swing={} csc={}/{} ctr={} quant={} dquant={} cap={}.{} song={} nh={:08x}",
+            self.playing as u8,
+            self.master_tick,
+            self.clock.bpm_x100(),
+            self.follow_active() as u8,
+            self.watch_track,
+            wt.current_step(),
+            wt.pos_tick,
+            clip.length_steps,
+            clip.loop_start_steps,
+            self.recording as u8,
+            self.counting_in() as u8,
+            self.metronome as u8,
+            self.dirty as u8,
+            self.session_state(),
+            self.active_notes_state(),
+            self.mute_state(),
+            self.pad_mute_state(),
+            self.held_len_steps(),
+            self.held_notes_state(),
+            clip.occupancy_hex_lane(self.watch_lane),
+            alanes,
+            aauto,
+            hauto,
+            hvel,
+            hgate,
+            hgmix as u8,
+            htp.prob,
+            htp.cond_a,
+            htp.cond_b,
+            htp.invert as u8,
+            hlmax,
+            self.swing_pct,
+            clip.scale_num,
+            clip.scale_den,
+            clip.transpose,
+            clip.quant,
+            self.default_quant,
+            self.capture.pending(self.watch_track as u8),
+            self.capture_gen,
+            self.song_state(),
+            self.note_view_hash(),
+        )
+    }
+
+    /// `mute=` payload: one '0'/'1' per track (track 0 first).
+    fn mute_state(&self) -> String {
+        let mut out = String::with_capacity(4);
+        for t in &self.tracks {
+            out.push(if t.muted { '1' } else { '0' });
+        }
+        out
+    }
+
+    /// `wpad=` payload for the WATCHED track: the soloed note (or -1), then the
+    /// muted notes, dot-separated ascending — `-1:36.38`, `42:36.38`, `-1:`.
+    ///
+    /// The watched track only: the drum grid the UI paints belongs to the track
+    /// it is showing, and sending all sixteen would be sixteen times the traffic
+    /// for the same one answer.
+    ///
+    /// The mute set travels even while a solo is up, so un-soloing restores the
+    /// user's own mutes from the same read that cleared the solo — the LED
+    /// cannot be left grey by a payload that dropped them.
+    fn pad_mute_state(&self) -> String {
+        let t = &self.tracks[self.watch_track];
+        let mut out = String::with_capacity(16);
+        out.push_str(&match t.pad_solo {
+            Some(n) => n.to_string(),
+            None => "-1".to_string(),
+        });
+        out.push(':');
+        let mut notes = t.pad_mutes.clone();
+        notes.sort_unstable(); // the mute set is a set; the wire is sorted
+        for (i, n) in notes.iter().enumerate() {
+            if i > 0 {
+                out.push('.');
+            }
+            out.push_str(&n.to_string());
+        }
+        out
+    }
+
+    /// `act=` payload: 4 comma-separated tracks, each dot-separated ascending
+    /// pitches currently sounding. Derived from the open gates, which are
+    /// exactly the sequenced notes still ringing — live pad notes are sounded
+    /// by the UI directly and never become gates, so they are excluded here.
+    fn active_notes_state(&self) -> String {
+        let mut out = String::with_capacity(48);
+        for t in 0..NUM_TRACKS {
+            if t > 0 {
+                out.push(',');
+            }
+            let mut pitches: Vec<u8> = self
+                .gates
+                .iter()
+                .filter(|g| g.track as usize == t)
+                .map(|g| g.pitch)
+                .collect();
+            pitches.sort_unstable();
+            pitches.dedup();
+            for (i, p) in pitches.iter().enumerate() {
+                if i > 0 {
+                    out.push('.');
+                }
+                out.push_str(&p.to_string());
+            }
+        }
+        out
+    }
+
+    /// Per-track Session grid state for the UI: tracks joined by ',', each
+    /// `EE.P.Q.S` — EE = 2-hex bitmap of occupied slots, P/Q/S = playing /
+    /// queued / selected slot (digit, or '-' for none).
+    /// `song=` — the raw scene list and which entry is playing, e.g.
+    /// `1:1,2,2,3` (on the entry that starts at press 1). `-` when there is no
+    /// song. Never contains a space: status is space-separated key=value.
+    fn song_state(&self) -> String {
+        if self.song.is_empty() {
+            return "-".to_string();
+        }
+        let mut out = String::with_capacity(2 + self.song.len() * 2);
+        out.push_str(&self.song_pos.to_string());
+        out.push(':');
+        for (i, s) in self.song.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            out.push_str(&s.to_string());
+        }
+        out
+    }
+
+    fn session_state(&self) -> String {
+        let slot = |o: Option<usize>| o.map_or('-', |s| (b'0' + s as u8) as char);
+        let mut out = String::with_capacity(40);
+        for (i, t) in self.tracks.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            let mut exist = 0u8;
+            for (s, c) in t.clips.iter().enumerate() {
+                if c.exists() {
+                    exist |= 1 << s;
+                }
+            }
+            out.push_str(&format!(
+                "{:02x}.{}.{}.{}",
+                exist,
+                slot(t.playing_slot),
+                slot(t.queued_slot),
+                (b'0' + t.active_clip as u8) as char
+            ));
+        }
+        out
+    }
+}
+
+/// Is `lane` one of the lanes in `mask` (bit `lane`)?
+fn lane_in(mask: u32, lane: u8) -> bool {
+    lane < 32 && mask & (1u32 << lane) != 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::clip::TrigProps;
+    use crate::command::apply_batch;
+    use crate::TICKS_PER_STEP;
+
+    const RATE: u32 = 44100;
+    const FRAMES: u32 = 128;
+
+    fn engine() -> Engine {
+        Engine::new(RATE, 12000)
+    }
+
+    #[test]
+    fn play_alone_refuses_an_empty_track() {
+        let mut e = engine();
+        assert!(!e.play_alone(3));
+        assert!(!e.playing);
+    }
+
+    #[test]
+    fn a_step_on_one_track_does_not_appear_on_others() {
+        // Reported on device: entering steps on track 1 also set them on
+        // tracks 5, 9 and 13 — a stride-4 alias.
+        let mut e = engine();
+        apply_batch(&mut e, "tog 0 0 60 100", &mut Vec::new());
+        for t in 1..NUM_TRACKS {
+            let n = e.tracks[t].active().notes.len();
+            assert_eq!(n, 0, "track {} gained a note from a track-0 edit", t);
+        }
+        assert_eq!(e.tracks[0].active().notes.len(), 1, "track 0 kept its note");
+    }
+
+    #[test]
+    fn engine_has_sixteen_tracks() {
+        let e = engine();
+        assert_eq!(e.tracks.len(), 16, "engine must expose 16 tracks");
+    }
+
+    #[test]
+    fn status_reports_every_track() {
+        let e = engine();
+        let s = e.status();
+        let mute = s.split("mute=").nth(1).unwrap().split(' ').next().unwrap();
+        assert_eq!(mute.len(), 16, "mute= carries one flag per track");
+        let sess = s.split("sess=").nth(1).unwrap().split(' ').next().unwrap();
+        assert_eq!(sess.split(',').count(), 16, "sess= carries one group per track");
+        let act = s.split("act=").nth(1).unwrap().split(' ').next().unwrap();
+        assert_eq!(act.split(',').count(), 16, "act= carries one group per track");
+    }
+
+    /* `beat_position` is what movy's chains lock synced LFOs to (the vtable
+     * movy-dsp synthesises). One block of 128 frames at 120 BPM is ~0.0058
+     * beats, so "within a block" below means within that. */
+    const BLOCK_BEATS_120: f64 = FRAMES as f64 / RATE as f64 * 2.0;
+
+    #[test]
+    fn beat_position_is_none_while_stopped() {
+        let mut e = engine();
+        assert_eq!(e.beat_position(), None);
+        let mut out = Vec::new();
+        e.advance_block(FRAMES, &mut out);
+        assert_eq!(e.beat_position(), None, "a stopped clock has no position");
+    }
+
+    #[test]
+    fn beat_position_counts_quarter_notes_at_the_tempo() {
+        let mut e = engine();
+        e.play();
+        assert_eq!(e.beat_position(), Some(0.0), "Play is beat 0");
+        let mut out = Vec::new();
+        let blocks = RATE / FRAMES; // ~1 s at 120 BPM = 2 beats
+        for _ in 0..blocks {
+            e.advance_block(FRAMES, &mut out);
+        }
+        let want = blocks as f64 * FRAMES as f64 / RATE as f64 * 2.0;
+        let got = e.beat_position().unwrap();
+        // Beat 0 is tick 0 serviced, one tick after Play.
+        let tick = 1.0 / PPQN as f64;
+        assert!((got - (want - tick)).abs() < 1e-9, "got {got}, want {}", want - tick);
+    }
+
+    #[test]
+    fn beat_position_lands_on_the_beat_its_midi_clock_marks() {
+        // The 0xF8 stream schwung counted is the old source of truth: the
+        // block that emits clock #24 is the block that crosses beat 1.
+        let mut e = engine();
+        e.play();
+        let mut clocks = 0;
+        let mut out = Vec::new();
+        while clocks < 25 {
+            out.clear();
+            e.advance_block(FRAMES, &mut out);
+            clocks += out.iter().filter(|ev| matches!(ev, OutEvent::Clock)).count();
+        }
+        let b = e.beat_position().unwrap();
+        assert!((1.0..1.0 + BLOCK_BEATS_120).contains(&b), "clock #24 at beat {b}");
+    }
+
+    #[test]
+    fn beat_position_does_not_jump_on_a_tempo_change() {
+        let mut e = engine();
+        e.play();
+        let mut out = Vec::new();
+        for _ in 0..200 {
+            e.advance_block(FRAMES, &mut out);
+        }
+        let before = e.beat_position().unwrap();
+        e.clock.set_bpm_x100(24000);
+        e.advance_block(FRAMES, &mut out);
+        let after = e.beat_position().unwrap();
+        // One block at the NEW tempo is 2x the 120 BPM block.
+        assert!(after > before && after - before < 2.0 * BLOCK_BEATS_120 + 1e-9,
+                "{before} -> {after}");
+    }
+
+    #[test]
+    fn beat_position_restarts_from_zero_on_the_next_play() {
+        let mut e = engine();
+        e.play();
+        let mut out = Vec::new();
+        for _ in 0..500 {
+            e.advance_block(FRAMES, &mut out);
+        }
+        e.stop(&mut out);
+        assert_eq!(e.beat_position(), None);
+        e.play();
+        e.advance_block(FRAMES, &mut out);
+        assert!(e.beat_position().unwrap() < BLOCK_BEATS_120, "a new Play is a new song position");
+    }
+
+    /// Run blocks until `ticks` master ticks have elapsed; collect events.
+    fn run_ticks(e: &mut Engine, ticks: u64) -> Vec<OutEvent> {
+        let mut out = Vec::new();
+        let start = e.clock.tick;
+        while e.clock.tick < start + ticks {
+            e.advance_block(FRAMES, &mut out);
+        }
+        out
+    }
+
+    /// 125 BPM at 24 PPQN / 44100 Hz = exactly 882 frames per external tick.
+    const EXT_TICK_FRAMES: u32 = 882;
+
+    /// Feed `n` external ticks with real frame spacing.
+    fn run_ext_ticks(e: &mut Engine, n: u32, out: &mut Vec<OutEvent>) {
+        for _ in 0..n {
+            let mut left = EXT_TICK_FRAMES;
+            while left > 0 {
+                let step = left.min(FRAMES);
+                e.advance_block(step, out);
+                left -= step;
+            }
+            e.on_external_realtime(0xF8, out);
+        }
+    }
+
+    /* ── undo restore ─────────────────────────────────────────────────────
+     * The point of these is that undo does NOT behave like a set load. The
+     * shared serialization makes the content half trivially right; what has to
+     * be proven is everything persist::load deliberately throws away. */
+
+    /// A playing engine with one 16-step clip of notes on track 0.
+    fn playing_engine() -> Engine {
+        let mut e = engine();
+        let mut out = Vec::new();
+        apply_batch(&mut e, "tog 0 0 60 100;tog 0 4 62 100;clen 0 16", &mut out);
+        apply_batch(&mut e, "play", &mut out);
+        run_ticks(&mut e, 4);
+        e
+    }
+
+    #[test]
+    fn undo_restore_keeps_transport_running() {
+        let mut e = playing_engine();
+        let snap = e.undo_snapshot();
+        let (playing, slot) = (e.playing, e.tracks[0].playing_slot);
+        assert!(playing && slot.is_some(), "fixture must be playing");
+
+        let mut out = Vec::new();
+        apply_batch(&mut e, "tog 0 8 64 100", &mut out);
+        assert!(e.undo_restore(&snap));
+
+        assert!(e.playing, "undo stopped the transport");
+        assert_eq!(e.tracks[0].playing_slot, slot, "undo dropped the playing slot");
+    }
+
+    #[test]
+    fn undo_restore_wraps_playhead_past_shortened_clip() {
+        let mut e = playing_engine();
+        let mut out = Vec::new();
+        // Snapshot a SHORT clip, then grow it and park the playhead past the
+        // short length. Restoring must pull the playhead back into range.
+        apply_batch(&mut e, "clen 0 4", &mut out);
+        let snap = e.undo_snapshot();
+        apply_batch(&mut e, "clen 0 16", &mut out);
+        e.tracks[0].pos_tick = TICKS_PER_STEP * 12;
+
+        assert!(e.undo_restore(&snap));
+        let len = e.tracks[0].playing().map(|c| c.length_ticks()).unwrap_or(0);
+        assert!(len > 0, "clip should still exist");
+        assert!(
+            e.tracks[0].pos_tick < len,
+            "playhead {} left past clip end {}",
+            e.tracks[0].pos_tick,
+            len
+        );
+    }
+
+    #[test]
+    fn undo_restore_sets_dirty() {
+        let mut e = playing_engine();
+        let snap = e.undo_snapshot();
+        let mut out = Vec::new();
+        apply_batch(&mut e, "tog 0 8 64 100", &mut out);
+        e.dirty = false; // as if the autosave had just read `state`
+
+        assert!(e.undo_restore(&snap));
+        assert!(e.dirty, "an undone edit must still be persisted");
+    }
+
+    #[test]
+    fn undo_restore_rejects_a_foreign_blob() {
+        let mut e = playing_engine();
+        assert!(!e.undo_restore("not-a-movy-blob\n"));
+    }
+
+    #[test]
+    fn undo_restore_round_trips_content() {
+        let mut e = playing_engine();
+        let before = e.undo_snapshot();
+        let mut out = Vec::new();
+        apply_batch(&mut e, "tog 0 8 64 100;clipdel 0 0", &mut out);
+        let after = e.undo_snapshot();
+        assert_ne!(before, after, "the edit must have changed something");
+
+        assert!(e.undo_restore(&before));
+        assert_eq!(e.undo_snapshot(), before, "undo did not restore the state");
+        assert!(e.undo_restore(&after));
+        assert_eq!(e.undo_snapshot(), after, "redo did not restore the state");
+    }
+
+    #[test]
+    fn ext_tempo_is_captured_into_engine_bpm() {
+        let mut e = engine(); // 120.00 BPM internally
+        let mut out = Vec::new();
+        e.on_external_realtime(0xFA, &mut out);
+        e.on_external_realtime(0xF8, &mut out); // anchor tick 0
+        run_ext_ticks(&mut e, 24, &mut out);
+        let bpm = e.clock.bpm_x100();
+        assert!((12450..=12550).contains(&bpm), "captured {bpm}, want ~12500");
+    }
+
+    #[test]
+    fn follow_locks_playhead_to_ext_ticks() {
+        let mut e = engine();
+        e.play();
+        let mut out = Vec::new();
+        e.on_external_realtime(0xFA, &mut out);
+        e.on_external_realtime(0xF8, &mut out);
+        run_ext_ticks(&mut e, 24, &mut out); // one external beat
+        // 24 ext ticks × 4 = 96 master ticks, ± the interpolated tail.
+        assert!((92..=100).contains(&e.master_tick), "master {}", e.master_tick);
+    }
+
+    #[test]
+    fn no_internal_clock_emission_while_following() {
+        let mut e = engine();
+        e.play();
+        let mut out = Vec::new();
+        e.advance_block(FRAMES, &mut out); // internal Start fires first
+        out.clear();
+        e.on_external_realtime(0xFA, &mut out);
+        e.on_external_realtime(0xF8, &mut out);
+        run_ext_ticks(&mut e, 48, &mut out);
+        let stops = out.iter().filter(|x| matches!(x, OutEvent::Stop)).count();
+        assert_eq!(stops, 1, "internal session closed exactly once on engage");
+        assert!(out.iter().all(|x| !matches!(x, OutEvent::Clock | OutEvent::Start)));
+    }
+
+    #[test]
+    fn fa_reanchors_pattern_and_flushes_gates() {
+        let mut e = engine();
+        e.tracks[0].active_mut().toggle_step(0, &[(60, 100)]);
+        e.play();
+        // A toggled step's gate is TICKS_PER_STEP (24), so run only 10 ticks —
+        // the note is still sounding when Move's FA re-anchors.
+        let _ = run_ticks(&mut e, 10); // internal playback, gate open
+        let mut out = Vec::new();
+        e.on_external_realtime(0xFA, &mut out);
+        assert!(out.contains(&OutEvent::NoteOff { track: 0, pitch: 60 }));
+        assert_eq!(e.master_tick, 0);
+        assert!(e.playing);
+    }
+
+    #[test]
+    fn engaging_mid_song_waits_for_moves_next_bar() {
+        let mut e = engine();
+        e.tracks[0].active_mut().toggle_step(0, &[(60, 100)]);
+        let mut out = Vec::new();
+        // Move already running, unanchored, 10 ticks into wherever.
+        e.on_external_realtime(0xF8, &mut out);
+        run_ext_ticks(&mut e, 10, &mut out);
+        e.play();
+        // Up to the bar boundary (96 ext ticks) movy holds at 0…
+        run_ext_ticks(&mut e, 40, &mut out);
+        assert_eq!(e.master_tick, 0, "waits for Move's bar");
+        // …then starts on the downbeat.
+        run_ext_ticks(&mut e, 50, &mut out);
+        assert!(e.master_tick > 0, "started after Move's bar boundary");
+        assert!(out.iter().any(|x| matches!(x, OutEvent::NoteOn { .. })));
+    }
+
+    #[test]
+    fn stale_ext_reverts_to_internal_with_bar_anchored_emission() {
+        // Under the always-on link (design §7 Phase 4) an explicit 0xFC now
+        // STOPS movy — only a *stale* clock (Move wedged, no 0xFC) is treated
+        // as a glitch and reverts to internal-clock, keep-playing. This is the
+        // former move_stop_reverts_… test, retargeted onto the staleness path
+        // that now owns the revert behavior; its bar-anchored-emission
+        // assertions are preserved.
+        let mut e = engine();
+        e.play();
+        let mut out = Vec::new();
+        e.on_external_realtime(0xFA, &mut out);
+        e.on_external_realtime(0xF8, &mut out);
+        run_ext_ticks(&mut e, 48, &mut out); // half a bar in (~192 master ticks)
+        out.clear();
+        let before = e.master_tick;
+        // No 0xFC: Move's clock simply goes stale. Drive blocks directly, long
+        // enough to cross the 0.5 s staleness window AND movy's next bar (384).
+        let mut ev = Vec::new();
+        for _ in 0..700 {
+            e.advance_block(FRAMES, &mut ev);
+        }
+        assert!(e.master_tick > before, "keeps playing after Move's clock goes stale");
+        // Start re-emitted exactly once, at our next bar boundary, then clocks.
+        let starts = ev.iter().filter(|x| matches!(x, OutEvent::Start)).count();
+        assert_eq!(starts, 1);
+        assert!(ev.iter().any(|x| matches!(x, OutEvent::Clock)));
+    }
+
+    #[test]
+    fn stale_ext_clock_reverts_like_a_stop() {
+        let mut e = engine();
+        e.play();
+        let mut out = Vec::new();
+        e.on_external_realtime(0xFA, &mut out);
+        e.on_external_realtime(0xF8, &mut out);
+        run_ext_ticks(&mut e, 24, &mut out);
+        let frozen = e.master_tick;
+        // 1 s of silence (> 0.5 s staleness) then internal blocks.
+        let mut left = 44100u32;
+        while left > 0 { let s = left.min(FRAMES); e.advance_block(s, &mut out); left -= s; }
+        assert!(e.master_tick > frozen, "revived on internal clock");
+    }
+
+    // ── External transport does not start or stop movy (Phase 3 semantics) ──
+
+    #[test]
+    fn external_fa_does_not_start_movy() {
+        let mut e = engine();
+        e.tracks[0].active_mut().toggle_step(0, &[(60, 100)]);
+        let mut out = Vec::new();
+        e.on_external_realtime(0xFA, &mut out);
+        run_ext_ticks(&mut e, 96, &mut out);
+        assert_eq!(e.master_tick, 0);
+        assert!(out.iter().all(|x| !matches!(x, OutEvent::NoteOn { .. })));
+    }
+
+    #[test]
+    fn external_fc_keeps_movy_playing() {
+        // Revert-keeps-playing: an external Stop does not stop movy (it reverts
+        // to the internal clock and keeps going).
+        let mut e = engine();
+        e.play();
+        let mut out = Vec::new();
+        e.on_external_realtime(0xFA, &mut out);
+        e.on_external_realtime(0xF8, &mut out);
+        run_ext_ticks(&mut e, 24, &mut out);
+        e.on_external_realtime(0xFC, &mut out);
+        assert!(e.playing, "external Stop leaves movy playing");
+    }
+
+    /// Note on/off events of `pitch` on track 0, in order: true = on.
+    fn on_offs(ev: &[OutEvent], pitch: u8) -> Vec<bool> {
+        ev.iter().filter_map(|x| match *x {
+            OutEvent::NoteOn { track: 0, pitch: p, .. } if p == pitch => Some(true),
+            OutEvent::NoteOff { track: 0, pitch: p } if p == pitch => Some(false),
+            _ => None,
+        }).collect()
+    }
+
+    #[test]
+    fn a_long_note_is_cut_by_its_own_next_note() {
+        // Stored 8 steps, but the same pitch returns at step 2: the first must
+        // be closed there, or its note-off would end the second one early.
+        let mut e = engine();
+        let c = e.tracks[0].active_mut();
+        c.toggle_step(0, &[(60, 100)]);
+        c.toggle_step(2, &[(60, 100)]);
+        c.set_length(0, 0, None, 8 * TICKS_PER_STEP);
+        e.play();
+        let ev = run_ticks(&mut e, 2 * TICKS_PER_STEP as u64 + 4);
+        assert_eq!(on_offs(&ev, 60), [true, false, true]);
+    }
+
+    #[test]
+    fn a_long_note_is_cut_at_the_loop_end() {
+        let mut e = engine();
+        let c = e.tracks[0].active_mut();
+        c.toggle_step(15, &[(60, 100)]);
+        c.set_length(15, 15, None, 1000);
+        e.play();
+        let ev = run_ticks(&mut e, 16 * TICKS_PER_STEP as u64 + 4);
+        assert_eq!(on_offs(&ev, 60), [true, false], "rang into the next pass");
+    }
+
+    #[test]
+    fn clock_emits_start_then_24ppqn_ticks() {
+        let mut e = engine();
+        e.tracks[0].active_mut().toggle_step(0, &[(60, 100)]);
+        e.play();
+        // One beat = 96 master ticks; expect 0xFA once, then 96/4 = 24 clocks.
+        let ev = run_ticks(&mut e, 96);
+        let starts = ev.iter().filter(|x| matches!(x, OutEvent::Start)).count();
+        let clocks = ev.iter().filter(|x| matches!(x, OutEvent::Clock)).count();
+        assert_eq!(starts, 1);
+        assert_eq!(clocks, 24);
+        // The anchor tick precedes the first note of the pattern.
+        let first_clock = ev.iter().position(|x| matches!(x, OutEvent::Clock)).unwrap();
+        let first_note = ev
+            .iter()
+            .position(|x| matches!(x, OutEvent::NoteOn { .. }))
+            .unwrap();
+        assert!(first_clock < first_note);
+    }
+
+    #[test]
+    fn clock_stop_emits_stop_once_and_goes_silent() {
+        let mut e = engine();
+        e.play();
+        let _ = run_ticks(&mut e, 8);
+        let mut out = Vec::new();
+        e.stop(&mut out);
+        // Stop is edge-detected in advance_block, so run one more block.
+        e.advance_block(FRAMES, &mut out);
+        let stops = out.iter().filter(|x| matches!(x, OutEvent::Stop)).count();
+        assert_eq!(stops, 1);
+        out.clear();
+        for _ in 0..50 {
+            e.advance_block(FRAMES, &mut out);
+        }
+        assert!(out.iter().all(|x| !matches!(x, OutEvent::Clock | OutEvent::Start)));
+    }
+
+    #[test]
+    fn clock_exact_count_across_many_blocks() {
+        let mut e = engine();
+        e.play();
+        // 4 beats = 384 master ticks -> exactly 96 clocks regardless of
+        // block-boundary alignment (integer accumulator guarantees this).
+        let ev = run_ticks(&mut e, 384);
+        let clocks = ev.iter().filter(|x| matches!(x, OutEvent::Clock)).count();
+        assert_eq!(clocks, 96);
+    }
+
+    // Playhead tick after `master_ticks` master ticks at the given scale, using
+    // a 2-bar loop (768 ticks) so none of the cases wrap.
+    fn pos_after(scale_num: u8, scale_den: u8, master_ticks: u64) -> u32 {
+        let mut e = engine();
+        e.tracks[0].active_mut().set_loop(0, 32);
+        e.tracks[0].active_mut().scale_num = scale_num;
+        e.tracks[0].active_mut().scale_den = scale_den;
+        e.play();
+        run_ticks(&mut e, master_ticks);
+        e.tracks[0].pos_tick
+    }
+
+    #[test]
+    fn status_reports_clip_scale_and_transpose() {
+        let mut e = engine();
+        e.tracks[0].active_mut().set_loop(0, 16);
+        e.tracks[0].active_mut().scale_num = 3;
+        e.tracks[0].active_mut().scale_den = 2;
+        e.tracks[0].active_mut().transpose = -7;
+        let s = e.status();
+        assert!(s.contains("csc=3/2"), "{s}");
+        assert!(s.contains("ctr=-7"), "{s}");
+    }
+
+    #[test]
+    fn scale_changes_playhead_rate() {
+        assert_eq!(pos_after(1, 1, 48), 48); // 1X  → 1:1
+        assert_eq!(pos_after(2, 1, 48), 96); // 2X  → 2 ticks per master tick
+        assert_eq!(pos_after(1, 2, 48), 24); // 1/2X → 1 tick per 2 master ticks
+        assert_eq!(pos_after(3, 4, 48), 36); // 3/4X → 36 ticks
+    }
+
+    // Master tick at which a 1-step note (gate 24) at the given scale note-offs.
+    fn note_off_master_tick(scale_num: u8, scale_den: u8) -> usize {
+        let mut e = engine();
+        e.tracks[0].active_mut().set_loop(0, 16);
+        e.tracks[0].active_mut().toggle_step(0, &[(60, 100)]);
+        e.tracks[0].active_mut().scale_num = scale_num;
+        e.tracks[0].active_mut().scale_den = scale_den;
+        e.play();
+        let mut out = Vec::new();
+        for m in 0..400 {
+            out.clear();
+            e.service_tick(&mut out);
+            if out.iter().any(|x| matches!(x, OutEvent::NoteOff { track: 0, pitch: 60 })) {
+                return m;
+            }
+        }
+        panic!("no note-off within range");
+    }
+
+    #[test]
+    fn swing_anchors_to_real_16ths_under_scale() {
+        let mut e = engine();
+        e.swing_pct = 80;
+        // 1X: off-beats are the odd steps (unchanged behaviour).
+        assert_eq!(e.swing_delay(0, 1, 1), 0);
+        assert!(e.swing_delay(1, 1, 1) > 0);
+        // 2X: steps are 32nds; only the real off-beat 16ths (2,6,10,…) swing.
+        assert_eq!(e.swing_delay(0, 2, 1), 0); // on-beat 16th
+        assert_eq!(e.swing_delay(1, 2, 1), 0); // 32nd, not a 16th
+        assert!(e.swing_delay(2, 2, 1) > 0);   // off-beat 16th
+        assert_eq!(e.swing_delay(4, 2, 1), 0); // on-beat 16th (4/2 even)
+        assert!(e.swing_delay(6, 2, 1) > 0);
+        // Magnitude scales to a real 16th (2 clip-steps at 2X).
+        assert_eq!(e.swing_delay(2, 2, 1), e.swing_delay(1, 1, 1) * 2);
+        // 1/2X: no clip-step lands on an off-beat 16th, so nothing swings.
+        assert_eq!(e.swing_delay(1, 1, 2), 0);
+        assert_eq!(e.swing_delay(2, 1, 2), 0);
+    }
+
+    #[test]
+    fn stopped_track_flushes_hanging_notes() {
+        let mut e = engine();
+        e.tracks[0].active_mut().set_loop(0, 16);
+        e.tracks[0].active_mut().toggle_step(0, &[(60, 100)]);
+        e.play();
+        let mut out = Vec::new();
+        e.service_tick(&mut out); // emits NoteOn(60); gate active for ~24 ticks
+        assert!(out.iter().any(|x| matches!(x, OutEvent::NoteOn { pitch: 60, .. })));
+        // Stop the track mid-note (Session stop): step_tick no longer runs, so
+        // the gate would hang — the safety flush must note it off instead.
+        e.tracks[0].playing_slot = None;
+        out.clear();
+        e.service_tick(&mut out);
+        assert!(out.iter().any(|x| matches!(x, OutEvent::NoteOff { track: 0, pitch: 60 })));
+        assert!(e.gates.is_empty());
+    }
+
+    #[test]
+    fn note_gate_scales_with_clip_scale() {
+        // At 2X the note lifecycle runs twice as fast, so a 1-step note lasts
+        // half the real-time (master ticks) of the 1X note.
+        assert_eq!(note_off_master_tick(1, 1), 24);
+        assert_eq!(note_off_master_tick(2, 1), 12);
+    }
+
+    #[test]
+    fn transpose_shifts_emitted_pitch_only() {
+        let mut e = engine();
+        e.tracks[0].active_mut().set_loop(0, 16);
+        e.tracks[0].active_mut().toggle_step(0, &[(60, 100)]);
+        e.tracks[0].active_mut().transpose = 12;
+        e.play();
+        let out = run_ticks(&mut e, 4);
+        let on = out.iter().find_map(|x| match x {
+            OutEvent::NoteOn { pitch, .. } => Some(*pitch),
+            _ => None,
+        });
+        assert_eq!(on, Some(72)); // 60 + 12, emitted only
+        assert_eq!(e.tracks[0].active().notes[0].pitch, 60); // stored pitch untouched
+    }
+
+    // A drum track's pitches are pad addresses, not notes: shifting them moves
+    // the hit to a different voice (or off the pad range entirely, silencing
+    // it). Clip transpose must be inert there — see the three sites below.
+    #[test]
+    fn drum_track_ignores_clip_transpose_on_emit() {
+        let mut e = engine();
+        e.set_track_drum(0, true);
+        e.tracks[0].active_mut().set_loop(0, 16);
+        e.tracks[0].active_mut().toggle_step(0, &[(36, 100)]); // kick pad
+        e.tracks[0].active_mut().transpose = -12;
+        e.play();
+        let out = run_ticks(&mut e, 4);
+        let on = out.iter().find_map(|x| match x {
+            OutEvent::NoteOn { pitch, .. } => Some(*pitch),
+            _ => None,
+        });
+        assert_eq!(on, Some(36)); // the kick, not 24
+    }
+
+    #[test]
+    fn drum_track_gate_matches_untransposed_pitch() {
+        let mut e = engine();
+        e.set_track_drum(0, true);
+        e.tracks[0].active_mut().set_loop(0, 16);
+        e.tracks[0].active_mut().toggle_step(0, &[(36, 100)]);
+        e.tracks[0].active_mut().transpose = -12;
+        e.play();
+        let out = run_ticks(&mut e, 4 + TICKS_PER_STEP as u64 * 2);
+        let off = out.iter().find_map(|x| match x {
+            OutEvent::NoteOff { pitch, .. } => Some(*pitch),
+            _ => None,
+        });
+        assert_eq!(off, Some(36)); // note-off must close the voice that opened
+    }
+
+    #[test]
+    fn drum_track_records_pad_pitch_verbatim() {
+        let mut e = engine();
+        e.set_track_drum(0, true);
+        e.tracks[0].active_mut().set_loop(0, 16);
+        e.tracks[0].active_mut().transpose = 5;
+        e.play();
+        e.toggle_record(0);
+        run_ticks(&mut e, 1); // the queued take starts on the bar it was armed on
+        e.live_note_on(0, 38, 100); // snare pad
+        e.tracks[0].pos_tick += 4;
+        e.live_note_off(0, 38);
+        // No transpose is re-added at emit, so none may be subtracted here.
+        assert_eq!(e.tracks[0].active().notes.last().unwrap().pitch, 38);
+    }
+
+    #[test]
+    fn melodic_track_still_transposes_after_drum_guard() {
+        let mut e = engine();
+        e.set_track_drum(0, true);
+        e.set_track_drum(0, false); // flips back when a melodic module loads
+        e.tracks[0].active_mut().set_loop(0, 16);
+        e.tracks[0].active_mut().toggle_step(0, &[(60, 100)]);
+        e.tracks[0].active_mut().transpose = 12;
+        e.play();
+        let out = run_ticks(&mut e, 4);
+        let on = out.iter().find_map(|x| match x {
+            OutEvent::NoteOn { pitch, .. } => Some(*pitch),
+            _ => None,
+        });
+        assert_eq!(on, Some(72));
+    }
+
+    #[test]
+    fn live_record_captures_at_scaled_position() {
+        let mut e = engine();
+        e.tracks[0].active_mut().set_loop(0, 16);
+        e.tracks[0].active_mut().scale_num = 2; // 2X: playhead advances 2 ticks/master tick
+        e.tracks[0].active_mut().scale_den = 1;
+        e.play();
+        e.toggle_record(0);                 // punch-in (already playing → no count-in)
+        let mut out = Vec::new();
+        for _ in 0..3 { e.service_tick(&mut out); }
+        let start = e.tracks[0].pos_tick;
+        assert_eq!(start, 6);               // 2 ticks per master tick over 3 ticks
+        e.live_note_on(0, 64, 100);
+        e.live_note_off(0, 64);
+        let n = e.tracks[0].active().notes.iter().find(|n| n.pitch == 64).unwrap();
+        assert_eq!(n.tick, start);          // captured at the scaled playhead position
+    }
+
+    #[test]
+    fn recording_stores_untransposed_pitch() {
+        let mut e = engine();
+        e.tracks[0].active_mut().set_loop(0, 16);
+        e.tracks[0].active_mut().transpose = 5;
+        e.play();
+        e.toggle_record(0); // punch-in, queued to the bar the transport is on
+        run_ticks(&mut e, 1);
+        e.live_note_on(0, 67, 100); // pad plays raw 67
+        e.tracks[0].pos_tick += 4;
+        e.live_note_off(0, 67);
+        // Stored as 67 - 5 = 62, so emit re-adds 5 -> 67 (matches the pad).
+        assert_eq!(e.tracks[0].active().notes.last().unwrap().pitch, 62);
+    }
+
+    #[test]
+    fn condition_skips_trig_on_off_cycle() {
+        let mut e = engine();
+        e.tracks[0].active_mut().toggle_step(0, &[(60, 100)]);
+        e.tracks[0].active_mut().set_loop(0, 16);
+        e.tracks[0].active_mut().set_trig_cond(0, 0, None, 2, 2); // 2:2
+        e.play();
+        let ev1 = run_ticks(&mut e, 16 * TICKS_PER_STEP as u64);
+        assert!(!ev1.iter().any(|x| matches!(x, OutEvent::NoteOn { pitch: 60, .. })),
+            "cycle 1 should be silent for 2:2");
+        let ev2 = run_ticks(&mut e, 16 * TICKS_PER_STEP as u64);
+        assert!(ev2.iter().any(|x| matches!(x, OutEvent::NoteOn { pitch: 60, .. })),
+            "cycle 2 should sound for 2:2");
+    }
+
+    #[test]
+    fn probability_zero_never_plays() {
+        let mut e = engine();
+        e.tracks[0].active_mut().toggle_step(0, &[(60, 100)]);
+        e.tracks[0].active_mut().set_loop(0, 16);
+        e.tracks[0].active_mut().set_trig_prob(0, 0, None, 0);
+        e.play();
+        let ev = run_ticks(&mut e, 16 * TICKS_PER_STEP as u64 * 4);
+        assert!(!ev.iter().any(|x| matches!(x, OutEvent::NoteOn { .. })), "0% never plays");
+    }
+
+    #[test]
+    fn chord_shares_one_probability_decision() {
+        let mut e = engine();
+        e.tracks[0].active_mut().toggle_step(0, &[(60, 100), (64, 100)]);
+        e.tracks[0].active_mut().set_loop(0, 16);
+        e.tracks[0].active_mut().set_trig_prob(0, 0, None, 50);
+        e.play();
+        let ev = run_ticks(&mut e, 16 * TICKS_PER_STEP as u64 * 8);
+        let n60 = ev.iter().filter(|x| matches!(x, OutEvent::NoteOn { pitch: 60, .. })).count();
+        let n64 = ev.iter().filter(|x| matches!(x, OutEvent::NoteOn { pitch: 64, .. })).count();
+        assert_eq!(n60, n64, "chord notes must share the same play/skip decision");
+    }
+
+    #[test]
+    fn status_reports_held_trig_props() {
+        let mut e = engine();
+        e.tracks[0].active_mut().toggle_step(3, &[(60, 90), (64, 110)]);
+        e.tracks[0].active_mut().set_trig_prob(3, 3, None, 40);
+        e.tracks[0].active_mut().set_trig_cond(3, 3, None, 2, 3);
+        e.set_held_query(Some((0, 3)));
+        let s = e.status();
+        assert!(s.contains(" hvel=100"), "avg of 90,110 = 100; got: {s}");
+        assert!(s.contains(" hgmix=0"), "same gate not mixed; got: {s}");
+        assert!(s.contains(" hprob=40"), "{s}");
+        assert!(s.contains(" hcond=2:3"), "{s}");
+        assert!(s.contains(" hinv=0"), "{s}");
+    }
+
+    #[test]
+    fn plays_note_at_step_and_releases() {
+        let mut e = engine();
+        e.tracks[0].active_mut().toggle_step(0, &[(60, 100)]);
+        e.play();
+        let ev = run_ticks(&mut e, TICKS_PER_STEP as u64 + 2);
+        assert!(ev.contains(&OutEvent::NoteOn { track: 0, pitch: 60, vel: 100 }));
+        assert!(ev.contains(&OutEvent::NoteOff { track: 0, pitch: 60 }));
+        let on = ev.iter().position(|x| matches!(x, OutEvent::NoteOn { .. })).unwrap();
+        let off = ev.iter().position(|x| matches!(x, OutEvent::NoteOff { .. })).unwrap();
+        assert!(on < off);
+    }
+
+    /// Advance `ticks` master ticks one block at a time; for each of tracks 0
+    /// and 1, collect the master-tick values (in steps since `start`) at which
+    /// it emits a NoteOn. Both observed in one pass (same engine instance).
+    fn fire_steps(e: &mut Engine, ticks: u64) -> (Vec<u64>, Vec<u64>) {
+        let mut out = Vec::new();
+        let start = e.clock.tick;
+        let (mut p0, mut p1) = (Vec::new(), Vec::new());
+        while e.clock.tick < start + ticks {
+            out.clear();
+            let before = e.clock.tick;
+            e.advance_block(FRAMES, &mut out);
+            if e.clock.tick == before {
+                continue;
+            }
+            let at_step = (e.clock.tick - 1 - start) / TICKS_PER_STEP as u64;
+            if out.iter().any(|x| matches!(x, OutEvent::NoteOn { track: 0, .. })) {
+                p0.push(at_step);
+            }
+            if out.iter().any(|x| matches!(x, OutEvent::NoteOn { track: 1, .. })) {
+                p1.push(at_step);
+            }
+        }
+        (p0, p1)
+    }
+
+    /// Joining the transport by entering a note bar-quantizes the new clip: it
+    /// starts a bar later but every one of its step-0 hits lands exactly on a
+    /// tick where an already-playing reference clip also hits — perfect bar
+    /// sync, regardless of how far into the bar the note was entered.
+    #[test]
+    fn note_join_is_phase_locked_to_a_playing_clip() {
+        let mut e = engine();
+        let mut out = Vec::new();
+        e.tracks[1].active_mut().toggle_step(0, &[(62, 100)]);
+        e.play();
+        let target = e.clock.tick + 5 * TICKS_PER_STEP as u64;
+        while e.clock.tick < target {
+            e.advance_block(FRAMES, &mut out);
+        }
+        apply_batch(&mut e, "tog 0 0 60 100", &mut out);
+        let (p0, p1) = fire_steps(&mut e, 3 * crate::TICKS_PER_BAR as u64);
+        assert!(!p0.is_empty(), "the joined clip eventually plays");
+        assert!(
+            p0.iter().all(|s| p1.contains(s)),
+            "joined clip fires in lockstep with the reference: p0={p0:?} p1={p1:?}"
+        );
+    }
+
+    // Collect (lane, val) CCs for track 0 from an event list.
+    fn ccs0(ev: &[OutEvent]) -> Vec<(u8, u8)> {
+        ev.iter().filter_map(|x| match x {
+            OutEvent::Auto { lane, val, track: 0 } => Some((*lane, *val)),
+            _ => None,
+        }).collect()
+    }
+
+    /* The base read-back indexes like `alabels`, and says `-` where that one
+     * does — the UI zips the two strings lane by lane, so a lane that is a
+     * label in one and a number in the other would shift every lane after it. */
+    #[test]
+    fn auto_bases_indexes_like_auto_labels() {
+        let mut e = engine();
+        e.auto_label(0, 1, "synth:cutoff");
+        let mut out = Vec::new();
+        e.auto_base(0, 1, 70, &mut out);
+        /* Assigned by `auto_label`, so it answers its base; every other lane on
+         * the track is unassigned and answers the same dash `alabels` gives. */
+        let bases = e.auto_bases();
+        let labels = e.auto_labels();
+        let b0: Vec<&str> = bases.split(',').next().unwrap().split('.').collect();
+        let l0: Vec<&str> = labels.split(',').next().unwrap().split('.').collect();
+        assert_eq!(b0.len(), LANES);
+        assert_eq!(b0.len(), l0.len());
+        assert_eq!(b0[1], "70");
+        assert_eq!(l0[1], "synth:cutoff");
+        assert_eq!(b0[0], "-");
+        assert_eq!(l0[0], "-");
+        /* A base set on an UNASSIGNED lane is still not a lane: it stays a dash,
+         * so the UI cannot mistake a leftover number for a live lane. */
+        e.auto_base_quiet(0, 5, 99);
+        let b = e.auto_bases();
+        assert_eq!(b.split(',').next().unwrap().split('.').nth(5).unwrap(), "-");
+    }
+
+    #[test]
+    fn automation_latches_forward_emitting_on_change_only() {
+        let mut e = engine();
+        // Lane 0 assigned, base 40; note at step 0; lock 100 at step 2.
+        e.tracks[0].lane_assigned[0] = true;
+        e.tracks[0].lane_base[0] = 40;
+        e.tracks[0].active_mut().toggle_step(0, &[(60, 100)]);
+        e.tracks[0].active_mut().set_lock(0, 2, 100);
+        e.play();
+        // Run one full bar (16 steps) + slack into step 0 of the next pass.
+        let ev = run_ticks(&mut e, 16 * TICKS_PER_STEP as u64 + 2);
+        let ccs = ccs0(&ev);
+        // Only three emits across 16+ steps: base 40 at step 0, lock 100 at step
+        // 2 (then 100 latches with no per-step re-emit through step 15), and base
+        // 40 again at step 0 of pass 2 where the note reverts the latch.
+        assert_eq!(ccs, vec![(0, 40), (0, 100), (0, 40)], "latch should emit on change only");
+    }
+
+    #[test]
+    fn automation_reverts_to_base_on_note_at_other_step() {
+        let mut e = engine();
+        e.tracks[0].lane_assigned[0] = true;
+        e.tracks[0].lane_base[0] = 40;
+        e.tracks[0].active_mut().toggle_step(0, &[(60, 100)]);
+        e.tracks[0].active_mut().toggle_step(8, &[(62, 100)]); // note step 8
+        e.tracks[0].active_mut().set_lock(0, 2, 100);
+        e.play();
+        let ev = run_ticks(&mut e, 16 * TICKS_PER_STEP as u64 + 2);
+        let ccs = ccs0(&ev);
+        // step0 → base 40, step2 → 100, step8 note → back to base 40.
+        assert_eq!(ccs, vec![(0, 40), (0, 100), (0, 40)]);
+    }
+
+    #[test]
+    fn automation_carries_across_loop_boundary() {
+        let mut e = engine();
+        e.tracks[0].lane_assigned[0] = true;
+        e.tracks[0].lane_base[0] = 40;
+        // No notes → nothing interrupts; lock 77 at step 14.
+        e.tracks[0].active_mut().set_lock(0, 14, 77);
+        // Give the clip a length so it plays (set_loop one bar) without notes.
+        e.tracks[0].active_mut().set_loop(0, 16);
+        e.play();
+        // Two full bars: after the lock at 14 the value 77 must persist past the
+        // wrap (no re-revert to base at step 0 of the second pass).
+        let ev = run_ticks(&mut e, 32 * TICKS_PER_STEP as u64 + 2);
+        let ccs = ccs0(&ev);
+        // First pass: base 40 (seed at step 0), then 77 at step 14. Second pass:
+        // value stays 77 across the boundary → no further CC.
+        assert_eq!(ccs, vec![(0, 40), (0, 77)]);
+    }
+
+    #[test]
+    fn automation_matches_effective_at_oracle_in_steady_state() {
+        let mut e = engine();
+        e.tracks[0].lane_assigned[0] = true;
+        let base = 40u8;
+        e.tracks[0].lane_base[0] = base;
+        e.tracks[0].active_mut().toggle_step(0, &[(60, 100)]);
+        e.tracks[0].active_mut().toggle_step(8, &[(62, 100)]);
+        e.tracks[0].active_mut().set_lock(0, 2, 100);
+        e.tracks[0].active_mut().set_lock(0, 10, 55);
+        let clip = e.tracks[0].active().clone();
+        e.play();
+        // First full bar reaches steady state (the carry settles). Then at every
+        // tick of the second bar the applied value (auto_cur) must equal the
+        // oracle for the step the playhead is in — no alignment assumptions.
+        run_ticks(&mut e, 16 * TICKS_PER_STEP as u64);
+        for _ in 0..16 * TICKS_PER_STEP as u64 {
+            run_ticks(&mut e, 1);
+            let step = e.tracks[0].current_step();
+            assert_eq!(e.tracks[0].auto_cur[0], clip.effective_at(0, step, base) as i16,
+                "step {step} mismatch vs oracle");
+        }
+    }
+
+    /* A drum voice latches its params at note-on, so a lock that lands after
+     * its note is heard on the NEXT hit (Schwung's `lane_lookahead.h` lesson).
+     * Walks the event stream in order — the order `drain_out` applies it in —
+     * and checks the value in force on lane 0 at every NoteOn is that note's
+     * step's lock. Each step's note has its own pitch so the check knows which
+     * step fired. */
+    fn assert_lock_precedes_note(e: &mut Engine, ticks: u64, want: &[(u8, u8)]) {
+        let ev = run_ticks(e, ticks);
+        let mut cur: Option<u8> = None;
+        let mut fired = 0;
+        for x in &ev {
+            match *x {
+                OutEvent::Auto { track: 0, lane: 0, val } => cur = Some(val),
+                OutEvent::NoteOn { track: 0, pitch, .. } => {
+                    let (_, lock) = want.iter().find(|(p, _)| *p == pitch)
+                        .unwrap_or_else(|| panic!("unexpected note {pitch}"));
+                    assert_eq!(cur, Some(*lock), "note {pitch} fired before its lock");
+                    fired += 1;
+                }
+                _ => {}
+            }
+        }
+        assert!(fired >= 2 * want.len(), "every note fired on both passes ({fired})");
+    }
+
+    fn lock_order_engine() -> Engine {
+        let mut e = engine();
+        e.tracks[0].lane_assigned[0] = true;
+        e.tracks[0].lane_base[0] = 5;
+        let c = e.tracks[0].active_mut();
+        c.set_loop(0, 16);
+        c.quant = 0; // keep the nudges: quantization would pull them back
+        e
+    }
+
+    #[test]
+    fn a_lock_precedes_its_note_on_the_grid_after_play_and_across_the_wrap() {
+        let mut e = lock_order_engine();
+        let tps = TICKS_PER_STEP;
+        let c = e.tracks[0].active_mut();
+        for (step, pitch, lock) in [(0u16, 60u8, 10u8), (4, 61, 20), (15, 62, 30)] {
+            c.add_note_raw(step, step as u32 * tps, 6, pitch, 100);
+            c.set_lock(0, step, lock);
+        }
+        e.play();
+        assert_lock_precedes_note(&mut e, 32 * tps as u64 + 2, &[(60, 10), (61, 20), (62, 30)]);
+    }
+
+    #[test]
+    fn a_lock_precedes_a_nudged_note() {
+        let mut e = lock_order_engine();
+        let tps = TICKS_PER_STEP;
+        let c = e.tracks[0].active_mut();
+        // Early on step 4, late on step 8, and early on step 0 — which wraps to
+        // the END of the previous pass, the hardest case for the latch.
+        c.add_note_raw(0, 16 * tps - 3, 6, 60, 100);
+        c.set_lock(0, 0, 10);
+        c.add_note_raw(4, 4 * tps - 5, 6, 61, 100);
+        c.set_lock(0, 4, 20);
+        c.add_note_raw(8, 8 * tps + 7, 6, 62, 100);
+        c.set_lock(0, 8, 30);
+        e.play();
+        assert_lock_precedes_note(&mut e, 48 * tps as u64 + 2, &[(60, 10), (61, 20), (62, 30)]);
+    }
+
+    #[test]
+    fn no_cc_for_unassigned_lane() {
+        let mut e = engine();
+        e.tracks[0].active_mut().toggle_step(0, &[(60, 100)]);
+        e.tracks[0].active_mut().set_lock(0, 0, 50); // lock but lane unassigned
+        e.play();
+        let ev = run_ticks(&mut e, TICKS_PER_STEP as u64 + 2);
+        assert!(!ev.iter().any(|x| matches!(x, OutEvent::Auto { .. })));
+    }
+
+    #[test]
+    fn four_tracks_play_simultaneously() {
+        let mut e = engine();
+        for t in 0..4 {
+            e.tracks[t].active_mut().toggle_step(0, &[(60 + t as u8, 100)]);
+        }
+        e.play();
+        let ev = run_ticks(&mut e, 4);
+        for t in 0..4u8 {
+            assert!(
+                ev.contains(&OutEvent::NoteOn { track: t, pitch: 60 + t, vel: 100 }),
+                "track {t} missing"
+            );
+        }
+    }
+
+    #[test]
+    fn copy_paste_carries_locks_even_without_notes() {
+        use crate::command::apply_batch;
+        let mut e = engine();
+        let mut out = Vec::new();
+        // Lock on step 1 with NO note there; note on step 0.
+        apply_batch(&mut e, "tog 0 0 60 100", &mut out);
+        e.tracks[0].active_mut().set_lock(2, 1, 77);
+        apply_batch(&mut e, "cpy 0 0 3", &mut out);   // copy steps 0-3 (locks + notes)
+        apply_batch(&mut e, "pst 0 8", &mut out);     // paste at step 8
+        assert_eq!(e.tracks[0].active().lock_at(2, 9), Some(77)); // step 1 → 9
+        assert!(e.tracks[0].active().step_has_notes(8));          // step 0 → 8
+    }
+
+    #[test]
+    fn paste_steps_replaces_destination() {
+        let mut e = engine();
+        // Source: note at step 0. Destination step 4 already has a note.
+        e.tracks[0].active_mut().toggle_step(0, &[(60, 100)]);
+        e.tracks[0].active_mut().toggle_step(4, &[(62, 100)]);
+        e.copy_steps(0, 0, 0);          // copy one step
+        e.paste_steps(0, 4);            // paste-replace at step 4
+        // Step 4 now holds ONLY the source's pitch (62 replaced by 60), not both.
+        let at4: Vec<u8> = e.tracks[0].active().notes.iter()
+            .filter(|n| n.step == 4).map(|n| n.pitch).collect();
+        assert_eq!(at4, vec![60], "destination replaced, not merged");
+    }
+
+    #[test]
+    fn voice_paste_moves_only_that_voice() {
+        let mut e = engine();
+        // Step 0: kick (36) + snare (38), a lock on lane 1 (kick's) and lane 2
+        // (snare's). Step 4: snare only, with its own lane-2 lock.
+        e.tracks[0].active_mut().toggle_step(0, &[(36, 100), (38, 100)]);
+        e.tracks[0].active_mut().toggle_step(4, &[(38, 90)]);
+        e.tracks[0].active_mut().set_lock(1, 0, 10);
+        e.tracks[0].active_mut().set_lock(2, 0, 20);
+        e.tracks[0].active_mut().set_lock(2, 4, 99);
+        e.copy_steps_voice(0, 0, 0, Some((36, 1 << 1)));   // kick, lane 1
+        e.paste_steps(0, 4);
+        let c = e.tracks[0].active();
+        let mut at4: Vec<u8> = c.notes.iter().filter(|n| n.step == 4).map(|n| n.pitch).collect();
+        at4.sort();
+        assert_eq!(at4, vec![36, 38], "the kick lands, the snare already there stays");
+        let lock = |lane: u8| c.locks.iter().find(|l| l.lane == lane && l.step == 4).map(|l| l.val);
+        assert_eq!(lock(1), Some(10), "the kick's lock is pasted");
+        assert_eq!(lock(2), Some(99), "the snare's own lock is untouched");
+    }
+
+    #[test]
+    fn paste_steps_carries_the_step_page_props() {
+        let mut e = engine();
+        {
+            let c = e.tracks[0].active_mut();
+            c.add_note_raw(0, 0, 30, 60, 77);           // velocity 77, length 30
+            c.set_trig_prob(0, 0, None, 40);
+            c.set_trig_cond(0, 0, None, 2, 4);
+            c.set_trig_invert(0, 0, None, true);
+            c.set_lock(3, 0, 64);
+            c.toggle_step(5, &[(62, 100)]);
+            c.set_trig_prob(5, 5, None, 10);            // destination's own row
+        }
+        e.copy_steps(0, 0, 0);
+        e.paste_steps(0, 5);
+        let c = e.tracks[0].active();
+        let n: Vec<_> = c.notes.iter().filter(|n| n.step == 5).collect();
+        assert_eq!(n.len(), 1);
+        assert_eq!((n[0].pitch, n[0].vel, n[0].gate), (60, 77, 30));
+        assert_eq!(c.governing_trig(5, 60),
+            TrigProps { prob: 40, cond_a: 2, cond_b: 4, invert: true });
+        assert_eq!(c.trigs.iter().filter(|t| t.step == 5).count(), 1, "the dest row is replaced");
+        assert_eq!(c.lock_at(3, 5), Some(64), "automation still travels");
+    }
+
+    #[test]
+    fn paste_of_a_default_step_resets_the_destination_props() {
+        let mut e = engine();
+        e.tracks[0].active_mut().toggle_step(0, &[(60, 100)]);
+        e.tracks[0].active_mut().toggle_step(4, &[(60, 100)]);
+        e.tracks[0].active_mut().set_trig_prob(4, 4, None, 25);
+        e.copy_steps(0, 0, 0);
+        e.paste_steps(0, 4);
+        assert_eq!(e.tracks[0].active().governing_trig(4, 60), TrigProps::DEFAULT);
+    }
+
+    #[test]
+    fn voice_paste_carries_that_voices_governing_props_only() {
+        let mut e = engine();
+        {
+            let c = e.tracks[0].active_mut();
+            c.toggle_step(0, &[(36, 100), (38, 100)]);
+            c.set_trig_prob(0, 0, None, 30);            // whole-step row governs the kick
+            c.toggle_step(4, &[(38, 100)]);
+            c.set_trig_cond(4, 4, None, 1, 2);          // dest whole-step row (snare's)
+        }
+        e.copy_steps_voice(0, 0, 0, Some((36, 0)));
+        e.paste_steps(0, 4);
+        let c = e.tracks[0].active();
+        assert_eq!(c.governing_trig(4, 36).prob, 30, "the kick's resolved prob lands");
+        assert_eq!((c.governing_trig(4, 36).cond_a, c.governing_trig(4, 36).cond_b), (1, 1),
+            "the dest whole-step condition does not leak onto the pasted kick");
+        assert_eq!(c.governing_trig(4, 38),
+            TrigProps { prob: 100, cond_a: 1, cond_b: 2, invert: false }, "the snare keeps its row");
+    }
+
+    #[test]
+    fn voice_paste_replaces_the_voice_at_the_destination() {
+        let mut e = engine();
+        e.tracks[0].active_mut().toggle_step(4, &[(36, 100)]);
+        e.tracks[0].active_mut().set_lock(1, 4, 50);
+        e.copy_steps_voice(0, 0, 0, Some((36, 1 << 1)));   // step 0: no kick, no lock
+        e.paste_steps(0, 4);
+        let c = e.tracks[0].active();
+        assert!(!c.step_has_notes(4), "an empty voice copy clears that voice");
+        assert!(c.locks.iter().all(|l| !(l.lane == 1 && l.step == 4)), "...and its lock");
+    }
+
+    #[test]
+    fn cpy_with_a_voice_pair_parses() {
+        let mut e = engine();
+        e.tracks[0].active_mut().toggle_step(0, &[(36, 100), (38, 100)]);
+        apply_batch(&mut e, "cpy 0 0 0 38 4294967295", &mut Vec::new());
+        e.paste_steps(0, 8);
+        let at8: Vec<u8> = e.tracks[0].active().notes.iter().filter(|n| n.step == 8).map(|n| n.pitch).collect();
+        assert_eq!(at8, vec![38]);
+    }
+
+    #[test]
+    fn paste_steps_empty_source_clears_destination() {
+        let mut e = engine();
+        e.tracks[0].active_mut().toggle_step(2, &[(62, 100)]); // dest has a note
+        e.copy_steps(0, 0, 0);          // step 0 is empty → empty clipboard
+        e.paste_steps(0, 2);            // replace step 2 with empty
+        assert!(!e.tracks[0].active().step_has_notes(2), "empty source clears the dest step");
+    }
+
+    #[test]
+    fn loop_wraps_and_replays() {
+        let mut e = engine();
+        e.tracks[0].active_mut().toggle_step(0, &[(60, 100)]);
+        e.play();
+        // 2 bars + slack: the step-0 note must fire twice.
+        let ev = run_ticks(&mut e, 16 * TICKS_PER_STEP as u64 + 4);
+        let ons = ev
+            .iter()
+            .filter(|x| matches!(x, OutEvent::NoteOn { .. }))
+            .count();
+        assert_eq!(ons, 2);
+    }
+
+    #[test]
+    fn muted_track_is_silent_but_advances() {
+        let mut e = engine();
+        e.tracks[0].active_mut().toggle_step(0, &[(60, 100)]);
+        e.tracks[0].muted = true;
+        e.play();
+        let ev = run_ticks(&mut e, 8);
+        // Transport clock (Start/Clock) rides the stream now; the mute
+        // guarantee is only about musical output.
+        assert!(!ev.iter().any(|x| matches!(
+            x,
+            OutEvent::NoteOn { .. } | OutEvent::NoteOff { .. }
+        )));
+        assert!(e.tracks[0].pos_tick > 0);
+    }
+
+    #[test]
+    fn mute_flushes_that_tracks_gates() {
+        let mut e = engine();
+        e.tracks[0].active_mut().toggle_step(0, &[(60, 100)]);
+        e.tracks[1].active_mut().toggle_step(0, &[(64, 100)]);
+        e.play();
+        let ev = run_ticks(&mut e, 2); // note-ons fired, gates still open
+        // Precondition: both tracks are actually playing, or the "untouched"
+        // assertion below would pass vacuously.
+        assert!(
+            ev.iter().any(|x| matches!(x, OutEvent::NoteOn { track: 0, .. })),
+            "track 0 must be sounding"
+        );
+        assert!(
+            ev.iter().any(|x| matches!(x, OutEvent::NoteOn { track: 1, .. })),
+            "track 1 must be sounding"
+        );
+
+        let mut out = Vec::new();
+        apply_batch(&mut e, "mute 0 1", &mut out);
+        assert!(
+            out.contains(&OutEvent::NoteOff { track: 0, pitch: 60 }),
+            "muting flushes that track's open gate immediately"
+        );
+        assert!(
+            !out.iter().any(|x| matches!(x, OutEvent::NoteOff { track: 1, .. })),
+            "other tracks' gates are untouched"
+        );
+
+        // The flushed gate is gone, so it must not emit a second off later.
+        let after = run_ticks(&mut e, 48);
+        assert!(
+            !after.iter().any(|x| matches!(x, OutEvent::NoteOff { track: 0, pitch: 60 })),
+            "flushed gate does not fire a duplicate note-off"
+        );
+    }
+
+    #[test]
+    fn unmute_emits_nothing() {
+        let mut e = engine();
+        e.tracks[0].active_mut().toggle_step(0, &[(60, 100)]);
+        e.play();
+        let _ = run_ticks(&mut e, 2);
+        let mut out = Vec::new();
+        apply_batch(&mut e, "mute 0 1", &mut out);
+        out.clear();
+        apply_batch(&mut e, "mute 0 0", &mut out);
+        assert!(
+            !out.iter().any(|x| matches!(x, OutEvent::NoteOff { .. })),
+            "unmuting releases nothing"
+        );
+    }
+
+    /* A drum pad's mute is per VOICE, where the track mute above is per track:
+     * the kick drops out while the snare goes on. Otherwise the same shape —
+     * the sequencer stops emitting what is muted, and since a drum voice's
+     * notes ARE its pads, the gate is on the emitted pitch. */
+    #[test]
+    fn pad_mute_silences_only_that_voice() {
+        let mut e = engine();
+        e.tracks[0].active_mut().toggle_step(0, &[(36, 100), (38, 100)]);
+        e.tracks[0].pad_mutes = vec![36];
+        e.play();
+        let ev = run_ticks(&mut e, 8);
+        assert!(
+            !ev.iter().any(|x| matches!(x, OutEvent::NoteOn { pitch: 36, .. })),
+            "the muted voice must not sound"
+        );
+        assert!(
+            ev.iter().any(|x| matches!(x, OutEvent::NoteOn { pitch: 38, .. })),
+            "the other voice must still sound, or the assertion above is vacuous"
+        );
+    }
+
+    #[test]
+    fn pad_solo_silences_the_other_pads() {
+        let mut e = engine();
+        e.tracks[0].active_mut().toggle_step(0, &[(36, 100), (38, 100)]);
+        e.tracks[0].pad_solo = Some(36);
+        e.play();
+        let ev = run_ticks(&mut e, 8);
+        assert!(
+            ev.iter().any(|x| matches!(x, OutEvent::NoteOn { pitch: 36, .. })),
+            "the soloed voice must sound"
+        );
+        assert!(
+            !ev.iter().any(|x| matches!(x, OutEvent::NoteOn { pitch: 38, .. })),
+            "every other voice of that track is silenced"
+        );
+    }
+
+    /* Solo overrides mute, the rule the track mute settled on the hard way:
+     * deriving the engine state as `base || !solo` left a track you had muted
+     * silent even once you soloed it, which made soloing look broken exactly
+     * when something was muted. A drum voice is the same promise. */
+    #[test]
+    fn pad_solo_overrides_that_voice_mute() {
+        let mut e = engine();
+        e.tracks[0].active_mut().toggle_step(0, &[(36, 100)]);
+        e.tracks[0].pad_mutes = vec![36];
+        e.tracks[0].pad_solo = Some(36);
+        e.play();
+        let ev = run_ticks(&mut e, 8);
+        assert!(
+            ev.iter().any(|x| matches!(x, OutEvent::NoteOn { pitch: 36, .. })),
+            "the soloed voice sounds even though it was muted"
+        );
+    }
+
+    /* "Silence now, not at gate expiry" — the guarantee `mute` gives a track,
+     * per voice. Without it a muted drum pad rings on for the length of its
+     * gate, which reads as the mute not having worked. */
+    #[test]
+    fn pmute_flushes_that_voices_gate() {
+        let mut e = engine();
+        e.tracks[0].active_mut().toggle_step(0, &[(36, 100), (38, 100)]);
+        e.play();
+        let ev = run_ticks(&mut e, 2); // both voices on, gates still open
+        assert!(
+            ev.iter().any(|x| matches!(x, OutEvent::NoteOn { pitch: 36, .. }))
+                && ev.iter().any(|x| matches!(x, OutEvent::NoteOn { pitch: 38, .. })),
+            "both voices must be sounding, or the assertions below are vacuous"
+        );
+
+        let mut out = Vec::new();
+        apply_batch(&mut e, "pmute 0 36 1", &mut out);
+        assert!(
+            out.contains(&OutEvent::NoteOff { track: 0, pitch: 36 }),
+            "muting a voice releases the note it was already holding"
+        );
+        assert!(
+            !out.iter().any(|x| matches!(x, OutEvent::NoteOff { pitch: 38, .. })),
+            "the other voice's gate is untouched"
+        );
+    }
+
+    #[test]
+    fn psolo_flushes_the_gates_it_silences() {
+        let mut e = engine();
+        e.tracks[0].active_mut().toggle_step(0, &[(36, 100), (38, 100)]);
+        e.tracks[1].active_mut().toggle_step(0, &[(40, 100)]);
+        e.play();
+        let _ = run_ticks(&mut e, 2);
+        let mut out = Vec::new();
+        apply_batch(&mut e, "psolo 0 36", &mut out);
+        assert!(
+            out.contains(&OutEvent::NoteOff { track: 0, pitch: 38 }),
+            "soloing releases the voices it silences"
+        );
+        assert!(
+            !out.iter().any(|x| matches!(x, OutEvent::NoteOff { pitch: 36, .. })),
+            "the soloed voice was already sounding and keeps sounding"
+        );
+        assert!(
+            !out.iter().any(|x| matches!(x, OutEvent::NoteOff { track: 1, .. })),
+            "another track's voices are not touched"
+        );
+    }
+
+    #[test]
+    fn stop_releases_held_gates() {
+        let mut e = engine();
+        e.tracks[0].active_mut().toggle_step(0, &[(60, 100)]);
+        e.play();
+        let _ = run_ticks(&mut e, 2); // note on fired, gate still open
+        let mut out = Vec::new();
+        e.stop(&mut out);
+        assert!(out.contains(&OutEvent::NoteOff { track: 0, pitch: 60 }));
+        // After stop, nothing plays. A single Stop transport event is emitted
+        // on the play→stop edge; no musical events follow.
+        let ev = run_ticks(&mut e, 50);
+        assert!(!ev.iter().any(|x| matches!(
+            x,
+            OutEvent::NoteOn { .. } | OutEvent::NoteOff { .. }
+        )));
+    }
+
+    #[test]
+    fn play_restarts_from_clip_start() {
+        let mut e = engine();
+        e.tracks[0].active_mut().toggle_step(0, &[(60, 100)]);
+        e.play();
+        let _ = run_ticks(&mut e, 30);
+        let mut out = Vec::new();
+        e.stop(&mut out);
+        e.play();
+        assert_eq!(e.tracks[0].pos_tick, 0);
+        let ev = run_ticks(&mut e, 2);
+        assert!(ev.contains(&OutEvent::NoteOn { track: 0, pitch: 60, vel: 100 }));
+    }
+
+    #[test]
+    fn playback_wraps_inside_loop_window() {
+        let mut e = engine();
+        // Content in bars 0 and 1; loop window = bar 1 only.
+        e.tracks[0].active_mut().toggle_step(0, &[(60, 100)]);  // bar 0
+        e.tracks[0].active_mut().toggle_step(16, &[(64, 100)]); // bar 1
+        e.tracks[0].active_mut().set_loop(16, 16);              // loop = bar 1
+        e.play();
+        assert_eq!(e.tracks[0].pos_tick, 16 * TICKS_PER_STEP);  // starts at window
+        let ev = run_ticks(&mut e, 16 * TICKS_PER_STEP as u64 + 4);
+        // Only the bar-1 note (64) plays; the bar-0 note (60) is outside.
+        assert!(ev.iter().any(|x| matches!(x, OutEvent::NoteOn { pitch: 64, .. })));
+        assert!(!ev.iter().any(|x| matches!(x, OutEvent::NoteOn { pitch: 60, .. })));
+    }
+
+    /// Play `n` eighth notes at `bpm` into the capture buffer, transport
+    /// stopped. `ext` keeps an external clock alive across the take (it goes
+    /// stale after 0.5 s of silence).
+    fn play_take(e: &mut Engine, bpm: f64, n: usize, ext: bool) {
+        let mut out = Vec::new();
+        let step = (RATE as f64 * 60.0 / bpm / 2.0) as u32;
+        for _ in 0..n {
+            e.live_note_on(0, 60, 100);
+            e.live_note_off(0, 60);
+            // An external clock must arrive at a plausible 24 PPQN rate (here
+            // 120 BPM): the engine reads its tempo from the tick interval.
+            let chunk_size = if ext { RATE * 60 / (120 * 24) } else { RATE / 8 };
+            let mut left = step;
+            while left > 0 {
+                let chunk = left.min(chunk_size);
+                e.advance_block(chunk, &mut out);
+                if ext {
+                    e.on_external_realtime(0xF8, &mut out);
+                }
+                left -= chunk;
+            }
+        }
+    }
+
+    fn info_field(info: &str, key: &str) -> String {
+        info.split_whitespace()
+            .find_map(|kv| kv.strip_prefix(&format!("{key}=")))
+            .unwrap_or("")
+            .to_string()
+    }
+
+    #[test]
+    fn a_long_take_keeps_only_the_last_few_bars() {
+        // Playing without pause never leaves a gap, so nothing but the age
+        // window bounds the take. Before it existed, a minute of noodling
+        // captured as a 16-bar clip pinned at the note cap — nothing like the
+        // phrase the player had just finished.
+        let mut e = engine();
+        play_take(&mut e, 120.0, 240, false); // 240 eighths at 120 BPM = 60 s
+        assert!(e.capture_commit(0));
+        let bars = e.tracks[0].active().length_steps / crate::STEPS_PER_BAR as u16;
+        // The window bounds the take; the clip then rounds up to whole bars
+        // around the last note's gate, so the window plus one bar is the ceiling.
+        assert!(
+            bars <= crate::capture::CAPTURE_MAX_BARS as u16 + 1,
+            "captured {bars} bars of history; the window is {}",
+            crate::capture::CAPTURE_MAX_BARS
+        );
+        assert!(bars >= 1, "the recent phrase is still there");
+        assert!(
+            e.tracks[0].active().notes.len() < 128,
+            "no longer pinned at the note cap"
+        );
+    }
+
+    #[test]
+    fn stopped_capture_sets_the_tempo_and_rolls() {
+        let mut e = engine();
+        play_take(&mut e, 100.0, 16, false);
+        assert!(e.capture_commit(0));
+        assert_eq!(e.clock.bpm_x100(), 10000, "the detected tempo is applied");
+        assert!(e.playing, "the take plays back immediately");
+        assert_eq!(info_field(&e.capture_info(), "mode"), "sel");
+        assert!(
+            e.tracks[0].active().notes.iter().all(|n| !n.suppress),
+            "a stopped capture is meant to be heard at once"
+        );
+    }
+
+    #[test]
+    fn selecting_another_candidate_retimes_the_take() {
+        let mut e = engine();
+        play_take(&mut e, 100.0, 16, false);
+        assert!(e.capture_commit(0));
+        let len_at_100 = e.tracks[0].active().length_steps;
+        let notes_at_100 = e.tracks[0].active().notes.len();
+        e.capture_select(2); // 200 BPM
+        assert_eq!(e.clock.bpm_x100(), 20000);
+        assert_eq!(
+            e.tracks[0].active().notes.len(),
+            notes_at_100,
+            "re-derived, not appended"
+        );
+        assert!(
+            e.tracks[0].active().length_steps > len_at_100,
+            "same performance, twice as many bars"
+        );
+    }
+
+    #[test]
+    fn an_external_clock_fits_the_take_to_the_existing_tempo() {
+        let mut e = engine();
+        let mut out = Vec::new();
+        e.on_external_realtime(0xFA, &mut out); // Move is clocking us
+        play_take(&mut e, 100.0, 16, true);
+        let before = e.clock.bpm_x100();
+        assert!(e.capture_commit(0));
+        assert_eq!(e.clock.bpm_x100(), before, "tempo is not ours to change");
+        let info = e.capture_info();
+        assert_eq!(info_field(&info, "mode"), "fix", "{info}");
+        assert_eq!(info_field(&info, "why"), "ext", "{info}");
+    }
+
+    #[test]
+    fn a_clip_with_notes_fits_rather_than_retempos() {
+        let mut e = engine();
+        let mut out = Vec::new();
+        crate::command::apply_batch(&mut e, "tog 0 0 48 100", &mut out);
+        play_take(&mut e, 100.0, 16, false);
+        assert!(e.capture_commit(0));
+        assert_eq!(e.clock.bpm_x100(), 12000);
+        let info = e.capture_info();
+        assert_eq!(info_field(&info, "why"), "notes", "{info}");
+        assert!(
+            e.tracks[0].active().notes.iter().any(|n| n.pitch == 48),
+            "the overdub keeps what was already there"
+        );
+    }
+
+    #[test]
+    fn the_fit_picks_the_closest_candidate_so_the_stretch_is_minimal() {
+        let mut e = engine(); // set runs at 120
+        let mut out = Vec::new();
+        e.on_external_realtime(0xFA, &mut out);
+        play_take(&mut e, 58.0, 16, true); // played at half time
+        assert!(e.capture_commit(0));
+        // 116 is a candidate (double of 58) and only 3.4% from 120; fitting
+        // through 58 itself would stretch the take by 107%.
+        let info = e.capture_info();
+        let permille: i32 = info_field(&info, "stretch").parse().unwrap();
+        assert!(permille.abs() < 100, "minimal stretch, got {permille}‰ — {info}");
+    }
+
+    #[test]
+    fn the_selector_owns_the_take_until_it_is_dismissed() {
+        let mut e = engine();
+        play_take(&mut e, 100.0, 16, false);
+        assert!(e.capture_commit(0));
+        e.live_note_on(0, 72, 100); // noodling while the overlay is up
+        assert_eq!(e.capture_pending(0), 0, "the frozen take is not disturbed");
+        e.capture_done();
+        assert_eq!(info_field(&e.capture_info(), "mode"), "none");
+        e.live_note_on(0, 72, 100);
+        assert_eq!(e.capture_pending(0), 1, "buffering resumes once dismissed");
+    }
+
+    #[test]
+    fn capture_overdubs_at_the_position_it_was_heard() {
+        let mut e = engine();
+        let mut out = Vec::new();
+        crate::command::apply_batch(&mut e, "tog 0 4 60 100", &mut out); // clip has notes
+        e.play();
+        run_ticks(&mut e, 6 * TICKS_PER_STEP as u64);
+        let at = e.tracks[0].pos_tick;
+        e.live_note_on(0, 67, 100);
+        e.live_note_off(0, 67);
+        let before = e.tracks[0].active().notes.len();
+        let len_before = e.tracks[0].active().length_steps;
+        assert!(e.capture_commit(0));
+        assert_eq!(e.tracks[0].active().notes.len(), before + 1);
+        let n = *e.tracks[0].active().notes.last().unwrap();
+        assert_eq!(n.pitch, 67);
+        assert!(
+            n.tick.abs_diff(at) <= TICKS_PER_STEP,
+            "landed at {}, heard at {at}",
+            n.tick
+        );
+        assert_eq!(
+            e.tracks[0].active().length_steps,
+            len_before,
+            "an overdub keeps the clip's length"
+        );
+    }
+
+    #[test]
+    fn capture_into_an_empty_playing_clip_grows_it_to_whole_bars() {
+        let mut e = engine();
+        e.play();
+        // A phrase that runs past one bar: 5 notes, one bar apart.
+        for _ in 0..5 {
+            e.live_note_on(0, 60, 100);
+            e.live_note_off(0, 60);
+            run_ticks(&mut e, crate::TICKS_PER_BAR as u64);
+        }
+        assert!(e.capture_commit(0));
+        let len = e.tracks[0].active().length_steps;
+        assert_eq!(len % crate::STEPS_PER_BAR as u16, 0, "whole bars, got {len}");
+        assert!(len > crate::STEPS_PER_BAR as u16, "grew past one bar, got {len}");
+    }
+
+    #[test]
+    fn capture_consumes_the_buffer() {
+        let mut e = engine();
+        e.play();
+        e.live_note_on(0, 60, 100);
+        e.live_note_off(0, 60);
+        assert!(e.capture_commit(0));
+        assert_eq!(e.capture_pending(0), 0);
+        assert!(!e.capture_commit(0), "nothing left to capture");
+    }
+
+    #[test]
+    fn capture_consumes_the_buffer_even_when_it_writes_nothing() {
+        // Only note-offs buffered for this track: there is nothing to write, but
+        // the press still has to leave the buffer empty or those orphans ride
+        // along into whatever is played next.
+        let mut e = engine();
+        e.play();
+        e.live_note_off(0, 60);
+        assert!(!e.capture_commit(0), "nothing to write");
+        assert!(e.capture.is_empty(), "but the buffer is consumed");
+    }
+
+    #[test]
+    fn live_notes_buffer_for_capture_while_idle() {
+        let mut e = engine();
+        e.live_note_on(0, 60, 100);
+        e.live_note_off(0, 60);
+        assert_eq!(e.capture_pending(0), 1);
+    }
+
+    #[test]
+    fn armed_input_is_not_buffered() {
+        let mut e = engine();
+        e.play();
+        e.toggle_record(0); // punch-in, queued to the bar the transport is on
+        run_ticks(&mut e, 1);
+        assert!(e.recording);
+        e.live_note_on(0, 60, 100);
+        assert_eq!(e.capture_pending(0), 0, "the record path owns armed input");
+    }
+
+    #[test]
+    fn captured_notes_sound_in_the_pass_they_were_captured_in() {
+        // Jam across the loop end and capture just after it: the notes played
+        // before the wrap sit AHEAD of the playhead now, so they must sound this
+        // time round. Writing them suppressed (which is right for live
+        // recording, where you have only just played the note) made the take
+        // silent until the next repeat.
+        let mut e = engine();
+        e.tracks[0].active_mut().toggle_step(0, &[(60, 100)]);
+        e.tracks[0].active_mut().set_loop(0, 16);
+        e.play();
+        run_ticks(&mut e, 14 * TICKS_PER_STEP as u64);
+        e.live_note_on(0, 67, 100);          // late in the bar
+        e.live_note_off(0, 67);
+        run_ticks(&mut e, 4 * TICKS_PER_STEP as u64);   // over the loop end
+        assert!(e.capture_commit(0), "the pre-wrap phrase is still buffered");
+        // Run to just before the next wrap: step 14 comes round inside this pass.
+        let ev = run_ticks(&mut e, 13 * TICKS_PER_STEP as u64);
+        assert!(
+            ev.iter().any(|x| matches!(x, OutEvent::NoteOn { pitch: 67, .. })),
+            "the captured note played in this pass, not the next one"
+        );
+    }
+
+    #[test]
+    fn an_empty_clip_captured_while_playing_launches_on_the_bar() {
+        // Transport running, nothing in this clip yet: the take keeps the
+        // transport's tempo and falls in on the bar like any other clip launch,
+        // rather than starting wherever the playhead happened to be.
+        let mut e = engine();
+        e.play();
+        let bpm = e.clock.bpm_x100();
+        run_ticks(&mut e, 5 * TICKS_PER_STEP as u64);   // mid-bar
+        e.live_note_on(0, 67, 100);
+        e.live_note_off(0, 67);
+        e.live_note_on(0, 69, 100);
+        e.live_note_off(0, 69);
+        assert!(e.capture_commit(0));
+        assert_eq!(e.clock.bpm_x100(), bpm, "the transport's tempo is kept");
+        let a = e.tracks[0].active_clip;
+        assert_eq!(
+            e.tracks[0].queued_slot, Some(a),
+            "queued, not started mid-bar"
+        );
+        let first = e.tracks[0].active().notes.iter().map(|n| n.tick).min().unwrap();
+        assert_eq!(
+            first,
+            e.tracks[0].active().loop_start_ticks() + 5 * TICKS_PER_STEP,
+            "the take keeps the phase it was played at, not snapped to step 1"
+        );
+        // On the next bar the launch fires and the clip plays from its start.
+        run_ticks(&mut e, crate::TICKS_PER_BAR as u64);
+        assert_eq!(e.tracks[0].playing_slot, Some(a));
+    }
+
+    #[test]
+    fn a_note_less_clip_that_is_already_the_playing_slot_still_launches_on_the_bar() {
+        // The clip exists (it was created, or its notes were deleted) but holds
+        // nothing, so it is already this track's playing slot and its playhead
+        // is running. Without a re-launch the take lands wherever the playhead
+        // had got to and never lines up with the bar.
+        let mut e = engine();
+        e.tracks[0].active_mut().ensure_exists();
+        e.play();
+        let bpm = e.clock.bpm_x100();
+        run_ticks(&mut e, 5 * TICKS_PER_STEP as u64);   // mid-bar
+        assert!(e.tracks[0].pos_tick > 0, "the playhead really is mid-bar");
+        e.live_note_on(0, 67, 100);
+        e.live_note_off(0, 67);
+        assert!(e.capture_commit(0));
+        assert_eq!(e.clock.bpm_x100(), bpm, "the transport's tempo is kept");
+        let a = e.tracks[0].active_clip;
+        assert_eq!(e.tracks[0].queued_slot, Some(a), "re-launched on the bar");
+        let first = e.tracks[0].active().notes.iter().map(|n| n.tick).min().unwrap();
+        assert_eq!(
+            first,
+            e.tracks[0].active().loop_start_ticks() + 5 * TICKS_PER_STEP,
+            "the take keeps the phase it was played at, not snapped to step 1"
+        );
+    }
+
+    #[test]
+    fn capturing_into_a_selected_slot_launches_it() {
+        // The slot you jammed over is the one you expect to hear afterwards,
+        // even if the track was playing something else (or nothing).
+        let mut e = engine();
+        e.play();
+        e.tracks[0].active_clip = 2;
+        e.tracks[0].playing_slot = None;
+        e.live_note_on(0, 60, 100);
+        e.live_note_off(0, 60);
+        assert!(e.capture_commit(0));
+        assert_eq!(
+            e.tracks[0].queued_slot, Some(2),
+            "the captured slot is launched, bar-quantized like step entry"
+        );
+    }
+
+    #[test]
+    fn replaying_the_same_spot_next_time_round_drops_the_earlier_pass() {
+        let mut e = engine();
+        e.tracks[0].active_mut().toggle_step(0, &[(60, 100)]);
+        e.tracks[0].active_mut().set_loop(0, 16);
+        e.play();
+        run_ticks(&mut e, 2 * TICKS_PER_STEP as u64);
+        e.live_note_on(0, 67, 100);
+        e.live_note_off(0, 67);
+        assert_eq!(e.capture_pending(0), 1);
+        // All the way round to the same spot, and play there again.
+        run_ticks(&mut e, crate::TICKS_PER_BAR as u64);
+        e.live_note_on(0, 69, 100);
+        assert_eq!(
+            e.capture_pending(0), 1,
+            "the earlier pass over this spot went; only the new note is buffered"
+        );
+    }
+
+    #[test]
+    fn a_phrase_that_crosses_the_loop_end_survives() {
+        // The old rule cleared at the wrap itself, which ate everything played
+        // in the run-up to it — exactly the phrase you most want to keep.
+        let mut e = engine();
+        e.tracks[0].active_mut().toggle_step(0, &[(60, 100)]);
+        e.tracks[0].active_mut().set_loop(0, 16);
+        e.play();
+        run_ticks(&mut e, 14 * TICKS_PER_STEP as u64);
+        e.live_note_on(0, 67, 100);           // late in the bar
+        e.live_note_off(0, 67);
+        run_ticks(&mut e, 4 * TICKS_PER_STEP as u64);  // over the loop end
+        e.live_note_on(0, 69, 100);           // early in the next bar
+        e.live_note_off(0, 69);
+        assert_eq!(e.capture_pending(0), 2, "both halves of the phrase are kept");
+    }
+
+    #[test]
+    fn a_chord_does_not_clear_itself() {
+        // Every note of a chord lands at one position in one pass; only an
+        // earlier pass counts as "you played over that again".
+        let mut e = engine();
+        e.tracks[0].active_mut().toggle_step(0, &[(60, 100)]);
+        e.tracks[0].active_mut().set_loop(0, 16);
+        e.play();
+        run_ticks(&mut e, 2 * TICKS_PER_STEP as u64);
+        e.live_note_on(0, 60, 100);
+        e.live_note_on(0, 64, 100);
+        e.live_note_on(0, 67, 100);
+        assert_eq!(e.capture_pending(0), 3, "the whole chord is buffered");
+    }
+
+    #[test]
+    fn deliberate_editing_clears_the_buffer() {
+        // Every gesture that means "I am building this clip on purpose" drops
+        // the free playing that came before it, so a later Capture cannot drop
+        // old notes into a clip that has since been edited by hand.
+        let mut out = Vec::new();
+        for op in [
+            "rec 0", "tog 0 0 60 100", "del 0 0 15 -1", "cq 0 100", "clen 0 32",
+            "dbl 0", "clipdel 0 0", "launch 0 1", "evel 0 0 0 -1 5", "aset 0 0 64",
+        ] {
+            let mut e = engine();
+            e.live_note_on(0, 60, 100);
+            assert_eq!(e.capture_pending(0), 1, "{op}: precondition");
+            crate::command::apply_batch(&mut e, op, &mut out);
+            assert_eq!(e.capture_pending(0), 0, "{op} left buffered input behind");
+        }
+    }
+
+    #[test]
+    fn housekeeping_traffic_does_not_clear_the_buffer() {
+        // The UI emits these while you are only playing: a step-length query,
+        // and the automation base syncs that follow any knob read or lane
+        // allocation. Clearing on them wiped the buffer mid-phrase.
+        let mut out = Vec::new();
+        for op in ["hold 0 4", "hold 0 -1", "abase 0 0 64", "abaseq 0 0 64", "alabel 0 0 x:y"] {
+            let mut e = engine();
+            e.live_note_on(0, 60, 100);
+            crate::command::apply_batch(&mut e, op, &mut out);
+            assert_eq!(e.capture_pending(0), 1, "{op} threw away live input");
+        }
+    }
+
+    #[test]
+    fn playing_the_pads_does_not_clear_the_buffer() {
+        // The inverse of the rule above: the input itself must survive, or
+        // nothing would ever be capturable.
+        let mut e = engine();
+        let mut out = Vec::new();
+        crate::command::apply_batch(&mut e, "non 0 60 100;nof 0 60;non 0 64 100", &mut out);
+        assert_eq!(e.capture_pending(0), 2);
+    }
+
+    #[test]
+    fn transport_edges_and_track_select_clear_the_buffer() {
+        let mut e = engine();
+        let mut out = Vec::new();
+        e.live_note_on(0, 60, 100);
+        e.play();
+        assert_eq!(e.capture_pending(0), 0, "starting clears");
+        e.live_note_on(0, 60, 100);
+        e.stop(&mut out);
+        assert_eq!(e.capture_pending(0), 0, "stopping clears");
+        e.live_note_on(0, 60, 100);
+        crate::command::apply_batch(&mut e, "watch 1", &mut out);
+        assert_eq!(e.capture_pending(0), 0, "a track button clears");
+    }
+
+    #[test]
+    fn recording_captures_live_notes_after_count_in() {
+        let mut e = engine();
+        e.toggle_record(0); // arms: count-in starts, transport plays
+        assert!(e.playing);
+        assert!(e.counting_in());
+        assert!(!e.recording);
+        // Run through the one-bar count-in (no capture yet).
+        run_ticks(&mut e, crate::TICKS_PER_BAR as u64 + 1);
+        assert!(e.recording);
+        assert!(!e.counting_in());
+        // Play a live note for ~2 steps.
+        e.live_note_on(0, 60, 100);
+        run_ticks(&mut e, 2 * TICKS_PER_STEP as u64);
+        e.live_note_off(0, 60);
+        assert_eq!(e.tracks[0].active().notes.len(), 1);
+        let n = e.tracks[0].active().notes[0];
+        assert_eq!(n.pitch, 60);
+        assert_eq!(n.vel, 100);
+        assert!(n.gate >= TICKS_PER_STEP); // ~2 steps long
+        assert!(n.suppress); // not replayed until the clip wraps
+    }
+
+    #[test]
+    fn count_in_and_metronome_emit_clicks() {
+        let mut e = engine();
+        e.toggle_record(0);
+        // The count-in bar produces 4 beat clicks, one accented (downbeat).
+        let cin = run_ticks(&mut e, crate::TICKS_PER_BAR as u64);
+        assert_eq!(cin.iter().filter(|x| matches!(x, OutEvent::Click { .. })).count(), 4);
+        // Metronome on, run another bar: 4 clicks, 1 accent.
+        e.set_metronome(true);
+        let bar = run_ticks(&mut e, crate::TICKS_PER_BAR as u64);
+        assert_eq!(bar.iter().filter(|x| matches!(x, OutEvent::Click { .. })).count(), 4);
+        assert_eq!(
+            bar.iter().filter(|x| matches!(x, OutEvent::Click { accent: true })).count(),
+            1
+        );
+    }
+
+    /// Arm, sit through the count-in, and play a note that is still held on
+    /// return — the state every tail test starts from.
+    fn recording_with_a_held_note(pitch: u8) -> Engine {
+        let mut e = engine();
+        e.toggle_record(0);
+        run_ticks(&mut e, crate::TICKS_PER_BAR as u64 + 1);
+        assert!(e.recording, "precondition: past the count-in");
+        e.live_note_on(0, pitch, 100);
+        run_ticks(&mut e, 2 * TICKS_PER_STEP as u64);
+        e
+    }
+
+    #[test]
+    fn rec_stop_keeps_a_note_that_is_still_held() {
+        // The reported bug: pressing Rec to stop while a pad was down erased
+        // that note outright. It belongs to the take and keeps the length it
+        // was actually played for, past the stop.
+        let mut e = recording_with_a_held_note(60);
+        e.toggle_record(0);
+        assert!(!e.recording, "capture stops immediately");
+        run_ticks(&mut e, 2 * TICKS_PER_STEP as u64);
+        e.live_note_off(0, 60);
+
+        assert_eq!(e.tracks[0].active().notes.len(), 1, "the held note was lost");
+        let n = e.tracks[0].active().notes[0];
+        assert_eq!(n.pitch, 60);
+        assert_eq!(n.vel, 100);
+        // ~4 steps: two inside the recording, two after the stop.
+        assert!(
+            n.gate >= 3 * TICKS_PER_STEP && n.gate <= 5 * TICKS_PER_STEP,
+            "gate {} is not the performed length",
+            n.gate
+        );
+    }
+
+    #[test]
+    fn rec_stop_captures_nothing_played_after_it() {
+        // The other half of punch-out: the note you were already holding is
+        // finished, but recording really has stopped.
+        let mut e = recording_with_a_held_note(60);
+        e.toggle_record(0);
+        e.live_note_on(0, 67, 100);
+        run_ticks(&mut e, TICKS_PER_STEP as u64);
+        e.live_note_off(0, 67);
+        e.live_note_off(0, 60);
+        let pitches: Vec<u8> = e.tracks[0].active().notes.iter().map(|n| n.pitch).collect();
+        assert_eq!(pitches, vec![60], "a note played after the stop was recorded");
+    }
+
+    #[test]
+    fn transport_stop_ends_a_held_note_there() {
+        // Stopping the transport had the same erasing bug. There is no playhead
+        // left to measure against, so the note ends at the stop.
+        let mut e = recording_with_a_held_note(60);
+        let mut out = Vec::new();
+        e.stop(&mut out);
+        assert_eq!(e.tracks[0].active().notes.len(), 1, "the held note was lost");
+        let n = e.tracks[0].active().notes[0];
+        assert!(
+            n.gate >= TICKS_PER_STEP && n.gate <= 3 * TICKS_PER_STEP,
+            "gate {} is not the length played before the stop",
+            n.gate
+        );
+    }
+
+    #[test]
+    fn an_unreleased_tail_is_finalized_at_the_clip_end() {
+        // A pad that is never released must not leave its note invisible for
+        // ever. The clip end caps it, and is also where it gets written.
+        let mut e = recording_with_a_held_note(60);
+        e.toggle_record(0);
+        let span = e.tracks[0].active().length_ticks();
+        run_ticks(&mut e, span as u64 + TICKS_PER_STEP as u64);
+
+        assert_eq!(e.tracks[0].active().notes.len(), 1);
+        let n = e.tracks[0].active().notes[0];
+        let end = e.tracks[0].active().loop_end_ticks();
+        assert_eq!(n.tick + n.gate, end, "did not stop at the clip end");
+        // Already written, so the eventual release must not write it twice.
+        e.live_note_off(0, 60);
+        assert_eq!(e.tracks[0].active().notes.len(), 1, "the release duplicated it");
+    }
+
+    #[test]
+    fn a_tail_note_is_audible_on_the_very_next_loop() {
+        // The tail is finalized at the clip end — the same tick on which
+        // `release_pass_flags` has just cleared everyone's suppress flag. Marked
+        // suppressed like any freshly recorded note, it would then wait for the
+        // NEXT wrap: recorded correctly, but silent for the whole first loop.
+        let mut e = recording_with_a_held_note(60);
+        e.toggle_record(0);                  // stop; the pad is never released
+        let span = e.tracks[0].active().length_ticks() as u64;
+
+        let first = run_ticks(&mut e, span);
+        let heard = |o: &[OutEvent]| {
+            o.iter().filter(|x| matches!(x, OutEvent::NoteOn { pitch: 60, .. })).count()
+        };
+        assert!(!e.tracks[0].active().notes.is_empty(), "precondition: it was recorded");
+        assert_eq!(heard(&first), 1, "the held note was silent for the first loop");
+        let second = run_ticks(&mut e, span);
+        assert_eq!(heard(&second), 1, "and it must keep playing after that");
+    }
+
+    #[test]
+    fn a_note_finalized_on_its_own_pass_is_still_suppressed() {
+        // The other half: a note released while the pass it was played on is
+        // still running must stay suppressed, or quantization moving its fire
+        // tick past the playhead sounds it a second time on that same pass.
+        let mut e = recording_with_a_held_note(60);
+        e.live_note_off(0, 60);
+        assert!(e.tracks[0].active().notes[0].suppress, "same-pass note lost its guard");
+    }
+
+    #[test]
+    fn a_long_tail_stops_at_the_clip_end_instead_of_droning() {
+        // Capping a tail at the pattern LENGTH rather than at the clip END let a
+        // note that began mid-clip run past the loop point and still be sounding
+        // when it reached its own start — audible as a drone on every pass.
+        // Recording a new clip, so it auto-extends: the note begins in bar 1 and
+        // the take runs into bar 2 before the stop.
+        let mut e = engine();
+        e.toggle_record(0);
+        run_ticks(&mut e, crate::TICKS_PER_BAR as u64 + 1);
+        run_ticks(&mut e, 14 * TICKS_PER_STEP as u64);   // near the bar line
+        e.live_note_on(0, 60, 100);
+        run_ticks(&mut e, 6 * TICKS_PER_STEP as u64);    // cross into bar 2
+        e.toggle_record(0);                              // stop, still held
+        run_ticks(&mut e, 40 * TICKS_PER_STEP as u64);   // hold on and on
+        e.live_note_off(0, 60);
+
+        let c = e.tracks[0].active();
+        assert_eq!(c.notes.len(), 1);
+        let n = c.notes[0];
+        assert!(n.tick > 0, "precondition: the note begins mid-clip");
+        assert_eq!(n.tick + n.gate, c.loop_end_ticks(), "did not stop at the clip end");
+        assert!(
+            n.gate < c.length_ticks(),
+            "gate {} fills the whole clip from a mid-clip start — it wraps into itself",
+            n.gate
+        );
+    }
+
+    #[test]
+    fn arming_the_next_take_resolves_the_previous_tail() {
+        // A tail cannot outlive the take after it: the position it would be
+        // measured against no longer has anything to do with the note.
+        let mut e = recording_with_a_held_note(60);
+        e.toggle_record(0);
+        e.toggle_record(0); // re-arm while the pad is still down
+        assert_eq!(e.tracks[0].active().notes.len(), 1, "the tail was not resolved");
+        e.live_note_off(0, 60);
+        assert_eq!(e.tracks[0].active().notes.len(), 1, "the release wrote it again");
+    }
+
+    #[test]
+    fn a_tail_lands_in_the_clip_it_was_played_into() {
+        // Releasing the pad after switching clips used to write the note
+        // wherever the track happened to be pointing by then.
+        let mut e = recording_with_a_held_note(60);
+        let mut out = Vec::new();
+        e.toggle_record(0);
+        apply_batch(&mut e, "clipsel 0 1", &mut out);
+        e.live_note_off(0, 60);
+        assert_eq!(e.tracks[0].clips[0].notes.len(), 1, "not in the clip it was played into");
+        assert_eq!(e.tracks[0].clips[1].notes.len(), 0, "written into the newly selected clip");
+    }
+
+    #[test]
+    fn deleting_the_clip_drops_its_tail() {
+        // Writing the note on release would leave one stray note in a slot the
+        // user just emptied.
+        let mut e = recording_with_a_held_note(60);
+        let mut out = Vec::new();
+        e.toggle_record(0);
+        apply_batch(&mut e, "clipdel 0", &mut out);
+        assert_eq!(e.tracks[0].active().notes.len(), 0, "precondition: emptied");
+
+        // Rebuilding the clip by hand must not give the stale note somewhere to
+        // land: the slot exists again by the time the pad is finally released.
+        apply_batch(&mut e, "tog 0 4 64 100", &mut out);
+        e.live_note_off(0, 60);
+        let pitches: Vec<u8> = e.tracks[0].active().notes.iter().map(|n| n.pitch).collect();
+        assert_eq!(pitches, vec![64], "the deleted clip's note came back");
+    }
+
+    #[test]
+    fn ltog_inherits_the_step_span_in_melodic_view_only() {
+        // Where the melodic-vs-drum decision is actually made: `ltog` reads
+        // watch_lane. A chord's added voice joins the chord; a drum lane's
+        // neighbour at the same step is a separate voice and keeps the grid.
+        let mut out = Vec::new();
+        for (wlane, want) in [("-1", (100u32, 60u32)), ("36", (4 * TICKS_PER_STEP, TICKS_PER_STEP))] {
+            let mut e = engine();
+            e.tracks[0].active_mut().set_loop(0, 16);
+            e.tracks[0].active_mut().add_note_raw(4, 100, 60, 60, 100);
+            apply_batch(&mut e, &format!("wlane {wlane};ltog 0 4 67 110"), &mut out);
+
+            let n = *e.tracks[0].active().notes.iter().find(|n| n.pitch == 67).unwrap();
+            assert_eq!((n.tick, n.gate), want, "wlane {wlane}");
+        }
+    }
+
+    #[test]
+    fn toggle_record_twice_stops() {
+        let mut e = engine();
+        e.toggle_record(0);
+        run_ticks(&mut e, crate::TICKS_PER_BAR as u64 + 1);
+        assert!(e.recording);
+        e.toggle_record(0);
+        assert!(!e.recording);
+    }
+
+    #[test]
+    fn launch_when_stopped_is_immediate() {
+        let mut e = engine();
+        e.tracks[1].clips[2].toggle_step(0, &[(60, 100)]);
+        e.launch_clip(1, 2);
+        assert!(e.playing);
+        assert_eq!(e.tracks[1].playing_slot, Some(2));
+        assert_eq!(e.tracks[1].active_clip, 2);
+        // Only track 1 plays; others stay silent.
+        assert_eq!(e.tracks[0].playing_slot, None);
+        let ev = run_ticks(&mut e, 2);
+        assert!(ev.contains(&OutEvent::NoteOn { track: 1, pitch: 60, vel: 100 }));
+    }
+
+    #[test]
+    fn launch_while_running_is_bar_quantized() {
+        let mut e = engine();
+        e.tracks[0].clips[0].toggle_step(0, &[(60, 100)]);
+        e.tracks[0].clips[3].toggle_step(0, &[(67, 100)]);
+        e.launch_clip(0, 0); // immediate (stopped)
+        // Queue clip 3 mid-bar; it must not switch until the next bar.
+        run_ticks(&mut e, TICKS_PER_STEP as u64 * 2);
+        e.launch_clip(0, 3);
+        assert_eq!(e.tracks[0].playing_slot, Some(0));
+        assert_eq!(e.tracks[0].queued_slot, Some(3));
+        // Advance to the next bar boundary → clip 3 takes over.
+        run_ticks(&mut e, crate::TICKS_PER_BAR as u64);
+        assert_eq!(e.tracks[0].playing_slot, Some(3));
+        assert_eq!(e.tracks[0].queued_slot, None);
+    }
+
+    #[test]
+    fn empty_slot_selects_and_stops_track() {
+        let mut e = engine();
+        e.tracks[2].clips[0].toggle_step(0, &[(60, 100)]);
+        e.launch_clip(2, 0);
+        run_ticks(&mut e, 4);
+        // Select an empty slot 5: selects it and stops the track at next bar.
+        e.launch_clip(2, 5);
+        assert_eq!(e.tracks[2].active_clip, 5);
+        assert!(e.tracks[2].pending_stop);
+        run_ticks(&mut e, crate::TICKS_PER_BAR as u64);
+        assert_eq!(e.tracks[2].playing_slot, None);
+    }
+
+    #[test]
+    fn session_status_reports_grid() {
+        let mut e = engine();
+        e.tracks[0].clips[0].toggle_step(0, &[(60, 100)]);
+        e.tracks[0].clips[1].toggle_step(0, &[(62, 100)]);
+        e.launch_clip(0, 0);
+        let s = e.status();
+        let sess = s.split("sess=").nth(1).unwrap().split(' ').next().unwrap();
+        let t0 = sess.split(',').next().unwrap();
+        // slots 0 and 1 exist → bitmap 0x03; playing 0; queued -; selected 0.
+        assert_eq!(t0, "03.0.-.0");
+    }
+
+    #[test]
+    fn deleting_the_playing_clip_stops_its_track() {
+        let mut e = engine();
+        e.tracks[0].clips[0].toggle_step(0, &[(60, 100)]);
+        e.tracks[0].clips[1].toggle_step(0, &[(62, 100)]);
+        e.launch_clip(0, 0);          // stopped → plays at once, transport starts
+        e.launch_clip(0, 1);          // running → slot 1 queued
+        e.delete_clip_at(0, 0);
+        let t0 = |e: &Engine| e.status().split("sess=").nth(1).unwrap()
+            .split(',').next().unwrap().to_string();
+        // The emptied slot is neither playing nor painted as such.
+        assert_eq!(t0(&e), "02.-.1.1");
+        e.delete_clip_at(0, 1);
+        assert_eq!(t0(&e), "00.-.-.1", "a deleted clip cannot stay queued");
+    }
+
+    #[test]
+    fn status_reports_watched_clip() {
+        let mut e = engine();
+        e.watch_track = 2;
+        e.tracks[2].active_mut().toggle_step(3, &[(60, 100)]);
+        let s = e.status();
+        assert!(s.contains("play=0"));
+        assert!(s.contains("trk=2"));
+        assert!(s.contains("len=16"));
+        let occ = s.split("occ=").nth(1).unwrap();
+        assert_eq!(&occ[0..2], "10"); // step 3 = bit 4 of byte 0
+    }
+
+    #[test]
+    fn status_reports_active_notes_during_playback() {
+        let mut e = engine();
+        // One note on track 0 at step 0, then start playback (play() selects
+        // the active clip as the playing slot).
+        e.tracks[0].active_mut().toggle_step(0, &[(60, 100)]);
+        e.play();
+        // Advance just past the note's trigger so its gate is open.
+        let _ = run_ticks(&mut e, 2);
+        let s = e.status();
+        let act = s.split("act=").nth(1).unwrap().split(' ').next().unwrap();
+        // Format: 4 comma-separated tracks, dot-separated pitches; track 0 sounds 60.
+        assert_eq!(act.split(',').next().unwrap(), "60");
+    }
+
+    #[test]
+    fn active_notes_clear_when_stopped() {
+        let mut e = engine();
+        let mut out = Vec::new();
+        e.tracks[0].active_mut().toggle_step(0, &[(60, 100)]);
+        e.play();
+        let _ = run_ticks(&mut e, 2);
+        e.stop(&mut out); // stop drains gates (silences) → active set empties
+        let s = e.status();
+        let act = s.split("act=").nth(1).unwrap().split(' ').next().unwrap();
+        // One empty group per track: the separator count, not a fixed literal,
+        // so widening NUM_TRACKS does not need this test edited again.
+        assert_eq!(act, ",".repeat(NUM_TRACKS - 1));
+    }
+
+    #[test]
+    fn empty_clip_does_not_advance_position() {
+        let mut e = engine();
+        e.play();
+        let _ = run_ticks(&mut e, 10);
+        assert_eq!(e.tracks[0].pos_tick, 0);
+    }
+
+    #[test]
+    fn hold_query_reports_note_length_in_steps() {
+        let mut e = engine();
+        let mut out = Vec::new();
+        e.tracks[0].active_mut().toggle_step(2, &[(60, 100)]);
+        e.tracks[0].active_mut().set_length(2, 2, None, 4 * TICKS_PER_STEP); // 4 steps
+        crate::command::apply_batch(&mut e, "hold 0 2", &mut out);
+        let s1 = e.status();
+        let hlen = s1.split("hlen=").nth(1).unwrap().split(' ').next().unwrap();
+        assert_eq!(hlen, "4");
+        crate::command::apply_batch(&mut e, "hold 0 -1", &mut out); // clear
+        let s2 = e.status();
+        let hlen0 = s2.split("hlen=").nth(1).unwrap().split(' ').next().unwrap();
+        assert_eq!(hlen0, "0");
+    }
+
+    #[test]
+    fn hold_query_reports_step_pitches() {
+        let mut e = engine();
+        let mut out = Vec::new();
+        e.tracks[0].active_mut().toggle_step(3, &[(60, 100), (64, 90), (67, 80)]);
+        crate::command::apply_batch(&mut e, "hold 0 3", &mut out);
+        let s = e.status();
+        let hnotes = s.split("hnotes=").nth(1).unwrap().split(' ').next().unwrap();
+        assert_eq!(hnotes, "60.64.67");
+        // Empty step → empty hnotes
+        crate::command::apply_batch(&mut e, "hold 0 5", &mut out); // step 5 has no notes
+        let s2 = e.status();
+        let hn2 = s2.split("hnotes=").nth(1).unwrap().split(' ').next().unwrap();
+        assert_eq!(hn2, "");
+        // No hold → empty
+        crate::command::apply_batch(&mut e, "hold 0 -1", &mut out);
+        let s3 = e.status();
+        let hn3 = s3.split("hnotes=").nth(1).unwrap().split(' ').next().unwrap();
+        assert_eq!(hn3, "");
+    }
+
+    #[test]
+    fn status_reports_watched_pad_mutes_and_solo() {
+        let mut e = engine();
+        let wp = |e: &Engine| -> String {
+            e.status().split("wpad=").nth(1).unwrap().split(' ').next().unwrap().to_string()
+        };
+        assert_eq!(wp(&e), "-1:", "nothing muted, no solo");
+
+        e.tracks[0].set_pad_mute(36, true);
+        e.tracks[0].set_pad_mute(38, true);
+        assert_eq!(wp(&e), "-1:36.38");
+
+        /* The mute set stays in the payload while a solo is up, so un-soloing
+         * restores the user's own mutes without a second read. */
+        e.tracks[0].pad_solo = Some(42);
+        assert_eq!(wp(&e), "42:36.38");
+
+        // Another track's mutes must not leak into the watched one.
+        e.tracks[1].set_pad_mute(40, true);
+        assert_eq!(wp(&e), "42:36.38");
+        e.watch_track = 1;
+        assert_eq!(wp(&e), "-1:40");
+    }
+
+    #[test]
+    fn status_reports_watched_pos_tick() {
+        let mut e = engine();
+        e.tracks[0].active_mut().toggle_step(0, &[(60, 100)]);
+        e.play();
+        let _ = run_ticks(&mut e, 5);
+        let s = e.status();
+        let pos = s.split("pos=").nth(1).unwrap().split(' ').next().unwrap();
+        assert_eq!(pos.parse::<u32>().unwrap(), e.tracks[e.watch_track].pos_tick);
+    }
+
+    #[test]
+    fn record_while_playing_skips_count_in() {
+        let mut e = engine();
+        e.tracks[0].active_mut().toggle_step(0, &[(60, 100)]);
+        e.play();              // transport already running
+        e.toggle_record(0);
+        assert!(e.recording, "records immediately");
+        assert!(!e.counting_in(), "no count-in while already playing");
+    }
+
+    #[test]
+    fn record_while_stopped_arms_count_in() {
+        let mut e = engine();
+        e.tracks[0].active_mut().toggle_step(0, &[(60, 100)]);
+        e.toggle_record(0);
+        assert!(e.counting_in(), "stopped: arms the count-in");
+        assert!(!e.recording, "recording begins only after the count-in");
+    }
+
+    #[test]
+    fn clips_silent_during_count_in_then_play() {
+        let mut e = engine();
+        e.tracks[0].active_mut().toggle_step(0, &[(60, 100)]);
+        e.toggle_record(0); // arms a one-bar count-in, starts transport
+        // Most of the count-in bar: no clip NoteOn (clicks are a different event).
+        let during = run_ticks(&mut e, crate::TICKS_PER_BAR as u64 - 4);
+        assert!(!during.iter().any(|x| matches!(x, OutEvent::NoteOn { .. })),
+                "no clip notes during count-in");
+        // Cross the count-in boundary: the step-0 note plays.
+        let after = run_ticks(&mut e, 8);
+        assert!(after.iter().any(|x| matches!(x, OutEvent::NoteOn { pitch: 60, .. })),
+                "note plays once count-in ends");
+    }
+
+    #[test]
+    fn status_reports_mute_flags() {
+        use crate::command::apply_batch;
+        let mut e = engine();
+        let mut out = Vec::new();
+        apply_batch(&mut e, "mute 1 1", &mut out);
+        let s = e.status();
+        let m = s.split("mute=").nth(1).unwrap().split(' ').next().unwrap();
+        let mut want = vec!['0'; NUM_TRACKS];
+        want[1] = '1';
+        assert_eq!(m, want.into_iter().collect::<String>(), "track 1 muted");
+    }
+
+    #[test]
+    fn first_recording_auto_extends_clip() {
+        // Empty clip: recording should extend bar-by-bar on each loop.
+        let mut e = engine();
+        e.toggle_record(0); // count-in
+        run_ticks(&mut e, crate::TICKS_PER_BAR as u64 + 1); // start recording
+        assert!(e.recording);
+        assert_eq!(e.tracks[0].active().length_steps, crate::STEPS_PER_BAR as u16);
+        // Run one full bar: pos_tick should hit end → clip extends to 2 bars.
+        run_ticks(&mut e, crate::TICKS_PER_BAR as u64);
+        assert_eq!(e.tracks[0].active().length_steps, crate::STEPS_PER_BAR as u16 * 2);
+    }
+
+    #[test]
+    fn overdub_does_not_auto_extend_clip() {
+        // Clip already has a note → overdub should NOT extend on wrap.
+        let mut e = engine();
+        e.tracks[0].active_mut().toggle_step(0, &[(60, 100)]); // place a note first
+        assert_eq!(e.tracks[0].active().notes.len(), 1);
+        let initial_len = e.tracks[0].active().length_steps;
+        e.toggle_record(0); // count-in; rec_empty_start = false (has notes)
+        run_ticks(&mut e, crate::TICKS_PER_BAR as u64 + 1); // start recording
+        assert!(e.recording);
+        // Run one full bar: clip should NOT extend.
+        run_ticks(&mut e, crate::TICKS_PER_BAR as u64);
+        assert_eq!(e.tracks[0].active().length_steps, initial_len);
+    }
+
+    #[test]
+    fn punch_in_records_into_empty_slot_and_extends() {
+        // Transport already running, then record a NEW clip into an empty slot
+        // (Session punch-in). The slot must become the track's playing/recording
+        // clip — capture works and it auto-extends like any first recording.
+        let mut e = engine();
+        e.tracks[1].active_mut().toggle_step(0, &[(48, 100)]); // some other track playing
+        e.play();
+        assert!(e.playing);
+
+        e.launch_clip(0, 2); // select empty slot 2 while running (sets pending_stop)
+        assert!(e.tracks[0].active().notes.is_empty());
+
+        e.toggle_record(0); // punch-in, queued to the next bar
+        run_ticks(&mut e, 1); // armed at tick 0, so the bar is this one
+        assert!(e.recording);
+        assert_eq!(e.tracks[0].playing_slot, Some(2), "empty slot not made the playing clip");
+        assert!(!e.tracks[0].pending_stop, "pending stop from empty-slot select not cleared");
+
+        // A live note is captured into the new clip.
+        e.live_note_on(0, 60, 110);
+        run_ticks(&mut e, 2 * TICKS_PER_STEP as u64);
+        e.live_note_off(0, 60);
+        assert_eq!(e.tracks[0].clips[2].notes.len(), 1, "note not recorded into the empty slot");
+
+        // Crossing the end auto-extends the new clip bar-by-bar.
+        let before = e.tracks[0].clips[2].length_steps;
+        run_ticks(&mut e, crate::TICKS_PER_BAR as u64);
+        assert!(e.tracks[0].clips[2].length_steps > before, "new clip did not auto-extend");
+    }
+
+    #[test]
+    fn punch_in_into_empty_slot_waits_for_the_bar() {
+        // Reported: with a beat playing, pressing Rec to record a NEW clip
+        // started capturing mid-bar, so the take's tick 0 landed wherever in the
+        // bar the press did and the track was off the grid from then on. A new
+        // clip must launch like any other clip launch — at the next bar.
+        let mut e = engine();
+        e.tracks[1].active_mut().toggle_step(0, &[(48, 100)]); // a beat is playing
+        e.play();
+        run_ticks(&mut e, TICKS_PER_STEP as u64 * 3); // press somewhere mid-bar
+        assert_ne!(e.master_tick % crate::TICKS_PER_BAR as u64, 0);
+
+        e.launch_clip(0, 2); // select the empty slot
+        e.toggle_record(0);
+        assert!(!e.recording, "capture started mid-bar instead of waiting for the bar");
+        assert!(e.counting_in(), "the armed-and-waiting state must show on the Rec button");
+
+        // The bar arrives: now it launches, in lockstep with the beat that was
+        // already playing — which is the whole point of waiting.
+        run_ticks(&mut e, crate::TICKS_PER_BAR as u64);
+        assert!(e.recording, "recording did not start at the bar boundary");
+        assert_eq!(e.tracks[0].playing_slot, Some(2));
+        assert_eq!(e.tracks[0].pos_tick, e.tracks[1].pos_tick,
+                   "take is out of phase with the clip that was already playing");
+        assert!(!e.counting_in());
+    }
+
+    #[test]
+    fn punch_in_take_is_aligned_with_the_master_bar() {
+        // The alignment the report is really about: a note played on a beat of
+        // the master grid must land on that beat INSIDE the new clip, not offset
+        // by however far into the bar the Rec press happened to be.
+        let mut e = engine();
+        e.tracks[1].active_mut().toggle_step(0, &[(48, 100)]);
+        e.play();
+        run_ticks(&mut e, TICKS_PER_STEP as u64 * 5); // arm 5 steps into the bar
+
+        e.launch_clip(0, 2);
+        e.toggle_record(0);
+        // Wait out the rest of the bar, then two more steps, and play there.
+        let to_bar = crate::TICKS_PER_BAR as u64
+            - (e.master_tick % crate::TICKS_PER_BAR as u64);
+        run_ticks(&mut e, to_bar + 2 * TICKS_PER_STEP as u64);
+        e.live_note_on(0, 60, 110);
+        run_ticks(&mut e, TICKS_PER_STEP as u64);
+        e.live_note_off(0, 60);
+
+        let n = &e.tracks[0].clips[2].notes;
+        assert_eq!(n.len(), 1, "note not recorded");
+        assert_eq!(n[0].step, 2, "note landed off the grid (mid-bar take start)");
+    }
+
+    #[test]
+    fn overdub_punch_in_still_records_immediately() {
+        // A clip that already has notes is already in phase: punching in on it
+        // must stay immediate, or an overdub would lose up to a bar.
+        let mut e = engine();
+        e.tracks[0].active_mut().toggle_step(0, &[(60, 100)]);
+        e.play();
+        run_ticks(&mut e, TICKS_PER_STEP as u64 * 3);
+        e.toggle_record(0);
+        assert!(e.recording, "overdub punch-in must not wait for the bar");
+    }
+
+    #[test]
+    fn second_rec_press_cancels_a_pending_take() {
+        let mut e = engine();
+        e.tracks[1].active_mut().toggle_step(0, &[(48, 100)]);
+        e.play();
+        run_ticks(&mut e, TICKS_PER_STEP as u64 * 3);
+        e.launch_clip(0, 2);
+        e.toggle_record(0);
+        e.toggle_record(0); // changed my mind
+        assert!(!e.counting_in(), "still armed after cancelling");
+        run_ticks(&mut e, crate::TICKS_PER_BAR as u64);
+        assert!(!e.recording, "cancelled take started anyway at the bar");
+    }
+
+    /// Clip-position tick at which pitch 60 fires. Same technique as
+    /// `swing_delays_offbeat_steps_only`: 8-frame blocks so at most one tick
+    /// elapses per block, and status `tick=` is post-increment, so the note
+    /// fired while pos was (tick - 1).
+    fn quant_fire_tick(step: u16, nudge: i32, quant: u8, swing: u32) -> u64 {
+        let mut e = Engine::new(44100, 12000);
+        e.swing_pct = swing;
+        e.tracks[0].active_mut().toggle_step(step, &[(60, 100)]);
+        e.tracks[0].active_mut().nudge(step, step, None, nudge);
+        e.tracks[0].active_mut().quant = quant;
+        e.play();
+        let mut out = Vec::new();
+        for _ in 0..5000 {
+            out.clear();
+            e.advance_block(8, &mut out);
+            if out.iter().any(|ev| matches!(ev, OutEvent::NoteOn { pitch: 60, .. })) {
+                let st = e.status();
+                let tick = st.split_whitespace()
+                    .find_map(|kv| kv.strip_prefix("tick="))
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .expect("status has tick=");
+                return tick - 1;
+            }
+        }
+        panic!("note never fired (quant {quant})");
+    }
+
+    /// Arm recording and run the count-in down to `left` ticks remaining.
+    fn armed_with_count_in_left(left: u32) -> Engine {
+        let mut e = engine();
+        let mut out = Vec::new();
+        e.toggle_record(0);
+        assert!(e.count_in_left > 0, "recording should arm a count-in");
+        while e.count_in_left > left {
+            e.advance_block(8, &mut out);
+        }
+        e
+    }
+
+    #[test]
+    fn preroll_note_is_captured_at_the_clip_start() {
+        let mut e = armed_with_count_in_left(6);
+        let mut out = Vec::new();
+        e.live_note_on(0, 60, 100);
+        while e.count_in_left > 0 {
+            e.advance_block(8, &mut out);
+        }
+        e.live_note_off(0, 60);
+        let n = e.tracks[0].active().notes.iter().find(|n| n.pitch == 60);
+        assert!(n.is_some(), "a note played inside the count-in must be recorded");
+        assert_eq!(n.unwrap().step, 0);
+        assert_eq!(n.unwrap().tick, 0);
+    }
+
+    #[test]
+    fn preroll_gate_spans_the_count_in() {
+        let mut e = armed_with_count_in_left(6);
+        let mut out = Vec::new();
+        e.live_note_on(0, 60, 100);
+        while e.count_in_left > 0 {
+            e.advance_block(8, &mut out);
+        }
+        let target = e.tracks[0].pos_tick + 10;
+        while e.tracks[0].pos_tick < target {
+            e.advance_block(8, &mut out);
+        }
+        e.live_note_off(0, 60);
+        let n = *e.tracks[0].active().notes.iter().find(|n| n.pitch == 60).unwrap();
+        assert!(n.gate >= 16, "gate {} should span the pre-roll too", n.gate);
+    }
+
+    #[test]
+    fn preroll_note_released_before_recording_still_records() {
+        let mut e = armed_with_count_in_left(8);
+        e.live_note_on(0, 62, 100);
+        e.live_note_off(0, 62);
+        assert!(e.tracks[0].active().notes.iter().any(|n| n.pitch == 62));
+    }
+
+    #[test]
+    fn note_earlier_than_half_a_step_is_ignored() {
+        // Beyond half a step it belongs to a different grid position, which is
+        // exactly where record_note's own rounding boundary sits.
+        let mut e = armed_with_count_in_left(TICKS_PER_STEP);
+        e.live_note_on(0, 64, 100);
+        e.live_note_off(0, 64);
+        assert!(!e.tracks[0].active().notes.iter().any(|n| n.pitch == 64));
+    }
+
+    #[test]
+    fn swung_upbeat_recorded_late_keeps_its_own_step() {
+        // Swing 70 puts the off-beat 16th 8 ticks late, so that is where the
+        // player hears it and plays it. Rounding against the straight grid left
+        // only 4 ticks of late tolerance (~21 ms at 120 BPM) before the note
+        // anchored to the next ON-beat step — and at 100 % quantization it then
+        // landed on top of the downbeat, losing the upbeat.
+        let mut e = engine();
+        e.swing_pct = 70;
+        for late in [0u32, 4, 8, 12, 15] {
+            assert_eq!(e.anchor_step(TICKS_PER_STEP + late, 1, 1), 1,
+                "played {late} ticks after the beat");
+        }
+        // Past the midpoint between the two swung positions it does belong to
+        // the next step.
+        assert_eq!(e.anchor_step(TICKS_PER_STEP + 17, 1, 1), 2);
+    }
+
+    #[test]
+    fn straight_grid_anchoring_is_unchanged_without_swing() {
+        let e = engine();
+        assert_eq!(e.anchor_step(0, 1, 1), 0);
+        assert_eq!(e.anchor_step(11, 1, 1), 0);
+        assert_eq!(e.anchor_step(12, 1, 1), 1);   // ties round up, as before
+        assert_eq!(e.anchor_step(TICKS_PER_STEP, 1, 1), 1);
+    }
+
+    #[test]
+    fn swung_hihat_take_keeps_every_upbeat() {
+        // The reported failure end to end: a 16th hihat pattern played against
+        // swing 70 and quantized to 100 % must fire on the swung grid. Counting
+        // hits is not enough — a collapsed upbeat still emits a NoteOn, just
+        // doubled on the downbeat — so this asserts WHERE each hit lands.
+        let mut e = engine();
+        e.swing_pct = 70;
+        let swing = (70 - 50) * TICKS_PER_STEP / 60;      // 8 ticks
+        for step in 0..16u16 {
+            // Off-beats played where they are heard, plus 5 ticks of human lag:
+            // inside the swung cell, but past the old straight-grid boundary.
+            let tick = step as u32 * TICKS_PER_STEP
+                + if step % 2 == 1 { swing + 5 } else { 0 };
+            let anchor = e.anchor_step(tick, 1, 1);
+            e.tracks[0].active_mut().record_note(anchor, tick, 6, 42, 100, true);
+        }
+        e.tracks[0].active_mut().quant = 100;
+        e.tracks[0].active_mut().release_pass_flags();   // undo record suppression
+        e.play();
+
+        let mut fired: Vec<u64> = Vec::new();
+        let mut out = Vec::new();
+        while e.clock.tick < crate::TICKS_PER_BAR as u64 {
+            out.clear();
+            e.advance_block(8, &mut out);
+            if out.iter().any(|ev| matches!(ev, OutEvent::NoteOn { pitch: 42, .. })) {
+                fired.push(e.clock.tick - 1);   // status tick is post-increment
+            }
+        }
+        let expected: Vec<u64> = (0..16u64)
+            .map(|s| s * TICKS_PER_STEP as u64
+                + if s % 2 == 1 { swing as u64 } else { 0 })
+            .collect();
+        assert_eq!(fired, expected, "hits should land on the swung grid");
+    }
+
+    #[test]
+    fn quant_100_snaps_to_grid() {
+        assert_eq!(quant_fire_tick(2, 7, 100, 50), (2 * TICKS_PER_STEP) as u64);
+    }
+
+    #[test]
+    fn quant_0_plays_raw_timing() {
+        assert_eq!(quant_fire_tick(2, 7, 0, 50), (2 * TICKS_PER_STEP + 7) as u64);
+    }
+
+    #[test]
+    fn quant_scales_deviation_and_leaves_swing_alone() {
+        // Swing is a groove control, not a quantization one. Scaling it with
+        // strength would make the SWING knob inert for programmed patterns,
+        // which sit exactly on the anchor and so have no deviation to scale.
+        let swing = (66 - 50) * TICKS_PER_STEP / 60;   // 6 ticks on an off-beat 16th
+        assert_eq!(quant_fire_tick(1, 5, 0, 66), (TICKS_PER_STEP + 5 + swing) as u64);
+        assert_eq!(quant_fire_tick(1, 5, 100, 66), (TICKS_PER_STEP + swing) as u64);
+        assert_eq!(quant_fire_tick(1, 5, 60, 66), (TICKS_PER_STEP + 2 + swing) as u64);
+    }
+
+    #[test]
+    fn quant_50_lands_midway_toward_grid() {
+        assert_eq!(quant_fire_tick(2, 8, 50, 50), (2 * TICKS_PER_STEP + 4) as u64);
+    }
+
+    #[test]
+    fn quant_pulls_early_note_forward() {
+        // Rounding has to work in both directions: a note before its anchor
+        // moves later as strength rises.
+        assert_eq!(quant_fire_tick(2, -8, 50, 50), (2 * TICKS_PER_STEP - 4) as u64);
+    }
+
+    #[test]
+    fn quant_change_mid_pass_does_not_double_trigger() {
+        // The note sounds quantized at step 2; dropping strength moves its
+        // target later within the same pass. Without `fired` it sounds twice.
+        let mut e = engine();
+        e.tracks[0].active_mut().toggle_step(2, &[(60, 100)]);
+        e.tracks[0].active_mut().nudge(2, 2, None, 9);
+        e.tracks[0].active_mut().quant = 100;
+        e.play();
+        let mut out = Vec::new();
+        while e.clock.tick <= (2 * TICKS_PER_STEP + 3) as u64 {
+            e.advance_block(8, &mut out);
+        }
+        e.tracks[0].active_mut().quant = 0;
+        while e.clock.tick <= (3 * TICKS_PER_STEP) as u64 {
+            e.advance_block(8, &mut out);
+        }
+        let ons = out.iter()
+            .filter(|ev| matches!(ev, OutEvent::NoteOn { pitch: 60, .. }))
+            .count();
+        assert_eq!(ons, 1, "the note had already sounded this pass");
+    }
+
+    #[test]
+    fn swing_delays_offbeat_steps_only() {
+        // Returns the clip-position tick at which the note on `step` fires.
+        // Advances in 8-frame chunks (≈0.03 ticks each, so ≤1 tick fires per
+        // chunk) and reads the master tick from status. status `tick=` is
+        // post-increment, and the note fires while pos == master_tick - 1, so
+        // the firing position is (status tick − 1).
+        fn fire_tick(swing: u32, step: u16) -> u64 {
+            let mut e = Engine::new(44100, 12000);
+            e.swing_pct = swing;
+            let mut out = Vec::new();
+            apply_batch(&mut e, &format!("tog 0 {step} 60 100"), &mut out);
+            e.play();
+            for _ in 0..5000 {
+                out.clear();
+                e.advance_block(8, &mut out);
+                if out.iter().any(|ev| matches!(ev, OutEvent::NoteOn { pitch: 60, .. })) {
+                    let st = e.status();
+                    let tick = st.split_whitespace()
+                        .find_map(|kv| kv.strip_prefix("tick="))
+                        .and_then(|v| v.parse::<u64>().ok())
+                        .expect("status has tick=");
+                    return tick - 1;
+                }
+            }
+            panic!("note on step {step} never fired (swing {swing})");
+        }
+        // Straight: step 0 at tick 0, step 1 at tick 24.
+        assert_eq!(fire_tick(50, 0), 0);
+        assert_eq!(fire_tick(50, 1), 24);
+        // Swing 80: even step unchanged, odd step delayed 12 ticks.
+        assert_eq!(fire_tick(80, 0), 0);
+        assert_eq!(fire_tick(80, 1), 24 + 12);
+    }
+
+    #[test]
+    fn status_reports_swing() {
+        let mut e = Engine::new(44100, 12000);
+        e.swing_pct = 66;
+        assert!(e.status().contains("swing=66"));
+    }
+
+    #[test]
+    fn a_scene_launches_every_track_in_its_column() {
+        let mut e = engine();
+        // Clips in column 2 on two tracks, plus one on a third track in a
+        // DIFFERENT column, so we can prove that track gets stopped, not left.
+        e.tracks[0].clips[2].length_steps = 16;
+        e.tracks[5].clips[2].length_steps = 16;
+        e.tracks[9].clips[0].length_steps = 16;
+        e.tracks[9].playing_slot = Some(0);
+
+        e.launch_scene(2);
+
+        assert!(e.playing, "a scene launched from stopped starts the transport");
+        assert_eq!(e.tracks[0].playing_slot, Some(2));
+        assert_eq!(e.tracks[5].playing_slot, Some(2));
+        // Track 9 has nothing in column 2: a scene is a snapshot, so it stops.
+        assert_eq!(
+            e.tracks[9].playing_slot, None,
+            "an empty slot in the column stops that track"
+        );
+        assert_eq!(e.tracks[9].active_clip, 2, "every track's edit target follows the scene");
+    }
+
+    #[test]
+    fn a_scene_launched_while_running_is_bar_quantized() {
+        let mut e = engine();
+        e.tracks[0].clips[0].length_steps = 16;
+        e.tracks[0].clips[3].length_steps = 16;
+        e.tracks[4].clips[0].length_steps = 16; // nothing in column 3 -> stops
+        e.play();
+        assert!(e.playing);
+
+        e.launch_scene(3);
+
+        assert_eq!(e.tracks[0].queued_slot, Some(3), "queued, not switched mid-bar");
+        assert_eq!(e.tracks[0].playing_slot, Some(0), "still on the old clip until the bar");
+        assert!(e.tracks[4].pending_stop, "an empty slot queues a stop, not an instant cut");
+    }
+
+    #[test]
+    fn a_scene_lasts_as_long_as_its_longest_clip_rounded_up_to_bars() {
+        let mut e = engine();
+        assert_eq!(e.scene_bars(0), 1, "an empty scene is one bar");
+
+        e.tracks[0].clips[0].length_steps = 16; // 1 bar
+        e.tracks[1].clips[0].length_steps = 48; // 3 bars
+        e.tracks[2].clips[0].length_steps = 20; // 1.25 bars -> 2
+        assert_eq!(e.scene_bars(0), 3, "the longest clip sets the length");
+
+        e.tracks[1].clips[0].length_steps = 0; // no longer exists
+        assert_eq!(e.scene_bars(0), 2, "20 steps rounds up to 2 bars");
+
+        assert_eq!(e.scene_bars(99), 1, "an out-of-range slot is one bar, not a panic");
+    }
+
+    /// Advance by whole bars through the real audio-block path, so the song's
+    /// bar-boundary scheduler runs exactly as it does on device.
+    fn run_bars(e: &mut Engine, bars: u32) {
+        run_ticks(e, bars as u64 * crate::TICKS_PER_BAR as u64);
+    }
+
+    #[test]
+    fn a_song_folds_repeated_presses_into_one_longer_entry() {
+        let mut e = engine();
+        e.song_start(1);
+        e.song_add(2);
+        e.song_add(2);
+        e.song_add(3);
+        assert_eq!(e.song, vec![1, 2, 2, 3]);
+        assert_eq!(e.song_entry_at(0), Some((1, 1)));
+        assert_eq!(
+            e.song_entry_at(1),
+            Some((2, 2)),
+            "two presses of 2 are one entry, twice as long"
+        );
+        assert_eq!(e.song_entry_at(3), Some((3, 1)));
+        assert_eq!(e.song_next_pos(1), 3, "the entry after the doubled 2 starts at press 3");
+        assert_eq!(e.song_next_pos(3), 0, "the last entry wraps to the first");
+    }
+
+    #[test]
+    fn a_song_arms_the_next_scene_exactly_one_bar_early_and_loops() {
+        let mut e = engine();
+        // Two 1-bar scenes on track 0.
+        e.tracks[0].clips[0].length_steps = 16;
+        e.tracks[0].clips[1].length_steps = 16;
+
+        e.song_start(0); // from stopped: starts the transport immediately
+        e.song_add(1);
+        assert!(e.playing);
+        assert_eq!(e.tracks[0].playing_slot, Some(0));
+
+        // With a one-bar entry the scheduler arms on the same boundary the
+        // entry starts — which is exactly one bar of warning.
+        run_ticks(&mut e, 1);
+        assert_eq!(
+            e.tracks[0].queued_slot,
+            Some(1),
+            "the next scene is queued a full bar before it plays"
+        );
+
+        run_bars(&mut e, 1);
+        assert_eq!(e.tracks[0].playing_slot, Some(1), "scene 2 fell in on the bar");
+        assert_eq!(e.song_pos(), 1);
+        assert_eq!(
+            e.tracks[0].queued_slot,
+            Some(0),
+            "and scene 1 is queued again — the song loops"
+        );
+
+        run_bars(&mut e, 1);
+        assert_eq!(e.tracks[0].playing_slot, Some(0));
+        assert_eq!(e.song_pos(), 0);
+    }
+
+    #[test]
+    fn a_two_bar_scene_holds_for_two_bars() {
+        let mut e = engine();
+        e.tracks[0].clips[0].length_steps = 32; // 2 bars
+        e.tracks[0].clips[1].length_steps = 16;
+        e.song_start(0);
+        e.song_add(1);
+
+        run_ticks(&mut e, 1); // bar 0: entry starts, two bars to go
+        assert_eq!(e.tracks[0].queued_slot, None, "nothing queued yet — two bars left");
+        run_bars(&mut e, 1); // bar 1: one to go
+        assert_eq!(e.tracks[0].queued_slot, Some(1), "one bar to go -> armed");
+        run_bars(&mut e, 1); // bar 2
+        assert_eq!(e.tracks[0].playing_slot, Some(1));
+    }
+
+    #[test]
+    fn a_repeated_scene_plays_twice_as_long_without_retriggering() {
+        let mut e = engine();
+        e.tracks[0].clips[0].length_steps = 16;
+        e.tracks[0].clips[1].length_steps = 16;
+        e.song_start(0);
+        e.song_add(0); // scene 1 twice -> two bars
+        e.song_add(1);
+
+        run_ticks(&mut e, 1); // bar 0 of the doubled entry
+        assert_eq!(
+            e.tracks[0].queued_slot, None,
+            "a doubled scene does not re-queue itself between reps"
+        );
+        run_bars(&mut e, 1); // bar 1 — one to go
+        assert_eq!(e.tracks[0].queued_slot, Some(1));
+        run_bars(&mut e, 1);
+        assert_eq!(
+            e.tracks[0].playing_slot,
+            Some(1),
+            "the doubled scene held for two bars"
+        );
+    }
+
+    #[test]
+    fn a_one_entry_song_never_relaunches_itself() {
+        let mut e = engine();
+        e.tracks[0].clips[0].length_steps = 16;
+        e.song_start(0);
+
+        run_bars(&mut e, 3);
+        // Re-launching would reset the track's `cycle` every bar, so an A:B
+        // trig condition could never reach B.
+        assert_eq!(
+            e.tracks[0].queued_slot, None,
+            "a song of one scene just keeps looping"
+        );
+        assert!(e.tracks[0].cycle > 1, "the play count keeps counting across the wrap");
+    }
+
+    #[test]
+    fn play_restarts_the_song_from_the_top() {
+        let mut e = engine();
+        e.tracks[0].clips[0].length_steps = 16;
+        e.tracks[0].clips[1].length_steps = 16;
+        e.song_start(0);
+        e.song_add(1);
+        run_ticks(&mut e, 1);
+        run_bars(&mut e, 1);
+        assert_eq!(e.song_pos(), 1, "moved on to the second scene");
+
+        let mut out = Vec::new();
+        e.stop(&mut out);
+        assert_eq!(e.song, vec![0, 1], "stopping keeps the song");
+        e.play();
+        assert_eq!(e.song_pos(), 0, "play restarts the arrangement from the beginning");
+        assert_eq!(e.tracks[0].playing_slot, Some(0));
+    }
+
+    #[test]
+    fn launching_a_clip_by_hand_deletes_the_song() {
+        let mut e = engine();
+        e.tracks[0].clips[0].length_steps = 16;
+        e.tracks[0].clips[1].length_steps = 16;
+        e.song_start(0);
+        e.song_add(1);
+        assert!(!e.song.is_empty());
+
+        e.launch_clip(0, 1);
+
+        assert!(e.song.is_empty(), "taking the wheel ends the arrangement");
+        assert_eq!(e.tracks[0].playing_slot, Some(0), "what was playing keeps playing");
+    }
+
+    #[test]
+    fn song_add_before_any_song_does_nothing() {
+        let mut e = engine();
+        e.song_add(3);
+        assert!(e.song.is_empty(), "an append with no song to append to is inert");
+    }
+
+
+    #[test]
+    fn status_reports_the_song_and_where_we_are_in_it() {
+        let mut e = engine();
+        let s = e.status();
+        let song = s.split("song=").nth(1).unwrap().split(' ').next().unwrap();
+        assert_eq!(song, "-", "no song reads as a dash, never as an empty value");
+
+        e.tracks[0].clips[1].length_steps = 16;
+        e.tracks[0].clips[2].length_steps = 16;
+        e.song_start(1);
+        e.song_add(2);
+        e.song_add(2);
+        let s = e.status();
+        let song = s.split("song=").nth(1).unwrap().split(' ').next().unwrap();
+        assert_eq!(song, "0:1,2,2");
+        assert!(!song.contains(' '), "a status value may never contain a space");
+    }
+
+
+    #[test]
+    fn a_take_follows_the_song_into_the_next_scene() {
+        // Overdub punch-in — what "record during a song" normally means: the
+        // clip is already running, so Rec captures from the playhead and does
+        // not queue a launch of its own.
+        let mut e = engine();
+        e.tracks[0].clips[0].length_steps = 16;
+        e.tracks[0].clips[0].toggle_step(0, &[(60, 100)]);
+        e.tracks[0].clips[1].length_steps = 16;
+        e.tracks[0].clips[1].toggle_step(0, &[(62, 100)]);
+        e.song_start(0);
+        e.song_add(1);
+
+        run_ticks(&mut e, 1);
+        e.toggle_record(0);
+        assert!(e.recording, "an overdub punches in immediately");
+        run_bars(&mut e, 1);
+
+        assert_eq!(e.tracks[0].playing_slot, Some(1), "the song moved on");
+        assert_eq!(
+            e.tracks[0].active_clip, 1,
+            "and the take follows into the clip that is now playing"
+        );
+        assert!(e.recording, "the take is still running after the scene change");
+    }
+
+    #[test]
+    fn arming_the_next_scene_does_not_move_the_edit_target_early() {
+        // The song arms a scene a full bar ahead to light the queued pulse.
+        // Retargeting then would move a running take into the next scene's clip
+        // a whole bar before that clip plays.
+        let mut e = engine();
+        e.tracks[0].clips[0].length_steps = 16;
+        e.tracks[0].clips[1].length_steps = 16;
+        e.song_start(0);
+        e.song_add(1);
+
+        run_ticks(&mut e, 1);
+        assert_eq!(e.tracks[0].queued_slot, Some(1), "armed a bar early");
+        assert_eq!(
+            e.tracks[0].active_clip, 0,
+            "but the edit target is still the clip that is actually playing"
+        );
+    }
+
+    #[test]
+    fn a_first_take_holds_its_track_against_the_song_for_that_scene() {
+        // Rec on a note-empty clip is itself a bar-quantized clip launch, and
+        // it overwrites the scene the song had armed for that track. The
+        // explicit gesture wins: the take lands in the clip the user asked for
+        // rather than being moved out from under them. Only that track is held
+        // — the song keeps running and takes it back at the next scene.
+        let mut e = engine();
+        e.tracks[0].clips[0].length_steps = 16; // exists, but no notes
+        e.tracks[0].clips[1].length_steps = 16;
+        e.tracks[1].clips[0].length_steps = 16;
+        e.tracks[1].clips[1].length_steps = 16;
+        e.song_start(0);
+        e.song_add(1);
+
+        run_ticks(&mut e, 1);
+        e.toggle_record(0);
+        run_bars(&mut e, 1);
+
+        assert_eq!(e.tracks[0].playing_slot, Some(0), "the take kept its track");
+        assert!(e.recording, "and it is running");
+        assert_eq!(
+            e.tracks[1].playing_slot,
+            Some(1),
+            "every other track still followed the song"
+        );
+    }
+
+
+    #[test]
+    fn a_scene_moves_the_selection_even_on_the_tracks_it_stops() {
+        // The Session grid's selected cell is `active_clip`. A track the scene
+        // silences has no queued launch to carry its selection across, so
+        // without help its selected pad stays in the old column while every
+        // other track moves — the grid then shows two different scenes at once.
+        let mut e = engine();
+        e.tracks[0].clips[0].length_steps = 16;
+        e.tracks[1].clips[0].length_steps = 16;
+        e.tracks[0].clips[2].length_steps = 16; // scene 2 plays on track 0 only
+        e.play();
+
+        e.launch_scene(2);
+        assert_eq!(
+            e.tracks[1].active_clip, 0,
+            "the selection does not move a bar early, any more than a take does"
+        );
+
+        run_bars(&mut e, 1);
+        assert_eq!(e.tracks[0].active_clip, 2, "the playing track followed the scene");
+        assert_eq!(
+            e.tracks[1].active_clip, 2,
+            "and so did the one the scene stopped"
+        );
+        assert_eq!(e.tracks[1].playing_slot, None, "stopped, but selected there");
+    }
+
+    #[test]
+    fn launching_a_clip_by_hand_outranks_a_scene_the_bar_has_not_reached() {
+        // A pending selection from a scene must not overwrite a slot the user
+        // picked by hand in the meantime.
+        let mut e = engine();
+        e.tracks[0].clips[0].length_steps = 16;
+        e.tracks[1].clips[0].length_steps = 16;
+        e.tracks[1].clips[5].length_steps = 16;
+        e.play();
+
+        e.launch_scene(2);              // nothing in column 2 on track 1 -> stops it
+        e.launch_clip(1, 5);            // ...but the user picks slot 5 before the bar
+        run_bars(&mut e, 1);
+
+        assert_eq!(e.tracks[1].active_clip, 5, "the hand-picked slot won");
+        assert_eq!(e.tracks[1].playing_slot, Some(5));
+    }
+
+
+    #[test]
+    fn a_song_parks_on_an_empty_scene_without_stopping_the_transport() {
+        // An empty scene has no clip to take a length from, so it is TERMINAL:
+        // the arrangement ends there. The transport keeps running — this is a
+        // stop in the song, not a stop of the machine.
+        let mut e = engine();
+        e.tracks[0].clips[0].length_steps = 16; // scene 1 plays
+        // scene 2 (slot 1) has no clip on ANY track.
+        e.song_start(0);
+        e.song_add(1);
+
+        run_ticks(&mut e, 1);
+        run_bars(&mut e, 1);
+        assert_eq!(e.song_pos(), 1, "we reached the empty scene");
+        assert_eq!(e.tracks[0].playing_slot, None, "everything is silent");
+
+        run_bars(&mut e, 4);
+        assert_eq!(e.song_pos(), 1, "and the song stays there — it is the end");
+        assert_eq!(e.tracks[0].playing_slot, None, "nothing came back");
+        assert_eq!(e.tracks[0].queued_slot, None, "nothing is even queued");
+        assert!(e.playing, "but the transport is still running");
+    }
+
+    #[test]
+    fn a_song_that_ends_can_be_left_by_launching_a_clip() {
+        let mut e = engine();
+        e.tracks[0].clips[0].length_steps = 16;
+        e.tracks[0].clips[4].length_steps = 16;
+        e.song_start(0);
+        e.song_add(1); // empty -> terminal
+        run_ticks(&mut e, 1);
+        run_bars(&mut e, 2);
+        assert_eq!(e.song_pos(), 1, "parked on the end");
+
+        e.launch_clip(0, 4);
+        assert!(e.song.is_empty(), "the song is gone");
+        run_bars(&mut e, 1);
+        assert_eq!(e.tracks[0].playing_slot, Some(4), "and playing again");
+    }
+
+
+    #[test]
+    fn a_scene_added_after_a_bar_has_passed_is_not_skipped() {
+        // Building a song is a LIVE gesture: bars go by between the presses.
+        // While the song was still a single entry the scheduler correctly armed
+        // nothing — it wraps onto itself — and appending a second scene after
+        // that must not let the next boundary step past it.
+        let mut e = engine();
+        e.tracks[0].clips[0].length_steps = 16;
+        e.tracks[0].clips[1].length_steps = 16;
+        e.tracks[0].clips[2].length_steps = 16;
+
+        e.song_start(0);
+        run_ticks(&mut e, 1); // bar 0: scene 1 starts; a song of one arms nothing
+        run_bars(&mut e, 1);  // ...and a whole bar passes before the next press
+
+        e.song_add(1);
+        e.song_add(2);
+
+        // Appending arms immediately, so the new scene lands on the NEXT
+        // boundary rather than a bar after it.
+        run_bars(&mut e, 1);
+        assert_eq!(
+            e.tracks[0].playing_slot,
+            Some(1),
+            "scene 2 played — it was not skipped over"
+        );
+        assert_eq!(e.song_pos(), 1, "and the song knows it is on scene 2");
+
+        run_bars(&mut e, 1);
+        assert_eq!(e.tracks[0].playing_slot, Some(2), "then scene 3 followed it");
+    }
+
+
+    #[test]
+    fn a_scene_added_during_the_current_bar_falls_in_on_the_very_next_one() {
+        // Two one-bar scenes. Adding the second WHILE the first is playing its
+        // only bar must queue it at once: the boundary that would have armed it
+        // (a one-bar entry arms on the bar it starts) has already gone by, so
+        // leaving it to the next boundary repeats the first scene for a bar
+        // nobody asked for.
+        let mut e = engine();
+        e.tracks[0].clips[0].length_steps = 16;
+        e.tracks[0].clips[1].length_steps = 16;
+
+        e.song_start(0);
+        run_ticks(&mut e, 1); // bar 0: scene 1 is playing its only bar
+        assert_eq!(e.tracks[0].playing_slot, Some(0));
+
+        e.song_add(1); // ...appended mid-bar, before the boundary
+
+        assert_eq!(
+            e.tracks[0].queued_slot,
+            Some(1),
+            "the appended scene is queued at once, not a bar later"
+        );
+        run_bars(&mut e, 1);
+        assert_eq!(
+            e.tracks[0].playing_slot,
+            Some(1),
+            "so scene 2 fell in on the very next bar"
+        );
+    }
+}

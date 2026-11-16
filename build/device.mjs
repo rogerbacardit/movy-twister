@@ -1,0 +1,41 @@
+// Bundles src/app/globals.ts -> ui.js (single ESM file for QuickJS device).
+import * as esbuild from 'esbuild';
+import { resolve, dirname } from 'path';
+import { fileURLToPath } from 'url';
+
+const __dir = dirname(fileURLToPath(import.meta.url));
+const root  = resolve(__dir, '..');
+
+// Schwung shared imports are injected at the top via banner so QuickJS sees
+// them before any bundled code. They must not appear in the bundle body.
+const SCHWUNG_BANNER = [
+    'import * as os from "os";',
+    'import * as std from "std";',
+    'import { Black, DarkGrey, White, BrightRed, NeonGreen,',
+    '         MovePads, MoveKnob1, MidiNoteOn, MidiNoteOff,',
+    '         MoveKnob1Touch, MoveKnob8Touch,',
+    '         MoveShift, MoveBack, MoveMainButton, MoveMainKnob,',
+    '         MoveLeft, MoveRight, MoveUp, MoveDown',
+    '} from "/data/UserData/schwung/shared/constants.mjs";',
+    'import { setLED, setButtonLED, decodeDelta }',
+    '    from "/data/UserData/schwung/shared/input_filter.mjs";',
+].join('\n');
+
+await esbuild.build({
+    entryPoints: [resolve(root, 'src/app/globals.ts')],
+    bundle:      true,
+    outfile:     resolve(root, 'ui.js'),
+    format:      'esm',
+    target:      ['es2020'],
+    banner:      { js: SCHWUNG_BANNER },
+    external:    ['/data/UserData/schwung/*'],
+    /* schwung-lib.ts awaits its imports at module top level, which is the one
+     * place movy can await at all: `eval_buf` runs `js_std_await` on the
+     * module's result, so the host load blocks until they settle and every
+     * global assigned afterwards is in place before the load reports success.
+     * es2020 has no top-level await, and without this esbuild rewrites the
+     * module into a form that defers evaluation. */
+    supported:   { 'top-level-await': true },
+    logLevel:    'info',
+});
+console.log("Device bundle written: ui.js");

@@ -1,0 +1,391 @@
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+import { join } from 'node:path';
+import { Bus } from './bus.js';
+import { grepDebugLog } from './device-log.js';
+import { repoRoot, type EngineDeploy } from './engine.js';
+import type { Packet } from './midi.js';
+import { SSH_OPTS } from './ssh.js';
+import type { HostBus, Need, Transport } from './transport.js';
+
+const run = promisify(execFile);
+
+/* movy itself is the standalone module since WP8; movy-sa is retired. */
+const MOVY_DIR = '/data/UserData/schwung/modules/tools/movy';
+/* Harness mode (standalone/launch.sh): in /dev/shm, so a reboot ends it. */
+const TESTBUS_FLAG = '/dev/shm/.movy-testbus';
+const LAUNCH = '/data/UserData/schwung/launch-standalone.sh';
+/* standalone/launch.sh's harness-mode hold (WP7 T1): after a clean close it
+ * keeps Move down and waits for a command, so a close/open pair costs a
+ * process start instead of a Move restart. */
+/* schwung's boot watchdog (host/boot_target_lib.sh): the stamp is
+ * "<target id> <strikes>", and <id>/healthy clears it at the next start. */
+const BOOT_TARGETS = '/data/UserData/boot-targets';
+/* Seconds since `pid` started; 0 when it is gone. */
+const ageOf = (pid: string) =>
+    `awk -v u=$(cut -d' ' -f1 /proc/uptime) '{print int(u - $22/100)}' /proc/${pid}/stat 2>/dev/null || echo 0`;
+const moveAge = `P=$(pidof MoveOriginal | cut -d' ' -f1); [ -n "$P" ] && ${ageOf('$P')} || echo 0`;
+const markHealthy = `read -r id _ < ${BOOT_TARGETS}/.boot-attempt 2>/dev/null `
+    + `&& [ -d "${BOOT_TARGETS}/$id" ] && touch "${BOOT_TARGETS}/$id/healthy"; true`;
+/* The movy-host PROCESS, never a module's child: osirus forks its DSP from
+ * the audio thread, and the fork runs the same executable, so `pidof
+ * movy-host` lists it too (and as the FIRST pid). The harness then TERMed the
+ * child and waited 12 s for a host that was never asked to stop (WP11). A
+ * fork keeps the executable but not the main thread's name. */
+const HOST_PIDS = `for p in $(pidof movy-host); do [ "$(cat /proc/$p/comm 2>/dev/null)" = movy-host ] && echo $p; done; true`;
+const HOLD_PIDF = '/dev/shm/.movy-launcher';
+const HOLD = '/dev/shm/.movy-hold';
+const HOLD_CMD = '/dev/shm/.movy-cmd';
+/* One ssh round trip: `up` (movy-host runs), `sent` (the launcher was holding
+ * and has the command), `wait` (the launcher lives but has not reached its
+ * hold yet) or `none` (no launcher: Move's side). Written as ableton, so a
+ * later launcher of either uid can remove it from the sticky /dev/shm. */
+const holdSend = (cmd: 'go' | 'quit') =>
+    `if [ -n "$(${HOST_PIDS})" ]; then echo up; `
+    + `elif [ -e ${HOLD} ]; then echo ${cmd} > ${HOLD_CMD}; echo sent; `
+    + `else P=$(cat ${HOLD_PIDF} 2>/dev/null); `
+    + `if [ -n "$P" ] && grep -q tools/movy/standalone /proc/$P/cmdline 2>/dev/null; then echo wait; else echo none; fi; fi`;
+/* A refused connect: the bus is not listening YET (a host still starting).
+ * Never a dropped link — by the time running() is asked the bus may be up, and
+ * rethrowing the refusal as a lost link failed seq's boot-gate pump on all
+ * three attempts (2026-10-13). */
+const notListening = (e: unknown): boolean =>
+    (e as { code?: string } | null)?.code === 'ECONNREFUSED';
+
+/* Set by scripts/vdev.sh tier, which builds once and then runs one shard per
+ * virtual device at the same time: shards that each built would write
+ * dist/ and ui.js under each other's scp (deploy_host honours it too). */
+const PREBUILT = process.env.MOVY_PREBUILT === '1';
+
+/* A device frame. Used ONLY while movy-host is down, when there is no frame
+ * clock on the box to wait on (the shim's went with Move). */
+const FRAME_MS = 128 / 44.1;
+
+/* The standalone flavour: movy-host, reached through its own test bus
+ * (docs/standalone/testbus.md). It replaces testd + ui-agent + scp with one
+ * socket — but that socket lives only while movy-host does, so the Bus is
+ * (re)connected on demand and a down host reads as "not running", never as an
+ * infra error.
+ *
+ * WP6 minimal: launch/restart go through schwung's launch-standalone.sh (open_tool_cmd
+ * cannot open a standalone tool until upstream U6), as the uid that owns the
+ * stack (WP0 findings §3.2: a lower uid cannot kill it and fails safe). */
+export class StandaloneTransport implements Transport {
+    readonly flavour = 'standalone' as const;
+    private bus: Bus | null = null;
+
+    constructor(readonly host: string) {}
+
+    has(_need: Need): boolean { return true; }
+
+    readonly hostBus: HostBus = {
+        logSeq: () => this.call((bus) => bus.logSeq()),
+        logTail: (from, pattern) => this.call((bus) => bus.logTail(from, pattern)),
+        subscribeMidiOut: () => this.call((bus) => bus.subscribe('midi_out')),
+        dumpMidiOut: () => this.call((bus) => bus.dump('midi_out')),
+        uiEval: (js) => this.call((bus) => bus.uiEval(js)),
+        state: () => this.call((bus) => bus.state()),
+        /* No reply comes: the link closing IS the answer. */
+        crash: () => this.call((bus) => bus.send('CRASH')).then(() => {}, () => {}),
+    };
+
+    private async ssh(user: 'ableton' | 'root', cmd: string): Promise<string> {
+        const { stdout } = await run('ssh', [...SSH_OPTS, `${user}@${this.host}`, cmd],
+                                     { maxBuffer: 8 * 1024 * 1024 });
+        return stdout;
+    }
+
+    /* schwung-testd binds the same port; the bus file tells movy-host to
+     * listen on every interface (launch-standalone.sh drops the env form).
+     * The old module-dir flag is removed too: it outlived the run, and a
+     * user's next launch then held on close and dry-ran the power button. */
+    async connect(): Promise<void> {
+        await this.ssh('root', `kill $(pidof schwung-testd) 2>/dev/null; rm -f ${MOVY_DIR}/testbus; `
+                             + `touch ${TESTBUS_FLAG}; chown ableton:users ${TESTBUS_FLAG}; true`);
+    }
+
+    /* Leave the device as the run found it — Move up, movy-host gone. A
+     * movy-host left running holds SPI and port 47777: the device would not be
+     * the user's Move again (in WP6 an overtake run then talked to ITS bus as
+     * though it were testd, and the tier hung 20 min). */
+    async close(): Promise<void> {
+        if (await this.running()) {
+            await this.call((bus) => bus.send('EXIT')).catch(() => {});
+            await this.waitFor('movy-host to exit',
+                async () => (await this.ssh('ableton', HOST_PIDS)).trim() === '', 5000)
+                .catch(() => {});
+        }
+        this.bus?.close();
+        this.bus = null;
+        /* A holding launcher would keep Move down for its whole timeout. */
+        await this.holdCommand('quit').catch(() => 'none');
+        /* Harness mode ends with the run: the device goes back to a user. */
+        await this.ssh('root', `rm -f ${TESTBUS_FLAG}`).catch(() => {});
+    }
+
+    /* Open from the launcher's hold. `up` is not "running": a movy-host whose
+     * UI has stopped is still tearing down for ~150 ms, and taking that for
+     * the new one left the launcher holding until the run gave up (seq's
+     * close-then-open, 2026-10-10). So keep offering `go` until a movy-host
+     * that RUNS answers. false = no launcher: open the Move way. */
+    private async fromHold(): Promise<boolean> {
+        const end = Date.now() + 15000;
+        let sent = false;
+        while (Date.now() < end) {
+            const st = await this.state();
+            if (st.running === 1 && st.engine_ready === 1) return true;
+            if (!sent) {
+                const r = (await this.ssh('ableton', holdSend('go'))).trim();
+                if (r === 'none') return false;
+                sent = r === 'sent';
+            }
+            await new Promise((res) => setTimeout(res, 150));
+        }
+        throw new Error('standalone: timed out waiting for movy-host to run with its engine (from the hold) (15000 ms)');
+    }
+
+    /* A movy-host the harness did not start has no bus: the flag is read at
+     * startup only, and the boot door (movy as the device's default target)
+     * starts one before connect() writes it. fromHold read its pid as "up,
+     * not ready yet" and spun out every scenario (2026-10-11). TERM is a stop
+     * that hands over nothing. A boot-door one is not always MoveLauncher's
+     * child (a Move restarted by launch-standalone.sh re-enters the selector,
+     * which boots the default), so `move stop` alone left it running: stop the
+     * launcher AND the pid, then start, and the new one reads the flag. A
+     * Tools-door one's launcher brings Move back: the Move way below.
+     * false = none was running. */
+    private async adoptForeignHost(): Promise<boolean> {
+        const pid = (await this.ssh('ableton', HOST_PIDS)).trim().split(/\s+/)[0];
+        if (!pid || Object.keys(await this.state()).length) return false;
+        /* One of ours between exec and its bus's listen() looks the same. */
+        if (Number((await this.ssh('ableton', ageOf(pid))).trim()) < 3) return false;
+        const boot = (await this.ssh('ableton', `tr '\\0' ' ' < /proc/${pid}/cmdline 2>/dev/null || true`)).includes('--boot');
+        await this.ssh('root', `${boot ? '/etc/init.d/move stop >/dev/null 2>&1; ' : ''}kill -TERM ${pid} 2>/dev/null; true`);
+        await this.waitFor('the busless movy-host to exit',
+            async () => (await this.ssh('ableton', HOST_PIDS)).trim() === '', 12000);
+        if (!boot) return false;
+        await this.ssh('root', `touch ${TESTBUS_FLAG}; chown ableton:users ${TESTBUS_FLAG}; /etc/init.d/move start >/dev/null 2>&1; true`);
+        await this.waitFor('movy-host to run with its engine (boot door, restarted)', async () => {
+            const st = await this.state();
+            return st.running === 1 && st.engine_ready === 1;
+        }, 40000);
+        return true;
+    }
+
+    /* Hand a held launcher its command; see holdSend. `wait` is the gap
+     * between movy-host's exit and the launcher entering its hold. */
+    private async holdCommand(cmd: 'go' | 'quit'): Promise<'up' | 'sent' | 'none'> {
+        const end = Date.now() + 5000;
+        for (;;) {
+            const r = (await this.ssh('ableton', holdSend(cmd))).trim();
+            if (r === 'up' || r === 'sent' || r === 'none') return r;
+            if (Date.now() > end) throw new Error(`standalone: launcher never reached its hold (${r})`);
+            await new Promise((res) => setTimeout(res, 100));
+        }
+    }
+
+    /* Single-flight, like launch(): movy-host's bus serves one client at a
+     * time, so two first calls that each connected leaked the link the server
+     * was serving, and every later command queued behind it forever (the tier
+     * hung after versions threw, 2026-10-11). */
+    private connecting: Promise<Bus> | null = null;
+    private b(): Promise<Bus> {
+        if (this.bus) return Promise.resolve(this.bus);
+        if (!this.connecting) {
+            this.connecting = (async () => {
+                const bus = new Bus(this.host);
+                await bus.connect();
+                this.bus = bus;
+                return bus;
+            })().finally(() => { this.connecting = null; });
+        }
+        return this.connecting;
+    }
+
+    /* A dropped link means movy-host went away; forget it so the next call
+     * reconnects to whichever process is there now. */
+    private async call<T>(f: (bus: Bus) => Promise<T>): Promise<T> {
+        const bus = await this.b();
+        try { return await f(bus); } catch (e) {
+            if (e instanceof Error && /connection closed|not connected/.test(e.message)) { bus.close(); this.bus = null; }
+            throw e;
+        }
+    }
+
+    ping(): Promise<string> { return this.call((bus) => bus.ping()); }
+
+    /* A host that exits DURING the wait (a close, a hard exit) takes its
+     * frame clock with it: that is the down case below, not an infra error
+     * (power's wedged exit threw out of an until() exactly so). */
+    async frames(n: number): Promise<number> {
+        if (await this.running()) {
+            try { return await this.call((bus) => bus.frames(n)); } catch (e) {
+                if (!notListening(e) && await this.running()) throw e;
+            }
+        }
+        await new Promise((r) => setTimeout(r, Math.ceil(n * FRAME_MS)));
+        return 0;
+    }
+
+    /* One input path: INJECT_MIDI reaches the UI and, for notes, the engine. */
+    /* While movy-host is down (starting, or held between a close and an
+     * open) there is no input path at all: Move is down too, so a physical
+     * press would go nowhere, and so does this one. seq's boot gate pumps
+     * presses across exactly that window. A press while it RUNS that fails
+     * is a real link loss and still throws. */
+    async uiMidi(p: Packet): Promise<void> {
+        try { await this.call((bus) => bus.injectShim(p)); } catch (e) {
+            if (!notListening(e) && await this.running()) throw e;
+        }
+    }
+    dspMidi(p: Packet): Promise<void> { return this.uiMidi(p); }
+
+    engineGet(key: string): Promise<string> { return this.call((bus) => bus.getParam(key)); }
+    engineSet(key: string, v: string): Promise<void> { return this.call((bus) => bus.setParam(key, v)); }
+    /* movy-host's SET_PARAM is already queued (no single slot to lose it in). */
+    engineSetQueued(key: string, v: string): Promise<void> { return this.engineSet(key, v); }
+
+    padLeds(): Promise<Uint8Array> { return this.call((bus) => bus.padLeds()); }
+
+    async framebuffer(): Promise<Buffer> {
+        const r = await this.call((bus) => bus.send('FB'));
+        return Buffer.from(r.slice(3).trim(), 'hex');
+    }
+
+    logGrep(pattern: string): Promise<string[]> { return grepDebugLog(this.host, pattern); }
+
+    async running(): Promise<boolean> {
+        try {
+            const st = await this.call((bus) => bus.state());
+            return st.running === 1;
+        } catch { this.bus?.close(); this.bus = null; return false; }
+    }
+
+    private async state(): Promise<Record<string, number>> {
+        try { return await this.call((bus) => bus.state()); } catch { return {}; }
+    }
+
+    private async waitFor(what: string, pred: () => Promise<boolean>, within: number): Promise<void> {
+        const end = Date.now() + within;
+        while (Date.now() < end) {
+            if (await pred()) return;
+            await new Promise((r) => setTimeout(r, 200));
+        }
+        throw new Error(`standalone: timed out waiting for ${what} (${within} ms)`);
+    }
+
+    /* As the stack's uid (WP0 findings §3.2). Without Move (a previous run
+     * left none) root launches, since only root can then free the device. */
+    /* Single-flight: two launches in the same instant (a retry overlapping an
+     * open) both ran launch-standalone.sh. The lock kept the second movy-host
+     * out, but ITS launch-standalone.sh then restarted Move underneath the
+     * first one, and the tier hung for 20 min (2026-10-10). Callers share one
+     * launch instead. */
+    private launching: Promise<void> | null = null;
+    launch(): Promise<void> {
+        if (!this.launching) this.launching = this.launchOnce().finally(() => { this.launching = null; });
+        return this.launching;
+    }
+
+    private async launchOnce(): Promise<void> {
+        if (await this.running()) return;
+        if (await this.adoptForeignHost()) return;
+        if (await this.fromHold()) return;
+        /* From a SETTLED Move only, as a user opens it from Tools: a Move still
+         * booting after the last exit re-grabs SPI behind the kill sweep
+         * (measured: EBUSY 0.5 s after "Killing SPI holders"). Generous: after
+         * an ableton-uid exit, launch-standalone.sh's bare Move restart once
+         * took ~60 s to bring shadow_ui up (2026-10-10; usually ~3-4 s). */
+        /* ...or for movy itself: with movy as the boot default, a Move
+         * restarted after a crash re-enters the selector and boots movy, so
+         * shadow_ui never comes (testbus/power waited out 90 s, 2026-10-11). */
+        await this.waitFor('Move to be back (shadow_ui up) or movy to boot',
+            async () => (await this.ssh('ableton', `pidof shadow_ui; ${HOST_PIDS}`)).trim() !== '', 90000);
+        if ((await this.ssh('ableton', HOST_PIDS)).trim()) {
+            if (await this.adoptForeignHost()) return;
+            await this.waitFor('the booted movy-host to run with its engine', async () => {
+                const st = await this.state();
+                return st.running === 1 && st.engine_ready === 1;
+            }, 15000);
+            return;
+        }
+        /* ...and past its boot watchdog's 15 s liveness window. /opt/move/Move
+         * counts every start as a boot attempt and clears it only once Move
+         * has lived 15 s; launch-standalone.sh killing it sooner leaves the
+         * strike, and the THIRD strike puts boot-select's forced picker on the
+         * screen with a 60 s backstop. That was the "Move took 60 s" case
+         * (reproduced 2026-10-10: runs 1-2 at 3.6 s, run 3 at 61.5 s). A strike
+         * can also outlive a healthy Move (a start that died without its
+         * watcher), so once Move has proved the watcher's own 15 s, mark the
+         * target healthy: the watchdog's documented "boot was good" file,
+         * which clears the count at the next start. */
+        await this.waitFor('Move to outlive its boot watchdog window (15 s)', async () =>
+            Number((await this.ssh('ableton', moveAge)).trim()) >= 16, 30000);
+        await this.ssh('ableton', markHealthy);
+        await this.ssh('root',
+            `P=$(pidof MoveOriginal | cut -d' ' -f1); U=$([ -n "$P" ] && stat -c %u /proc/$P || echo 0); `
+            + `if [ "$U" = 0 ]; then ${LAUNCH} ${MOVY_DIR}/standalone; `
+            + `else su ableton -s /bin/sh -c '${LAUNCH} ${MOVY_DIR}/standalone'; fi`);
+        /* launch-standalone.sh sleeps ~1.8 s before it even kills Move. */
+        await this.waitFor('movy-host to run with its engine', async () => {
+            const st = await this.state();
+            return st.running === 1 && st.engine_ready === 1;
+        }, 15000);
+    }
+
+    /* EXIT, then a fresh process — proved by a CHANGED pid, because a bus that
+     * never went down must not read as one that came back. */
+    async restart(): Promise<void> {
+        const pidOf = (banner: string) => /pid=(\d+)/.exec(banner)?.[1] ?? '';
+        const before = pidOf(await this.ping().catch(() => ''));
+        if (before) {
+            await this.call((bus) => bus.send('EXIT')).catch(() => {});
+            this.bus?.close();
+            this.bus = null;
+            await this.waitFor('movy-host to exit',
+                async () => (await this.ssh('ableton', HOST_PIDS)).trim() === '', 5000);
+        }
+        await this.launch();
+        const after = pidOf(await this.ping());
+        if (!after || after === before) throw new Error(`standalone: restart did not change movy-host (pid ${before} → ${after})`);
+    }
+
+    /* dsp.so, chain-host.so and movy-host ship to tools/movy (fresh inodes,
+     * deploy-host.sh). Any change → a new process runs it. */
+    async deployEngine(): Promise<EngineDeploy> {
+        const md5 = () => this.ssh('ableton',
+            `md5sum ${MOVY_DIR}/dsp.so ${MOVY_DIR}/movy-host ${MOVY_DIR}/movy-link ${MOVY_DIR}/standalone ${MOVY_DIR}/chain-host.so 2>/dev/null | md5sum | cut -d' ' -f1`)
+            .catch(() => '');
+        try {
+            if (!PREBUILT) {
+                await run('bash', [join(repoRoot(), 'scripts', 'build-dsp.sh')], { cwd: repoRoot() });
+                await run('node', [join(repoRoot(), 'build', 'device.mjs')], { cwd: repoRoot() });
+            }
+            const before = await md5();
+            for (const so of ['dsp.so', 'chain-host.so'])
+                await run('scp', ['-q', ...SSH_OPTS, join(repoRoot(), 'dist', so), `ableton@${this.host}:${MOVY_DIR}/${so}.new`]);
+            await this.ssh('ableton', `cd ${MOVY_DIR} && mv dsp.so.new dsp.so && mv chain-host.so.new chain-host.so`);
+            await run('bash', ['-c', `. scripts/lib/deploy-host.sh && deploy_host ${this.host}`],
+                      { cwd: repoRoot(), maxBuffer: 8 * 1024 * 1024 });
+            const after = await md5();
+            if (before === after) return { built: true, changed: false, restarted: false, detail: after };
+            const restarted = await this.running();
+            if (restarted) await this.restart();
+            return { built: true, changed: true, restarted, detail: after };
+        } catch (e) {
+            const msg = e instanceof Error ? e.message : String(e);
+            return { built: false, detail: msg.split('\n').slice(0, 6).join('\n') };
+        }
+    }
+
+    /* ui.js is read at launch, so a running movy-host keeps the old one until
+     * its next open. */
+    private uiDeployed = false;
+    async deployUi(force = false): Promise<boolean> {
+        if (this.uiDeployed && !force) return false;
+        if (!PREBUILT) await run('node', [join(repoRoot(), 'build', 'device.mjs')], { cwd: repoRoot() });
+        await run('scp', ['-q', ...SSH_OPTS, join(repoRoot(), 'ui.js'), `ableton@${this.host}:${MOVY_DIR}/`]);
+        this.uiDeployed = true;
+        return true;
+    }
+}

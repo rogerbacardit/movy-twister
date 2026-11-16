@@ -1,0 +1,65 @@
+/* Step parameter page: shown only during a parameter-lock session (a held
+ * step). It is page 0, ahead of the module banks / chain slots. Selection is
+ * remembered across sessions so a session that ended on the step page reopens
+ * there next time (the page does not exist outside a session, so a flag carries
+ * that intent). Knob/value editing lives in step-edit.ts; rendering reads this. */
+
+import { seqState, occHasStep } from './state.js';
+import { schwungGridDrop } from '../renderer/schwung-grid.js';
+import { MASTER_PAGE_TRACK } from '../app/page-owner.js';
+import { STEP_PARAMS_COMPONENT } from '../chain/config.js';
+
+export const stepPageState = {
+    /** The step page (page 0) is the currently selected page this session. */
+    selected: false,
+    /** Carried across sessions: the prior session ended on the step page. */
+    lastSessionStepPage: false,
+};
+
+/* SP-54: the step page's own SchwungPage (its `ctl`, carrying UI-only ephemeral
+ * state — a touch-claim timer, an open enum peek) must not survive past the
+ * hold it was built for, or that state bleeds into the NEXT hold. Called from
+ * both `onSessionEnd` (the happy-path release) and `resetStepPage` (the
+ * lost-release recovery path `app/input-reset.ts` runs on tool open and on
+ * every foreground handoff) — those are the only two ways a step-hold session
+ * ends, so the page's lifetime cannot latch by missing a release the way
+ * SP-31's controller and SP-51's overlay once did. A no-op `Map.delete` when
+ * nothing was ever cached (mode was `off`, or the page was never selected). */
+function dropStepParamsPage(): void {
+    schwungGridDrop(MASTER_PAGE_TRACK, STEP_PARAMS_COMPONENT);
+}
+
+/** Session (parameter lock) begins: open the step page iff the last one did. */
+export function onSessionStart(): void {
+    stepPageState.selected = stepPageState.lastSessionStepPage;
+}
+
+/** Session ends: remember whether the step page was open. */
+export function onSessionEnd(): void {
+    stepPageState.lastSessionStepPage = stepPageState.selected;
+    stepPageState.selected = false;
+    dropStepParamsPage();
+}
+
+export function setStepPageSelected(v: boolean): void {
+    stepPageState.selected = v;
+}
+
+/** True when the step page should be rendered/edited (session active + selected). */
+export function stepPageActive(sessionActive: boolean): boolean {
+    return sessionActive && stepPageState.selected;
+}
+
+/* The step page only exists for a held step that actually HAS a note on the
+ * watched lane — there are no per-trig params to edit on an empty step (occ is
+ * already lane-filtered by the engine). Empty held steps fall back to the normal
+ * module page so chain-automation (hold-step) editing still works there. */
+export function stepPageAvailable(): boolean {
+    return seqState.stepAutoMode && occHasStep(seqState.holdStep);
+}
+
+export function resetStepPage(): void {
+    stepPageState.selected = false;
+    stepPageState.lastSessionStepPage = false;
+    dropStepParamsPage();
+}

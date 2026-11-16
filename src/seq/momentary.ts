@@ -1,0 +1,80 @@
+/* Generic momentary view-switch. A button-down shows the target view
+ * immediately; the release decides what sticks:
+ *   - HOLD (>= HOLD_MS) or a modifier-gesture happened while held  → revert
+ *     to the prior state (temporary peek / modifier use); restore() runs.
+ *   - clean quick TAP, nothing done while held                     → 'tap';
+ *     the caller latches (or toggles off if it was already in the view).
+ * One active button at a time. The *At variants take an explicit timestamp
+ * (ms) for testability; the plain variants read Date.now().
+ *
+ * The threshold is wall-clock, not tick-counted: the device tick rate is not a
+ * stable constant (it has run ~94 Hz and ~205 Hz across schwung builds), so a
+ * tick-based hold window silently changes length when the rate moves. A track
+ * switch is a sub-second tap; a hold-to-peek is a deliberate ~1 s press. */
+
+const HOLD_MS = 500;
+
+let active: { button: number; pressMs: number; restore: () => void; gestured: boolean } | null = null;
+
+export function momentaryDownAt(button: number, nowMs: number, restore: () => void): void {
+    active = { button, pressMs: nowMs, restore, gestured: false };
+}
+
+/* Mark the in-progress momentary as a modifier use (wheel resize, clip launch,
+ * bar select while held) so its release reverts instead of latching. No-op when
+ * no momentary is active. */
+export function momentaryGesture(): void {
+    if (active) active.gestured = true;
+}
+
+export function momentaryUpAt(button: number, nowMs: number): 'revert' | 'tap' | 'none' {
+    if (!active || active.button !== button) return 'none';
+    const revert = active.gestured || nowMs - active.pressMs >= HOLD_MS;
+    const restore = active.restore;
+    active = null;
+    if (revert) {
+        restore();
+        return 'revert';
+    }
+    return 'tap';
+}
+
+/* Release without the hold-duration rule: only a modifier gesture while held
+ * suppresses the action. For buttons where holding longer is not a different
+ * intent — Mute has no peek semantics (its restore is a no-op), so a deliberate
+ * press should mute the active track just like a quick tap does. */
+export function momentaryUpUngated(button: number): 'used' | 'clean' | 'none' {
+    if (!active || active.button !== button) return 'none';
+    const used    = active.gestured;
+    const restore = active.restore;
+    active = null;
+    if (used) { restore(); return 'used'; }
+    return 'clean';
+}
+
+/* Abandon the in-progress momentary without running its restore: the gesture
+ * made while held COMMITTED, so the release must change nothing. Distinct from
+ * momentaryGesture(), which is the opposite verdict (the gesture was a modifier
+ * use, so the release reverts). Selecting a track from the Session step row is
+ * the commit case — the point of the hold is to land on the new track. */
+export function momentaryCancel(button: number): void {
+    if (active && active.button === button) active = null;
+}
+
+/* The press of `button` is still down and nothing has been done with it — a
+ * hold that is still only a hold. False once released, gestured or cancelled. */
+export function momentaryPlainHold(button: number, nowMs: number, minMs: number): boolean {
+    return !!active && active.button === button && !active.gestured && nowMs - active.pressMs >= minMs;
+}
+
+export function momentaryDown(button: number, restore: () => void): void {
+    momentaryDownAt(button, Date.now(), restore);
+}
+
+export function momentaryUp(button: number): 'revert' | 'tap' | 'none' {
+    return momentaryUpAt(button, Date.now());
+}
+
+export function resetMomentary(): void {
+    active = null;
+}

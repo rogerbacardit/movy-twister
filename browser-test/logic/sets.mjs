@@ -1,0 +1,351 @@
+/* browser-test/logic/sets.mjs — movy's own Set library (WP4): the `lib` wire,
+ * name policy, the set source, the SETS page's gestures, and the library half
+ * of the session's identity.
+ *
+ * The engine side (index, order, import, file moves) is cargo's to test; here
+ * a small fake answers `set lib …` the way set_lib_jobs.rs does, so what is
+ * asserted is what the UI SENDS and what it does with the answer.
+ *
+ * Run by browser-test/logic.mjs.
+ */
+
+import { eq, ok, _log } from './harness.mjs';
+
+/* A fake library engine: the `lib` answer and the commands that change it. */
+function fakeLib() {
+    const st = { rev: 0, cur: '', made: '', sets: [], sent: [], next: 1, setsdir: null };
+    const publish = (err = '') => {
+        st.rev++;
+        st.wire = `rev=${st.rev} cur=${st.cur || '-'} made=${st.made || '-'} err=${err || '-'}\n`
+            + st.sets.map((s) => `${s.id}\t${s.clips}\t0\t${s.name}\n`).join('');
+    };
+    const set = (key, val) => {
+        if (key === 'setsdir') { st.setsdir = val; return true; }
+        if (key !== 'set' || !String(val).startsWith('lib ')) return true;
+        const cmd = String(val).slice(4);
+        st.sent.push(cmd);
+        const [verb, ...rest] = cmd.split(' ');
+        if (verb === 'new') { st.made = 'm' + st.next++; st.sets.unshift({ id: st.made, name: rest.join(' '), clips: 0 }); }
+        if (verb === 'dup') {
+            const i = st.sets.findIndex((s) => s.id === rest[0]);
+            st.made = 'm' + st.next++;
+            st.sets.splice(i + 1, 0, { id: st.made, name: rest.slice(1).join(' '), clips: st.sets[i].clips });
+        }
+        if (verb === 'rename') st.sets.find((s) => s.id === rest[0]).name = rest.slice(1).join(' ');
+        if (verb === 'del') st.sets = st.sets.filter((s) => s.id !== rest[0]);
+        publish();
+        return true;
+    };
+    return { st, publish, get: (key) => (key === 'lib' ? (st.wire ?? '') : null), set };
+}
+
+function install(f) {
+    const saved = [globalThis.host_module_get_param, globalThis.host_module_set_param];
+    globalThis.host_module_get_param = f.get;
+    globalThis.host_module_set_param = f.set;
+    return () => {
+        [globalThis.host_module_get_param, globalThis.host_module_set_param] = saved;
+    };
+}
+
+export async function run() {
+    const lib = await import('../../dist/esm/seq/sets-lib.js');
+    const src = await import('../../dist/esm/seq/set-source.js');
+    const vmm = await import('../../dist/esm/seq/sets-page-vm.js');
+    const page = await import('../../dist/esm/seq/sets-page.js');
+    const ls = await import('../../dist/esm/seq/set-lib-session.js');
+    const { appState, VIEW_SETS, VIEW_CHAIN } = await import('../../dist/esm/app/state.js');
+
+{
+    _log('\nset library wire:');
+    const p = lib.parseLib('rev=4 cur=m1 made=m2 err=-\nm2\t3\t1\tMy  Set\tTabbed\nm1\t0\t0\tA\n');
+    eq('rev', p.rev, 4);
+    eq('cur', p.cur, 'm1');
+    eq('made', p.made, 'm2');
+    eq('dash err is empty', p.err, '');
+    eq('rows in order', p.rows.map((r) => r.id).join(','), 'm2,m1');
+    eq('a name keeps its spaces', p.rows[0].name, 'My  Set\tTabbed');
+    eq('clips', p.rows[0].clips, 3);
+    eq('no rev is no answer', lib.parseLib('cur=x'), null);
+    eq('empty is no answer', lib.parseLib(''), null);
+    eq('a library with no Sets', lib.parseLib('rev=1 cur=- made=- err=-\n').rows.length, 0);
+    eq('mig: when the migration ran', lib.parseLib('rev=1 cur=- made=- err=- mig=1760000000000\n').mig, 1760000000000);
+    eq('an older engine has no mig', p.mig, 0);
+    const auto = lib.libMigrateCmd(false);
+    ok('the migration reads every page root', auto.includes(' pages=/data/UserData/schwung/set_pages,'), auto);
+    ok('and schwung\'s per-Set files', auto.includes(' state=/data/UserData/schwung/set_state'), auto);
+    ok('the automatic one is not forced', !auto.endsWith(' force'), auto);
+    ok('the manual one is', lib.libMigrateCmd(true).endsWith(' force'));
+}
+
+{
+    _log('\nmigrate from Move (Settings row):');
+    const ma = await import('../../dist/esm/seq/migrate-action.js');
+    const vr = await import('../../dist/esm/seq/version-restore.js');
+    const { loadingStage } = await import('../../dist/esm/renderer/loading-view.js');
+    const f = fakeLib();
+    let vui = 'pending';
+    const get = f.get;
+    f.get = (k) => (k === 'vui' ? vui : get(k));
+    const restore = install(f);
+    ma.resetMigrateAction(); vr.resetVersionRestore();
+    ma.migrateRowClick('OPEN');
+    eq('the first click only arms', [f.st.sent.length, ma.migrateRowValue()].join(), '0,CONFIRM?');
+    const { wrapWords } = await import('../../dist/esm/renderer/wrap.js');
+    const { HINT_W, HINT_LINES } = await import('../../dist/esm/renderer/flags-view.js');
+    const fits = (h) => wrapWords(h, HINT_W).length <= HINT_LINES;
+    ok('the armed hint fits the hint band', fits(ma.migrateRowHint()), ma.migrateRowHint());
+    ma.disarmMigrateRow();
+    ma.migrateRowClick('OPEN');
+    ma.migrateRowClick('OPEN');
+    ok('the second click runs it, forced', f.st.sent.at(-1).startsWith('migrate ') && f.st.sent.at(-1).endsWith(' force'),
+       f.st.sent.at(-1));
+    ok('and waits for the open Set', vr.migrationPending());
+    const n = f.st.sent.length;
+    ma.migrateRowClick('OPEN'); ma.migrateRowClick('OPEN');
+    eq('no second run while one is in flight', f.st.sent.length, n);
+    eq('still pending: no reload', vr.restoreTick(), false);
+    vui = 'kept';
+    eq('the open Set was not one of them: no reload', vr.restoreTick(), false);
+    ok('and the wait is over', !vr.migrationPending());
+    ma.migrateRowClick('OPEN'); ma.migrateRowClick('OPEN');
+    vui = 'none';
+    eq('the open Set was replaced: reload it', vr.restoreTick(), true);
+    f.st.wire = 'rev=9 cur=- made=- err=- mig=1760000000000\n';
+    lib.libRefresh();
+    ok('the done hint says when, and fits', ma.migrateRowHint().startsWith('Ran 20') && fits(ma.migrateRowHint()),
+       ma.migrateRowHint());
+    ma.disarmMigrateRow(); vr.resetVersionRestore(); lib.resetLib();
+    ok('the never-ran hint fits', fits(ma.migrateRowHint()), ma.migrateRowHint());
+    eq('splash: the first start says it is migrating', loadingStage('loading', 0, '3/12'), 'MIGRATING SETS 3/12');
+    restore();
+}
+
+{
+    _log('\nset names:');
+    const d = new Date(2027, 5, 1, 12);
+    eq('first of the day', lib.defaultSetName(d, []), '2027-06-01_01');
+    eq('one past the HIGHEST suffix, not the count',
+       lib.defaultSetName(d, [{ name: '2027-06-01_03' }, { name: '2027-06-01_01' }]), '2027-06-01_04');
+    eq('another day does not count', lib.defaultSetName(d, [{ name: '2027-05-31_07' }]), '2027-06-01_01');
+    eq('a copy', lib.dupName('Song'), 'Song Copy');
+    {
+        const names = await import('../../dist/esm/seq/set-names.js');
+        const P = names.SET_NAME_PAIRS;
+        eq('every pair is two words', P.filter((n) => n.split(' ').length !== 2).length, 0);
+        eq('no pair twice', new Set(P.map((n) => n.toLowerCase())).size, P.length);
+        ok('a large collection', P.length >= 200, P.length);
+        ok('every pair fits a duplicate\'s suffix under the engine cut',
+           P.every((n) => n.length + ' Copy'.length <= lib.NAME_MAX));
+        ok('a dated name is the placeholder', names.isDatedName('2026-10-17_03'));
+        ok('a named Set is not', !names.isDatedName('2026-10-17_03 mix'));
+        ok('nor a copy of a dated one', !names.isDatedName('2026-10-17_03 Copy'));
+        const row = (name) => ({ id: name, clips: 0, depth: 0, name });
+        eq('a named Set keeps its name', names.renameInitialText(row('Song'), []), 'Song');
+        /* Every pair but one taken, in another case: the free one is found
+         * wherever the random start lands. */
+        const taken = P.slice(1).map((n) => row(n.toUpperCase()));
+        eq('skips every used pair', names.generateSetName(taken, () => 0.5), P[0]);
+        eq('all taken: still unique', names.generateSetName(P.map(row), () => 0), P[0] + ' 2');
+        eq('and past that', names.generateSetName([...P.map(row), row(P[0] + ' 2')], () => 0), P[0] + ' 3');
+        const seen = new Set();
+        for (let i = 0; i < 50; i++) seen.add(names.generateSetName([], Math.random));
+        ok('not the same name every time', seen.size > 10, seen.size);
+    }
+    const long = 'x'.repeat(60);
+    eq('a long copy keeps its suffix', lib.dupName(long).endsWith(' Copy'), true);
+    eq('and fits the engine limit', lib.dupName(long).length <= lib.NAME_MAX, true);
+}
+
+{
+    _log('\nset source:');
+    eq('Sets live in the library', src.setsDir(), '/data/UserData/UserLibrary/Movy/Sets');
+    ok('the legacy tree is named only for the import to read', src.LEGACY_SETS_DIR.endsWith('/modules/tools/movy/sets'));
+}
+
+{
+    _log('\nan unwritable library is refused on screen:');
+    const f = fakeLib();
+    const restore = install(f);
+    try {
+        lib.resetLib();
+        f.publish();
+        lib.libRefresh();
+        eq('a writable library runs', ls.libraryBlocked(), '');
+        f.publish('save');
+        lib.libRefresh();
+        eq('index not saved: refused with a reason', ls.libraryBlocked(), 'SETS FOLDER NOT WRITABLE');
+        f.publish();
+        lib.libRefresh();
+        eq('a later good save lifts it', ls.libraryBlocked(), '');
+        f.publish('missing');
+        lib.libRefresh();
+        eq('a per-command error is not a blocked library', ls.libraryBlocked(), '');
+    } finally {
+        restore();
+        lib.resetLib();
+    }
+}
+
+{
+    _log('\nsets page view model:');
+    const rows = [{ id: 'a', clips: 2, depth: 0, name: 'Alpha' }, { id: 'b', clips: 0, depth: 0, name: 'Beta' }];
+    const vm = vmm.buildSetsPageVM(rows, 'b', 9, false);
+    eq('[NEW] first', vm.rows[0].name, vmm.NEW_ROW);
+    eq('selection clamps to the list', vm.selected, 2);
+    eq('the open Set is marked', vm.rows.map((r) => r.current).join(','), 'false,false,true');
+    eq('clip counts', vm.rows[1].clips, '2');
+    eq('confirm names the Set', vmm.buildSetsPageVM(rows, 'b', 1, true).confirm, 'DELETE ALPHA?');
+    eq('no confirm on [NEW]', vmm.buildSetsPageVM(rows, 'b', 0, true).confirm, null);
+    eq('before the first answer', vmm.buildSetsPageVM(null, '', 0, false).mode, 'loading');
+}
+
+{
+    _log('\nsets page gestures:');
+    const f = fakeLib();
+    const restore = install(f);
+    src.resetWantedSet();
+    lib.resetLib();
+    ls.resetLibSession();
+    f.st.sets = [{ id: 'b', name: 'Beta', clips: 1 }, { id: 'a', name: 'Alpha', clips: 0 }];
+    f.st.cur = 'a';
+    f.publish();
+    const tick = (n = 20) => { for (let i = 0; i < n; i++) page.setsPageTick(); };
+
+    appState.currentView = VIEW_CHAIN;
+    page.openSetsPage('a');
+    eq('opens on the open Set', page.setsPageState.selected, 2);
+    eq('is a screen', appState.currentView, VIEW_SETS);
+
+    page.setsPageJog(-1, false);
+    page.setsPageJog(-1, false);
+    page.setsPageJog(-1, false);
+    eq('jog stops at [NEW]', page.setsPageState.selected, 0);
+    page.setsPageClick('a');
+    ok('[NEW] sends a dated name', /^new \d{4}-\d\d-\d\d_01$/.test(f.st.sent.at(-1)), f.st.sent.at(-1));
+    eq('still on the page while the Set is being made', appState.currentView, VIEW_SETS);
+    tick();
+    eq('[NEW] opens the Set it made', src.wantedSet(), f.st.made);
+    eq('and closes the page, as opening any Set does', appState.currentView, VIEW_CHAIN);
+    page.openSetsPage(f.st.made);
+    eq('back on the page, focus is on the new Set', lib.libState().rows[page.setsPageState.selected - 1].id, f.st.made);
+
+    page.setsPageButton('copy');
+    eq('copy names a Copy', f.st.sent.at(-1), `dup ${f.st.sets[0].id} ${f.st.sets[0].name} Copy`);
+    tick();
+    eq('focus follows the copy', lib.libState().rows[page.setsPageState.selected - 1].id, f.st.made);
+
+    page.setsPageButton('capture');
+    ok('capture opens the keyboard with the name', globalThis.__textEntryLast?.initialText?.endsWith(' Copy'));
+    eq('the keyboard has no title to read as part of the name', globalThis.__textEntryLast?.title, '');
+    globalThis.__textEntryConfirm('Renamed');
+    ok('confirm renames', f.st.sent.at(-1).startsWith('rename ') && f.st.sent.at(-1).endsWith(' Renamed'));
+    const before = f.st.sent.length;
+    page.setsPageButton('capture');
+    globalThis.__textEntryConfirm('  ');
+    eq('an empty name renames nothing', f.st.sent.length, before);
+
+    /* A Set still on its dated placeholder is offered a generated name; the
+     * LEDs of the three edit buttons follow what they would do. */
+    {
+        const names = await import('../../dist/esm/seq/set-names.js');
+        const dated = f.st.sets.find((s) => names.isDatedName(s.name));
+        ok('the [NEW] Set is dated', !!dated);
+        page.setsPageState.selected = lib.libState().rows.findIndex((r) => r.id === dated.id) + 1;
+        ok('editable on a Set', page.setsPageEditable());
+        page.setsPageButton('capture');
+        const offered = globalThis.__textEntryLast?.initialText;
+        ok('a dated Set is offered a generated pair', names.SET_NAME_PAIRS.includes(offered), offered);
+        globalThis.__textEntryConfirm(offered);
+        eq('accepting it renames to it', f.st.sent.at(-1), `rename ${dated.id} ${offered}`);
+        tick();
+        const sel = page.setsPageState.selected;
+        page.setsPageState.selected = 0;
+        ok('nothing to edit on [NEW]', !page.setsPageEditable());
+        page.setsPageState.selected = sel;
+    }
+
+    /* Delete a Set that is not open: arm, the jog is the confirm's, click. */
+    tick();
+    const victim = lib.libState().rows[page.setsPageState.selected - 1].id;
+    page.setsPageButton('delete');
+    ok('delete arms', page.setsPageState.confirming);
+    ok('an armed delete leaves nothing to edit', !page.setsPageEditable());
+    const sel = page.setsPageState.selected;
+    page.setsPageJog(1, false);
+    eq('the confirm owns the jog', page.setsPageState.selected, sel);
+    page.setsPageClick('a');
+    eq('the click deletes', f.st.sent.at(-1), 'del ' + victim);
+
+    /* Buttons on [NEW] do nothing. */
+    page.setsPageState.selected = 0;
+    const n0 = f.st.sent.length;
+    page.setsPageButton('copy'); page.setsPageButton('delete');
+    eq('nothing on [NEW]', [f.st.sent.length, page.setsPageState.confirming].join(), `${n0},false`);
+
+    /* Open another Set: wanted, and the page closes. */
+    tick();
+    const bRow = lib.libState().rows.findIndex((r) => r.id === 'b');
+    page.setsPageState.selected = bRow + 1;
+    ok('a click on a Set closes', page.setsPageClick('a'));
+    eq('and wants it', src.wantedSet(), 'b');
+    eq('back where we came from', appState.currentView, VIEW_CHAIN);
+
+    /* Delete the OPEN Set: switch first, delete once the session has left. */
+    page.openSetsPage('b');
+    page.setsPageButton('delete');
+    page.setsPageClick('b');
+    ok('the open Set is not deleted yet', !f.st.sent.at(-1).startsWith('del b'));
+    ok('a neighbour is wanted', src.wantedSet() !== 'b');
+    ls.libraryTick('b', true);
+    ok('still open: still not deleted', !f.st.sent.includes('del b'));
+    ls.libraryTick(src.wantedSet(), true);
+    eq('deleted once left', f.st.sent.at(-1), 'del b');
+
+    /* The ONLY Set: a replacement is made first. */
+    f.st.sets = [{ id: 'z', name: 'Only', clips: 0 }];
+    f.publish();
+    page.openSetsPage('z');
+    tick();
+    page.setsPageButton('delete');
+    page.setsPageClick('z');
+    ok('a new Set is made first', f.st.sent.at(-1).startsWith('new '));
+    tick();
+    eq('which becomes the wanted Set', src.wantedSet(), f.st.made);
+    ls.libraryTick(f.st.made, true);
+    eq('and then the old one goes', f.st.sent.at(-1), 'del z');
+    restore();
+}
+
+{
+    _log('\nlibrary session identity:');
+    const f = fakeLib();
+    const restore = install(f);
+    src.resetWantedSet();
+    lib.resetLib();
+    ls.resetLibSession();
+    eq('nothing until the library answers', ls.libraryIdentity(), null);
+    eq('the migration request goes out first', f.st.sent[0].split(' ')[0], 'migrate');
+    eq('pointed at the library', f.st.setsdir, '/data/UserData/UserLibrary/Movy/Sets');
+    f.publish();   // the migration's answer: an empty library
+    /* The fake answers synchronously; the engine a few ticks later — either
+     * way the Set opened is the one the `new` made. */
+    const first = ls.libraryIdentity();
+    ok('an empty library makes its first Set, named for today',
+       /^new \d{4}-\d\d-\d\d_01$/.test(f.st.sent.at(-1)), f.st.sent.at(-1));
+    const id = first ?? ls.libraryIdentity();
+    eq('and opens it', id && id.uuid, f.st.made);
+    eq('one migration request per engine generation', f.st.sent.filter((c) => c.startsWith('migrate')).length, 1);
+
+    /* A library with a last-open Set reopens it. */
+    src.resetWantedSet();
+    lib.resetLib();
+    ls.resetLibSession();
+    f.st.sets = [{ id: 'n', name: 'N', clips: 0 }, { id: 'o', name: 'O', clips: 0 }];
+    f.st.cur = 'o';
+    f.publish();
+    eq('last-open reopens', ls.libraryIdentity()?.uuid, 'o');
+    src.resetWantedSet();
+    restore();
+}
+}

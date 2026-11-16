@@ -1,0 +1,1642 @@
+/* browser-test/mock-synth.mjs — mock synth state for the browser harness
+ * Each entry is a flat map keyed the same way shadow_get_param uses:
+ *   "synth:name"          → display name
+ *   "synth:ui_hierarchy"  → JSON string (parsed by model.mjs)
+ *   "synth:<key>"         → current param value as string
+ */
+
+function hier(knobs) {
+    return JSON.stringify({ levels: { root: { knobs } } });
+}
+
+function hierFull(knobs, params) {
+    return JSON.stringify({ levels: { root: { knobs, params } } });
+}
+
+
+/* A hierarchy shaped like a real param-dense module: many levels (banks), some
+ * spanning more than one page. `sizes[i]` is level i's param count, so a level
+ * of 16 params occupies two pages of the indicator bar under one bank. */
+function multiLevel(name, sizes) {
+    const params = [];
+    const levels = { root: { knobs: [], params: [] } };
+    sizes.forEach((count, i) => {
+        const keys = Array.from({ length: count }, (_, j) => `l${i}_p${j}`);
+        keys.forEach(k => params.push({ key: k, name: k.toUpperCase(), type: "int", min: 0, max: 127 }));
+        levels[`lvl${i}`] = { knobs: keys.slice(0, 8), params: keys.map(k => ({ key: k, label: k })) };
+        levels.root.params.push({ level: `lvl${i}`, label: `B${i}` });
+    });
+    return {
+        "synth:name": name,
+        "synth:chain_params": JSON.stringify(params),
+        "synth:ui_hierarchy": JSON.stringify({ levels }),
+        ...Object.fromEntries(params.map(p => [`synth:${p.key}`, "0"])),
+    };
+}
+
+/* Helm's 11-entry oscillator waveform list, in its published order. */
+const HELM_WAVES = ['Sine', 'Triangle', 'Square', 'Saw Down', 'Saw Up',
+    '3 Step', '4 Step', '8 Step', '3 Pyramid', '5 Pyramid', '9 Pyramid'];
+
+export const MOCK_SYNTHS = {
+
+    /* Smack-style one-shot actions for the trigger badge states. Two triggers so a
+     * frame shows the fired/cooling badge next to an untouched armed one. No
+     * value-carrying knob here on purpose: an arc's rendered value depends on
+     * where the round-robin refresh happens to be, which made the badge baselines
+     * differ in a cell these scenes are not about. */
+    triggers: {
+        "synth:name":         "Smacky",
+        "synth_module":       "smacky",
+        "synth:chain_params": JSON.stringify([
+            { key: "capture", name: "Capture", type: "enum", options: ["idle", "trigger"], behavior: "trigger" },
+            { key: "reroll",  name: "Reroll",  type: "enum", options: ["idle", "trigger"], behavior: "trigger" },
+        ]),
+        "synth:capture":      "idle",
+        "synth:reroll":       "idle",
+    },
+
+    /* Declared readouts (`access: "read"`) beside ordinary controls, so the
+     * dotted frame can be compared against an undotted cell in the same shot.
+     * One of each widget a readout realistically wears: a dial, an enum square,
+     * and a big number. */
+    readouts: {
+        "synth:name":         "Keydetect",
+        "synth_module":       "keydetect",
+        "synth:chain_params": JSON.stringify([
+            { key: "detected_key", name: "Detected Key", type: "enum",
+              options: ["C", "C#", "D", "D#", "E", "F", "F#", "G"], access: "read" },
+            { key: "level_in", name: "Input Level", type: "float", min: 0, max: 1, access: "read" },
+            { key: "sens",     name: "Sensitivity", type: "float", min: 0, max: 1 },
+            { key: "hold",     name: "Hold Steps",  type: "int",   min: 0, max: 16, access: "read" },
+        ]),
+        "synth:detected_key": "D#",
+        "synth:level_in":     "0.72",
+        "synth:sens":         "0.4",
+        "synth:hold":         "6",
+    },
+
+    /* Eight trigger badges on one page — the worst case for badge draw cost. */
+    triggers_full: {
+        "synth:name":         "Smackier",
+        "synth_module":       "smackier",
+        "synth:chain_params": JSON.stringify(
+            Array.from({ length: 8 }, (_, i) => ({
+                key: "act" + i, name: "Action " + i, type: "enum",
+                options: ["idle", "trigger"], behavior: "trigger",
+            })),
+        ),
+        ...Object.fromEntries(Array.from({ length: 8 }, (_, i) => ["synth:act" + i, "idle"])),
+    },
+
+    test8: {
+        "synth:name": "Test 8",
+        "synth:ui_hierarchy": hier([
+            { key: "freq",   label: "Freq",   type: "float", min: 0,   max: 1,   step: 0.01 },
+            { key: "res",    label: "Reso",   type: "float", min: 0,   max: 1,   step: 0.01 },
+            { key: "drive",  label: "Drive",  type: "float", min: 0,   max: 1,   step: 0.01 },
+            { key: "vol",    label: "Vol",    type: "float", min: 0,   max: 1,   step: 0.01 },
+            { key: "attack", label: "Atk",    type: "float", min: 0,   max: 1,   step: 0.01 },
+            { key: "decay",  label: "Dcy",    type: "float", min: 0,   max: 1,   step: 0.01 },
+            { key: "sustain","label": "Sus",  type: "float", min: 0,   max: 1,   step: 0.01 },
+            { key: "release","label": "Rel",  type: "float", min: 0,   max: 1,   step: 0.01 },
+        ]),
+        "synth:freq":   "0.50",
+        "synth:res":    "0.30",
+        "synth:drive":  "0.10",
+        "synth:vol":    "0.80",
+        "synth:attack": "0.05",
+        "synth:decay":  "0.40",
+        "synth:sustain":"0.60",
+        "synth:release":"0.30",
+    },
+
+    test16: {
+        "synth:name": "Test 16",
+        "synth:ui_hierarchy": hier([
+            { key: "p1",  label: "P1",   type: "float", min: 0, max: 1, step: 0.01 },
+            { key: "p2",  label: "P2",   type: "float", min: 0, max: 1, step: 0.01 },
+            { key: "p3",  label: "P3",   type: "float", min: 0, max: 1, step: 0.01 },
+            { key: "p4",  label: "P4",   type: "float", min: 0, max: 1, step: 0.01 },
+            { key: "p5",  label: "P5",   type: "float", min: 0, max: 1, step: 0.01 },
+            { key: "p6",  label: "P6",   type: "float", min: 0, max: 1, step: 0.01 },
+            { key: "p7",  label: "P7",   type: "float", min: 0, max: 1, step: 0.01 },
+            { key: "p8",  label: "P8",   type: "float", min: 0, max: 1, step: 0.01 },
+            { key: "p9",  label: "P9",   type: "float", min: 0, max: 1, step: 0.01 },
+            { key: "p10", label: "P10",  type: "float", min: 0, max: 1, step: 0.01 },
+            { key: "p11", label: "P11",  type: "float", min: 0, max: 1, step: 0.01 },
+            { key: "p12", label: "P12",  type: "float", min: 0, max: 1, step: 0.01 },
+            { key: "p13", label: "P13",  type: "float", min: 0, max: 1, step: 0.01 },
+            { key: "p14", label: "P14",  type: "float", min: 0, max: 1, step: 0.01 },
+            { key: "p15", label: "P15",  type: "float", min: 0, max: 1, step: 0.01 },
+            { key: "p16", label: "P16",  type: "float", min: 0, max: 1, step: 0.01 },
+        ]),
+        ...Object.fromEntries(
+            Array.from({ length: 16 }, (_, i) => [`synth:p${i + 1}`, `${(i / 15).toFixed(2)}`])
+        ),
+    },
+
+    env_dual: {
+        "synth:name": "Dual Env",
+        "synth:ui_hierarchy": hier([
+            { key: "attack",   label: "Attack",   type: "float", min: 0, max: 1, step: 0.01 },
+            { key: "decay",    label: "Decay",    type: "float", min: 0, max: 1, step: 0.01 },
+            { key: "sustain","label": "Sustain",  type: "float", min: 0, max: 1, step: 0.01 },
+            { key: "release","label": "Release",  type: "float", min: 0, max: 1, step: 0.01 },
+            { key: "f_attack", label: "F Attack", type: "float", min: 0, max: 1, step: 0.01 },
+            { key: "f_decay",  label: "F Decay",  type: "float", min: 0, max: 1, step: 0.01 },
+            { key: "f_sustain","label": "F Sustain", type: "float", min: 0, max: 1, step: 0.01 },
+            { key: "f_release","label": "F Release", type: "float", min: 0, max: 1, step: 0.01 },
+        ]),
+        "synth:attack": "0.10",  "synth:decay": "0.35", "synth:sustain": "0.70", "synth:release": "0.45",
+        "synth:f_attack": "0.40","synth:f_decay": "0.25","synth:f_sustain": "0.30","synth:f_release": "0.20",
+    },
+
+    // A2 partial envelopes: 2-stage AD (attack+decay) beside two plain knobs.
+    env_ad: {
+        "synth:name": "AD Env",
+        "synth:ui_hierarchy": hier([
+            { key: "attack", label: "Attack", type: "float", min: 0, max: 1, step: 0.01 },
+            { key: "decay",  label: "Decay",  type: "float", min: 0, max: 1, step: 0.01 },
+            { key: "cutoff", label: "Cutoff", type: "float", min: 0, max: 1, step: 0.01 },
+            { key: "reso",   label: "Reso",   type: "float", min: 0, max: 1, step: 0.01 },
+        ]),
+        "synth:attack": "0.20", "synth:decay": "0.50", "synth:cutoff": "0.60", "synth:reso": "0.30",
+    },
+    // A3 module-LFO viz: name-inferred, no explicit lfo: tags. No phase, so the
+    // partner is Rate — the layout reorders Shape+Rate onto one line and the
+    // rate value drives the cycle count (~1.5 here); Deform skews the shape.
+    lfo_mod: {
+        "synth:name": "Mod LFO",
+        "synth:ui_hierarchy": hier([
+            { key: "lfo_shape", label: "LFO Shape", type: "enum",
+              options: ["Sine", "Triangle", "Saw", "Square", "Ramp Down", "Noise", "Step Sequencer", "Wavetable 1"] },
+            { key: "lfo_rate",   label: "LFO Rate",   type: "float", min: 0,  max: 1, step: 0.01 },
+            { key: "lfo_deform", label: "LFO Deform", type: "float", min: -1, max: 1, step: 0.01 },
+            { key: "lfo_depth",  label: "LFO Depth",  type: "float", min: 0,  max: 1, step: 0.01 },
+            { key: "cutoff",     label: "Cutoff",     type: "float", min: 0,  max: 1, step: 0.01 },
+            { key: "reso",       label: "Reso",       type: "float", min: 0,  max: 1, step: 0.01 },
+        ]),
+        "synth:lfo_shape": "4",   // Ramp Down → shape id 6 (saw down)
+        "synth:lfo_rate": "0.50", "synth:lfo_deform": "0.70", "synth:lfo_depth": "0.80",
+        "synth:cutoff": "0.60", "synth:reso": "0.30",
+    },
+
+    /* Single-knob waveform silhouettes. Four qualifying waveform enums on one
+     * page (chordism's shape), so one shot covers the frame, the flat "Off"
+     * glyph and the square/pulse risers side by side. A non-qualifying enum
+     * (Gate/Envelope) sits alongside to prove it keeps its text square. */
+    wave_cells: {
+        "synth:name": "Waves",
+        "synth:ui_hierarchy": hier([
+            { key: "wave_1", label: "Wave 1", type: "enum",
+              options: ["Off", "Sine", "Triangle", "Saw", "Square", "Pulse Tr", "Wavetable"] },
+            { key: "wave_2", label: "Wave 2", type: "enum",
+              options: ["Off", "Sine", "Triangle", "Saw", "Square", "Pulse Tr", "Wavetable"] },
+            { key: "wave_3", label: "Wave 3", type: "enum",
+              options: ["Off", "Sine", "Triangle", "Saw", "Square", "Pulse Tr", "Wavetable"] },
+            { key: "wave_4", label: "Wave 4", type: "enum",
+              options: ["Off", "Sine", "Triangle", "Saw", "Square", "Pulse Tr", "Wavetable"] },
+            { key: "osc_wave", label: "Osc Wave", type: "enum",
+              options: ["Saw", "Pulse", "Noise"] },
+            { key: "mod_shape", label: "Mod Shape", type: "enum",
+              options: ["Sine", "Tri", "Saw", "Square", "S&H", "Random"] },
+            { key: "vca_mode", label: "VCA Mode", type: "enum", options: ["Gate", "Envelope"] },
+            { key: "level", label: "Level", type: "float", min: 0, max: 1, step: 0.01 },
+        ]),
+        "synth:wave_1": "0",   // Off      → flat line
+        "synth:wave_2": "3",   // Saw
+        "synth:wave_3": "4",   // Square   → straight risers
+        "synth:wave_4": "5",   // Pulse Tr → narrower duty than Square
+        "synth:osc_wave": "1", // Pulse
+        "synth:mod_shape": "5",// Random   → smooth walk, not the stepped S&H
+        "synth:vca_mode": "0", // not a waveform enum → stays a text square
+        "synth:level": "0.60",
+    },
+
+    /* Granular sampler: a `wav_position` marker and its sample file, drawn as
+     * the waveform with the position cut into it. The scene's WAV is built in
+     * screenshot.mjs so the peaks are real rather than mocked. */
+    wav_sample: {
+        "synth:name": "Granny",
+        "synth:ui_hierarchy": hier([
+            { key: "sample_path", label: "Sample", type: "filepath", root: "/s" },
+            { key: "position",    label: "Position", type: "wav_position", min: 0, max: 1, step: 0.01 },
+            { key: "size_ms",     label: "Size",     type: "float", min: 5, max: 500, step: 1 },
+            { key: "density",     label: "Density",  type: "float", min: 1, max: 60, step: 1 },
+            { key: "spray",       label: "Spray",    type: "float", min: 0, max: 1, step: 0.01 },
+            { key: "jitter",      label: "Jitter",   type: "float", min: 0, max: 1, step: 0.01 },
+            { key: "scan",        label: "Scan",     type: "float", min: -10, max: 10, step: 0.1 },
+            { key: "grain_gain",  label: "Gain",     type: "float", min: 0, max: 1, step: 0.01 },
+        ]),
+        "synth:sample_path": "/s/scene.wav",
+        "synth:position": "0.42",
+        "synth:size_ms": "120", "synth:density": "20", "synth:spray": "0.3",
+        "synth:jitter": "0.2", "synth:scan": "0", "synth:grain_gain": "0.8",
+    },
+
+    /* mrsample page 0: an ADSR envelope takes one line and a filter curve the
+     * other, so the sample+marker pair lands BESIDE the filter graphic. The
+     * scene exists to prove the two drawings stay visually separate. */
+    wav_beside_filter: {
+        "synth:name": "MrSample",
+        "synth:ui_hierarchy": JSON.stringify({ levels: { root: {
+            knobs: ['attack_ms', 'decay_ms', 'sustain', 'release_ms',
+                    'filter_cutoff', 'filter_res', 'sample_path', 'sample_start'],
+            params: [
+                { key: 'attack_ms', label: 'Attack', type: 'float', min: 0, max: 5000, step: 1 },
+                { key: 'decay_ms', label: 'Decay', type: 'float', min: 0, max: 5000, step: 1 },
+                { key: 'sustain', label: 'Sustain', type: 'float', min: 0, max: 1, step: 0.01 },
+                { key: 'release_ms', label: 'Release', type: 'float', min: 0, max: 5000, step: 1 },
+                { key: 'filter_cutoff', label: 'Cutoff', type: 'float', min: 0, max: 1, step: 0.01 },
+                { key: 'filter_res', label: 'Reso', type: 'float', min: 0, max: 1, step: 0.01 },
+                { key: 'sample_path', label: 'Sample', type: 'filepath', root: '/s' },
+                { key: 'sample_start', label: 'Start', type: 'float', ui_type: 'wav_position',
+                  filepath_param: 'sample_path', min: 0, max: 1, step: 0.01 },
+            ],
+        } } }),
+        "synth:attack_ms": "200", "synth:decay_ms": "800", "synth:sustain": "0.6",
+        "synth:release_ms": "1200", "synth:filter_cutoff": "0.55", "synth:filter_res": "0.35",
+        "synth:sample_path": "/s/scene.wav", "synth:sample_start": "0.45",
+    },
+
+    /* mrsample's loop page: a playback marker plus loop bounds, all on the one
+     * waveform. loop_mode gates the bounds via visible_if. */
+    wav_loop: {
+        "synth:name": "MrSample",
+        "synth:ui_hierarchy": JSON.stringify({ levels: { root: {
+            knobs: ['sample_path', 'sample_start', 'loop_mode', 'loop_start', 'loop_end', 'loop_xfade_ms'],
+            params: [
+                { key: 'sample_path', label: 'Sample', type: 'filepath', root: '/s' },
+                { key: 'sample_start', label: 'Start', type: 'float', ui_type: 'wav_position',
+                  filepath_param: 'sample_path', view_group: 'loop', min: 0, max: 1, step: 0.01 },
+                { key: 'loop_mode', label: 'Loop', type: 'enum', options: ['off', 'on'] },
+                { key: 'loop_start', label: 'Loop Start', type: 'float', ui_type: 'wav_position',
+                  filepath_param: 'sample_path', view_group: 'loop', min: 0, max: 1, step: 0.01,
+                  visible_if: { param: 'loop_mode', equals: 'on' } },
+                { key: 'loop_end', label: 'Loop End', type: 'float', ui_type: 'wav_position',
+                  filepath_param: 'sample_path', view_group: 'loop', min: 0, max: 1, step: 0.01,
+                  visible_if: { param: 'loop_mode', equals: 'on' } },
+                { key: 'loop_xfade_ms', label: 'Loop Xfade', type: 'float', min: 0, max: 500, step: 1,
+                  visible_if: { param: 'loop_mode', equals: 'on' } },
+            ],
+        } } }),
+        "synth:sample_path": "/s/scene.wav",
+        "synth:sample_start": "0.18", "synth:loop_mode": "on",
+        "synth:loop_start": "0.40", "synth:loop_end": "0.80", "synth:loop_xfade_ms": "20",
+    },
+
+    /* Switches: both spellings of a boolean (int 0..1 and an off/on enum) next
+     * to the near-misses — a Free/Sync pair that is a mode rather than a state,
+     * and a randomiser that becomes a trigger badge instead. */
+    switches: {
+        "synth:name": "Switches",
+        "synth:ui_hierarchy": hier([
+            { key: "osc2_sync",  label: "Osc2 Sync", type: "int",  min: 0, max: 1 },
+            { key: "legato",     label: "Legato",    type: "enum", options: ["Off", "On"] },
+            { key: "unison",     label: "Unison",    type: "int",  min: 0, max: 1 },
+            { key: "bypass",     label: "Bypass",    type: "enum", options: ["off", "on"] },
+            { key: "lfo_mode",   label: "LFO Mode",  type: "enum", options: ["Free", "Sync"] },
+            { key: "rnd_patch",  label: "Rnd Patch", type: "int",  min: 0, max: 1 },
+            { key: "cutoff",     label: "Cutoff",    type: "float", min: 0, max: 1, step: 0.01 },
+            { key: "voice_mode", label: "Voices",    type: "enum", options: ["Poly", "Mono"] },
+        ]),
+        "synth:osc2_sync": "1", "synth:legato": "Off", "synth:unison": "0",
+        "synth:bypass": "on", "synth:lfo_mode": "Sync", "synth:rnd_patch": "0",
+        "synth:cutoff": "0.5", "synth:voice_mode": "Poly",
+    },
+
+    /* Faders: loudness params next to two knobs that merely mention level-ish
+     * words, so the rule's exclusions are visible in the picture too. */
+    pan_dials: {
+        "synth:name": "Pan",
+        "synth:ui_hierarchy": hier([
+            { key: "pan",       label: "Pan",      type: "float", min: -1, max: 1, step: 0.01 },
+            { key: "v1_pan",    label: "V1 Pan",   type: "float", min: -1, max: 1, step: 0.01 },
+            { key: "pan_1",     label: "Pan 1",    type: "int",   min: 0,  max: 100, step: 1 },
+            { key: "panorama",  label: "Panorama", type: "int",   min: 0,  max: 127, step: 1 },
+            { key: "pad_pan",   label: "Pan",      type: "float", min: -1, max: 1, step: 0.01 },
+            { key: "input_pan", label: "Pan",      type: "float", min: 0,  max: 1, step: 0.01 },
+            /* The two that only SAY pan: both must still draw an arc. */
+            { key: "rnd_pan",   label: "Rnd Pan",  type: "float", min: 0,  max: 1, step: 0.01 },
+            { key: "pan_width", label: "Pan Width",type: "float", min: 0,  max: 100, step: 1 },
+        ]),
+        "synth:pan": "-1", "synth:v1_pan": "-0.5", "synth:pan_1": "25",
+        "synth:panorama": "64", "synth:pad_pan": "0.4", "synth:input_pan": "1",
+        "synth:rnd_pan": "0.35", "synth:pan_width": "60",
+    },
+
+    faders: {
+        "synth:name": "Faders",
+        "synth:ui_hierarchy": hier([
+            { key: "volume",    label: "Volume",   type: "float", min: 0, max: 1, step: 0.01 },
+            { key: "gain",      label: "Gain",     type: "float", min: 0, max: 2, step: 0.01 },
+            { key: "lvl_snare", label: "Snare",    type: "float", min: 0, max: 1, step: 0.01 },
+            { key: "sub_level", label: "Sub",      type: "float", min: 0, max: 1, step: 0.01 },
+            { key: "trim_db",   label: "Trim",     type: "float", min: -12, max: 12, step: 0.5 },
+            { key: "pre_gain",  label: "Pre Gain", type: "float", min: -60, max: 30, step: 1 },
+            { key: "cutoff",    label: "Cutoff",   type: "float", min: 0, max: 1, step: 0.01 },
+            { key: "rate",      label: "Rate",     type: "float", min: 0, max: 1, step: 0.01 },
+        ]),
+        "synth:volume": "0.75", "synth:gain": "0.3", "synth:lvl_snare": "1.0",
+        "synth:sub_level": "0", "synth:trim_db": "0", "synth:pre_gain": "-9",
+        "synth:cutoff": "0.5", "synth:rate": "0.4",
+    },
+
+    /* Low/high cut. Row 1 is the PAIR — reordered lowcut-first and drawn as one
+     * band-pass across two cells. Row 2 is the two SINGLE cases, each one cell,
+     * plus a slope and a filter mod amount that must keep their knobs. */
+    cut_filters: {
+        "synth:name": "Cuts",
+        "synth:ui_hierarchy": hier([
+            { key: "high_cut", label: "High Cut", type: "float", min: 0, max: 1, step: 0.01 },
+            { key: "low_cut",  label: "Low Cut",  type: "float", min: 0, max: 1, step: 0.01 },
+            { key: "mix",      label: "Mix",      type: "float", min: 0, max: 1, step: 0.01 },
+            { key: "width",    label: "Width",    type: "float", min: 0, max: 1, step: 0.01 },
+            { key: "hpf",      label: "HPF",      type: "float", min: 0, max: 1, step: 0.01 },
+            /* Between the two singles on purpose: adjacent lone cuts read as a
+             * false band-pass, and this scene is the doc screenshot. */
+            { key: "hp_slope", label: "HP Slope", type: "float", min: 0, max: 1, step: 0.01 },
+            { key: "lpf_only", label: "Hi Cut",   type: "float", min: 0, max: 1, step: 0.01 },
+            { key: "hpf_mg",   label: "HPF MG",   type: "float", min: -1, max: 1, step: 0.01 },
+        ]),
+        "synth:high_cut": "0.75", "synth:low_cut": "0.25",
+        "synth:mix": "0.5", "synth:width": "0.5",
+        "synth:hpf": "0.4", "synth:lpf_only": "0.6",
+        "synth:hp_slope": "0.5", "synth:hpf_mg": "0",
+    },
+
+    /* EQ band groups. Row 1 is a 3-band "smile" (low up, mid down, high up);
+     * row 2 is the 2-band case plus a crossover FREQUENCY pair that must NOT be
+     * mistaken for an EQ — it is unipolar, which is the whole test. */
+    eq_bands: {
+        "synth:name": "EQ",
+        "synth:ui_hierarchy": hier([
+            { key: "eq_mid", label: "Mid",  type: "float", min: -12, max: 12, step: 0.5 },
+            { key: "eq_hi",  label: "High", type: "float", min: -12, max: 12, step: 0.5 },
+            { key: "eq_lo",  label: "Low",  type: "float", min: -12, max: 12, step: 0.5 },
+            { key: "trim",   label: "Trim", type: "float", min: -12, max: 12, step: 0.5 },
+            { key: "drv_body", label: "Body", type: "float", min: -6, max: 6, step: 0.5 },
+            { key: "drv_air",  label: "Air",  type: "float", min: -6, max: 6, step: 0.5 },
+            { key: "low_xo",  label: "Low/Mid Hz", type: "float", min: 200, max: 1200, step: 10 },
+            { key: "high_xo", label: "Mid/Hi Hz",  type: "float", min: 1000, max: 16000, step: 100 },
+        ]),
+        "synth:eq_lo": "9", "synth:eq_mid": "-6", "synth:eq_hi": "7",
+        "synth:trim": "0",
+        "synth:drv_body": "3", "synth:drv_air": "-5",
+        "synth:low_xo": "600", "synth:high_xo": "4000",
+    },
+
+    /* Lone envelope stages. `attack` and `decay` share a qualifier, so the
+     * EXISTING envelope graphic claims them — the scene proves that precedence:
+     * only stages with no partner get the new glyph. The rest show decays
+     * across the range plus the mirrored attack, and a randomiser and a reverb
+     * tail that must keep their arcs. */
+    env_stages: {
+        "synth:name": "Stages",
+        "synth:ui_hierarchy": hier([
+            { key: "decay",      label: "Decay",      type: "float", min: 0, max: 1, step: 0.01 },
+            { key: "mod_decay",  label: "Mod Decay",  type: "float", min: 0, max: 1, step: 0.01 },
+            { key: "all_decay",  label: "All Decay",  type: "float", min: 0, max: 1, step: 0.01 },
+            { key: "lpg_decay",  label: "LPG Decay",  type: "float", min: 0, max: 1, step: 0.01 },
+            { key: "attack",     label: "Attack",     type: "float", min: 0, max: 1, step: 0.01 },
+            { key: "soft_attack", label: "Soft Attack", type: "float", min: 0, max: 1, step: 0.01 },
+            /* Not stages: a randomiser and a reverb tail must keep their arcs. */
+            { key: "decay_rnd",  label: "Decay Rnd",  type: "float", min: 0, max: 1, step: 0.01 },
+            { key: "rev_decay",  label: "Reverb Dcy", type: "float", min: 0, max: 1, step: 0.01 },
+        ]),
+        "synth:decay": "0.15", "synth:mod_decay": "0.45",
+        "synth:all_decay": "0.75", "synth:lpg_decay": "1.0",
+        "synth:attack": "0.30", "synth:soft_attack": "0.80",
+        "synth:decay_rnd": "0.50", "synth:rev_decay": "0.50",
+    },
+
+    /* OB-Xd's oscillator section: Saw and Pulse are independent on/off switches
+     * rather than one shape enum, so the cell shows WHICH waveform each switch
+     * controls (solid = sounding, dotted = not). Surge's Noise Mute is here too
+     * because its sense is inverted — ON means silent. */
+    wave_toggles: {
+        "synth:name": "OB-Xd",
+        "synth:ui_hierarchy": hier([
+            { key: "osc1_saw",   label: "Osc1 Saw",   type: "int", min: 0, max: 1, step: 1 },
+            { key: "osc1_pulse", label: "Osc1 Pulse", type: "int", min: 0, max: 1, step: 1 },
+            { key: "osc2_saw",   label: "Osc2 Saw",   type: "int", min: 0, max: 1, step: 1 },
+            { key: "osc2_pulse", label: "Osc2 Pulse", type: "int", min: 0, max: 1, step: 1 },
+            { key: "lfo_sin",    label: "LFO Sine",   type: "int", min: 0, max: 1, step: 1 },
+            { key: "lfo_square", label: "LFO Square", type: "int", min: 0, max: 1, step: 1 },
+            { key: "mute_noise", label: "Noise Mute", type: "enum", options: ["Off", "On"] },
+            { key: "cutoff",     label: "Cutoff",     type: "float", min: 0, max: 1, step: 0.01 },
+        ]),
+        "synth:osc1_saw": "1", "synth:osc1_pulse": "0",
+        "synth:osc2_saw": "0", "synth:osc2_pulse": "1",
+        "synth:lfo_sin": "1",  "synth:lfo_square": "0",
+        "synth:mute_noise": "1",   // muted → drawn dotted despite the value being ON
+        "synth:cutoff": "0.60",
+    },
+
+    /* Helm's oscillator waveform list on single knobs. The scene exists for one
+     * comparison: a stepped climb next to the SAME list's smooth Saw Up, and a
+     * stepped pyramid next to its Triangle. If the cell glyph ever loses height
+     * those pairs become pixel-identical and this baseline catches it. */
+    helm_waves: {
+        "synth:name": "Helm",
+        "synth:ui_hierarchy": hier([
+            { key: "w_step3", label: "Step 3", type: "enum", options: HELM_WAVES },
+            { key: "w_step4", label: "Step 4", type: "enum", options: HELM_WAVES },
+            { key: "w_step8", label: "Step 8", type: "enum", options: HELM_WAVES },
+            { key: "w_sawup", label: "Saw Up", type: "enum", options: HELM_WAVES },
+            { key: "w_pyr3",  label: "Pyr 3",  type: "enum", options: HELM_WAVES },
+            { key: "w_pyr5",  label: "Pyr 5",  type: "enum", options: HELM_WAVES },
+            { key: "w_pyr9",  label: "Pyr 9",  type: "enum", options: HELM_WAVES },
+            { key: "w_tri",   label: "Tri",    type: "enum", options: HELM_WAVES },
+        ]),
+        "synth:w_step3": "5", "synth:w_step4": "6", "synth:w_step8": "7",
+        "synth:w_sawup": "4",
+        "synth:w_pyr3": "8", "synth:w_pyr5": "9", "synth:w_pyr9": "10",
+        "synth:w_tri": "1",
+    },
+
+    /* Helm's LFO page: shape names ("Saw Up", "N Step", "N Pyramid") and role
+     * words ("Frequency", "Amp") the name inference had to learn. The scene
+     * overrides synth:mono_lfo_1_waveform to shoot each new silhouette. */
+    lfo_helm: {
+        "synth:name": "Helm",
+        "synth:ui_hierarchy": hier([
+            { key: "mono_lfo_1_waveform", label: "Mono LFO 1 Waveform", type: "enum",
+              options: ["Sine", "Triangle", "Square", "Saw Up", "Saw Down",
+                        "3 Step", "4 Step", "8 Step", "3 Pyramid", "5 Pyramid",
+                        "9 Pyramid", "Sample & Hold", "Sample & Glide"] },
+            { key: "mono_lfo_1_amplitude", label: "Mono LFO 1 Amp",       type: "float", min: 0, max: 1, step: 0.01 },
+            { key: "mono_lfo_1_frequency", label: "Mono LFO 1 Frequency", type: "float", min: 0, max: 1, step: 0.01 },
+            { key: "mono_lfo_1_retrigger", label: "Mono LFO 1 Retrigger", type: "enum",
+              options: ["Free", "Retrigger", "Sync to Playhead"] },
+        ]),
+        "synth:mono_lfo_1_waveform": "7",   // "8 Step" → stepped ramp (11)
+        "synth:mono_lfo_1_amplitude": "0.80", "synth:mono_lfo_1_frequency": "0.50",
+        "synth:mono_lfo_1_retrigger": "0",
+    },
+
+    // A1 filter-response viz: cutoff+resonance drawn as a curve; a same-page MODE
+    // enum morphs the shape and SLOPE picks 12/24 dB. The scene overrides
+    // synth:mode / synth:resonance / synth:slope per shot before rendering.
+    filter_demo: {
+        "synth:name": "Filter",
+        "synth:ui_hierarchy": hier([
+            { key: "cutoff",    label: "Cutoff",    type: "float", min: 0, max: 1, step: 0.01 },
+            { key: "resonance", label: "Resonance", type: "float", min: 0, max: 1, step: 0.01 },
+            { key: "drive",     label: "Drive",     type: "float", min: 0, max: 1, step: 0.01 },
+            { key: "mix",       label: "Mix",       type: "float", min: 0, max: 1, step: 0.01 },
+            { key: "mode",      label: "Mode",      type: "enum",  options: ["LP", "HP", "BP", "Notch", "Peak", "AP"] },
+            { key: "slope",     label: "Slope",     type: "enum",  options: ["12 dB", "24 dB"] },
+        ]),
+        "synth:cutoff": "0.55", "synth:resonance": "0.30", "synth:drive": "0.20",
+        "synth:mix": "1.00", "synth:mode": "0", "synth:slope": "0",
+    },
+    // A1 two curves on one page (aphex-like): lpf_cut/lpf_reso → LP on one line,
+    // hpf_cut/hpf_reso → HP on the other, both inferred from name tokens.
+    filter_dual: {
+        "synth:name": "Aphex",
+        "synth:ui_hierarchy": hier([
+            { key: "lpf_cut",  label: "LPF Cut",  type: "float", min: 0, max: 1, step: 0.01 },
+            { key: "lpf_reso", label: "LPF Peak", type: "float", min: 0, max: 1, step: 0.01 },
+            { key: "hpf_cut",  label: "HPF Cut",  type: "float", min: 0, max: 1, step: 0.01 },
+            { key: "hpf_reso", label: "HPF Peak", type: "float", min: 0, max: 1, step: 0.01 },
+            { key: "mg_freq",  label: "MG Freq",  type: "float", min: 0, max: 1, step: 0.01 },
+            { key: "depth",    label: "Depth",    type: "float", min: 0, max: 1, step: 0.01 },
+        ]),
+        "synth:lpf_cut": "0.65", "synth:lpf_reso": "0.55", "synth:hpf_cut": "0.35",
+        "synth:hpf_reso": "0.45", "synth:mg_freq": "0.50", "synth:depth": "0.40",
+    },
+
+    // A2 partial envelopes: 3-stage ASR (attack + sustain plateau + release).
+    env_asr: {
+        "synth:name": "ASR Env",
+        "synth:ui_hierarchy": hier([
+            { key: "attack",  label: "Attack",  type: "float", min: 0, max: 1, step: 0.01 },
+            { key: "sustain", label: "Sustain", type: "float", min: 0, max: 1, step: 0.01 },
+            { key: "release", label: "Release", type: "float", min: 0, max: 1, step: 0.01 },
+            { key: "tone",    label: "Tone",    type: "float", min: 0, max: 1, step: 0.01 },
+        ]),
+        "synth:attack": "0.25", "synth:sustain": "0.65", "synth:release": "0.40", "synth:tone": "0.50",
+    },
+
+    test_enum: {
+        "synth:name": "Enums",
+        "synth:ui_hierarchy": hier([
+            { key: "mode",   label: "Mode",   type: "enum",  options: ["LP", "BP", "HP", "Notch"] },
+            { key: "octave", label: "Oct",    type: "int",   min: -3, max: 3, step: 1 },
+            { key: "wave",   label: "Wave",   type: "enum",  options: ["Sine", "Saw", "Sq", "Tri", "Nse"] },
+            { key: "bits",   label: "Bits",   type: "int",   min: 1,  max: 16, step: 1 },
+            { key: "cutoff", label: "Cut",    type: "float", min: 0,  max: 1,  step: 0.01 },
+            { key: "res",    label: "Res",    type: "float", min: 0,  max: 1,  step: 0.01 },
+            { key: "env",    label: "Env",    type: "float", min: -1, max: 1,  step: 0.01 },
+            { key: "vel",    label: "Vel",    type: "float", min: 0,  max: 1,  step: 0.01 },
+        ]),
+        "synth:mode":   "0",
+        "synth:octave": "0",
+        "synth:wave":   "1",
+        "synth:bits":   "16",
+        "synth:cutoff": "0.70",
+        "synth:res":    "0.20",
+        "synth:env":    "0.30",
+        "synth:vel":    "0.50",
+    },
+
+    /* Step cells (model/step-labels.ts) beside the neighbours that must NOT
+     * become one. Octaves sit off zero so the sign is actually visible: no other
+     * baseline catches a "+2" turning into a "2". */
+    test_steps: {
+        "synth:name": "Steps",
+        "synth:ui_hierarchy": hier([
+            { key: "octave",      label: "Oct",   type: "int", min: -3, max: 3, step: 1 },
+            { key: "osc1_range",  label: "Rng",   type: "int", min: -2, max: 2, step: 1 },
+            { key: "arp_octaves", label: "ArpOc", type: "int", min: 1,  max: 4, step: 1 },
+            { key: "voice_count", label: "Voice", type: "int", min: 1,  max: 8, step: 1 },
+            // Not step cells: a mode with a narrow range, a wide count, a
+            // toggle, and a float. These stay an arc, an arc, a bar and an arc.
+            { key: "legato",      label: "Legat", type: "int", min: 0,  max: 3, step: 1 },
+            { key: "bend_range",  label: "Bend",  type: "int", min: 0,  max: 1, step: 1 },
+            { key: "unison_det",  label: "Detun", type: "int", min: 0,  max: 100, step: 1 },
+            { key: "cutoff",      label: "Cut",   type: "float", min: 0, max: 1, step: 0.01 },
+        ]),
+        "synth:octave":      "2",
+        "synth:osc1_range":  "-1",
+        "synth:arp_octaves": "3",
+        "synth:voice_count": "6",
+        "synth:legato":      "2",
+        "synth:bend_range":  "1",
+        "synth:unison_det":  "40",
+        "synth:cutoff":      "0.60",
+    },
+
+    /* Name-based enums (like the arp midi_fx): get/set speak the option NAME,
+     * not the index. `division` has >6 options → opens the overlay. */
+    name_enum: {
+        "synth:name": "ArpLike",
+        "synth:ui_hierarchy": hier([
+            { key: "division", label: "Div",  type: "enum",
+              options: ["1/4.", "1/4", "1/4T", "1/8.", "1/8", "1/8T", "1/16.", "1/16", "1/16T", "1/32"] },
+            { key: "sync",     label: "Sync", type: "enum", options: ["internal", "clock"] },
+        ]),
+        "synth:division": "1/8",   // name string (index 4), not "4"
+        "synth:sync":     "internal",
+    },
+
+    /* Index-based enum with >6 options (overlay) — the majority case; the value
+     * is reported/accepted as a numeric index. Must keep working unchanged. */
+    index_enum: {
+        "synth:name": "IdxSynth",
+        "synth:ui_hierarchy": hier([
+            { key: "model", label: "Model", type: "enum",
+              options: ["VA", "Phase", "Wave", "String", "VirtAn", "Shape", "FM", "Gran"] },
+            { key: "cutoff", label: "Cut", type: "float", min: 0, max: 1, step: 0.01 },
+        ]),
+        "synth:model":  "2",   // index string (→ "Wave"), not a name
+        "synth:cutoff": "0.50",
+    },
+
+    plaits: {
+        "synth:name":   "Plaits",
+        "synth:module": "plaits",
+        "synth:ui_hierarchy": hierFull(
+            ["engine","harmonics","timbre","morph","decay","lpg_colour","fm_amount","aux_mix"],
+            [
+                { key: "engine",               label: "Engine",    type: "enum" },
+                { key: "harmonics",            label: "Harmonics" },
+                { key: "timbre",               label: "Timbre" },
+                { key: "morph",                label: "Morph" },
+                { key: "decay",                label: "Decay" },
+                { key: "lpg_colour",           label: "LPG Color" },
+                { key: "fm_amount",            label: "FM Amount" },
+                { key: "aux_mix",              label: "Aux Mix" },
+                { key: "attack",               label: "Attack" },
+                { key: "timbre_mod",           label: "Timbre Mod" },
+                { key: "morph_mod",            label: "Morph Mod" },
+                { key: "legato",               label: "Legato",    type: "enum" },
+                { key: "velocity_sensitivity", label: "Vel Sens" },
+                { key: "octave_transpose",     label: "Octave" },
+            ]
+        ),
+        "synth:chain_params": JSON.stringify([
+            { key: "engine",    name: "Engine",    type: "enum",
+              options: ["VA VCF","Phase Dist","6-Op I","6-Op II","6-Op III",
+                        "Wave Terr","Str Mach","Chiptune","V. Analog","Waveshape",
+                        "FM","Grain","Additive","Wavetable","Chord","Speech",
+                        "Swarm","Noise","Particle","String","Modal",
+                        "Bass Drum","Snare Drum","Hi-Hat"],
+              default: "VA VCF", refreshes_labels: true },
+            { key: "harmonics", name: "Harmonics", type: "float", min: 0, max: 1, step: 0.01, default: 0.5 },
+            { key: "timbre",    name: "Timbre",    type: "float", min: 0, max: 1, step: 0.01, default: 0.5 },
+            { key: "morph",     name: "Morph",     type: "float", min: 0, max: 1, step: 0.01, default: 0.5 },
+            { key: "decay",     name: "Decay",     type: "float", min: 0, max: 1, step: 0.01, default: 0.5 },
+            { key: "lpg_colour",name: "LPG Color", type: "float", min: 0, max: 1, step: 0.01, default: 0.5 },
+            { key: "fm_amount", name: "FM",        type: "float", min: 0, max: 1, step: 0.01, default: 0   },
+            { key: "aux_mix",   name: "Mix",       type: "float", min: 0, max: 1, step: 0.01, default: 0   },
+            { key: "attack",    name: "Attack",    type: "float", min: 0, max: 1, step: 0.01, default: 0   },
+            { key: "timbre_mod",name: "Timbre Mod",type: "float", min: 0, max: 1, step: 0.01, default: 0   },
+            { key: "morph_mod", name: "Morph Mod", type: "float", min: 0, max: 1, step: 0.01, default: 0   },
+            { key: "legato",    name: "Legato",    type: "enum",  options: ["off","on"],        default: "off" },
+            { key: "velocity_sensitivity", name: "Vel Sens", type: "float", min: 0, max: 1, step: 0.01, default: 0.5 },
+            { key: "octave_transpose",     name: "Octave",   type: "int",   min: -3, max: 3,             default: 0   },
+        ]),
+        "synth:engine":               "0",
+        "synth:harmonics":            "0.5",
+        "synth:timbre":               "0.5",
+        "synth:morph":                "0.5",
+        "synth:decay":                "0.5",
+        "synth:lpg_colour":           "0.5",
+        "synth:fm_amount":            "0.0",
+        "synth:aux_mix":              "0.0",
+        "synth:attack":               "0.0",
+        "synth:timbre_mod":           "0.0",
+        "synth:morph_mod":            "0.0",
+        "synth:legato":               "0",
+        "synth:velocity_sensitivity": "0.5",
+        "synth:octave_transpose":     "0",
+    },
+
+    wurl: {
+        "synth:name":   "Wurl",
+        "synth:module": "wurl",
+        "synth:ui_hierarchy": hierFull(
+            ["volume","tremolo","attack","decay","brightness","darken","bark","reverb"],
+            [
+                { key: "volume",     label: "Volume" },
+                { key: "tremolo",    label: "Tremolo" },
+                { key: "attack",     label: "Attack" },
+                { key: "decay",      label: "Decay" },
+                { key: "brightness", label: "Brightness" },
+                { key: "darken",     label: "Darken" },
+                { key: "bark",       label: "Bark" },
+                { key: "reverb",     label: "Reverb" },
+                { key: "speaker",    label: "Speaker" },
+                { key: "tune",       label: "Tune" },
+            ]
+        ),
+        "synth:chain_params": JSON.stringify([
+            { key: "volume",     name: "Volume",     type: "float", min: 0, max: 1, step: 0.01 },
+            { key: "tremolo",    name: "Tremolo",    type: "float", min: 0, max: 1, step: 0.01 },
+            { key: "attack",     name: "Attack",     type: "float", min: 0, max: 1, step: 0.01 },
+            { key: "decay",      name: "Decay",      type: "float", min: 0, max: 1, step: 0.01 },
+            { key: "brightness", name: "Bright",     type: "float", min: 0, max: 1, step: 0.01 },
+            { key: "darken",     name: "Darken",     type: "float", min: 0, max: 1, step: 0.01 },
+            { key: "bark",       name: "Bark",       type: "float", min: 0, max: 1, step: 0.01 },
+            { key: "reverb",     name: "Reverb",     type: "float", min: 0, max: 1, step: 0.01 },
+            { key: "speaker",    name: "Speaker",    type: "float", min: 0, max: 1, step: 0.01 },
+            { key: "tune",       name: "Tune",       type: "float", min: 0, max: 1, step: 0.01 },
+        ]),
+        "synth:volume":     "0.8",
+        "synth:tremolo":    "0.0",
+        "synth:attack":     "0.05",
+        "synth:decay":      "0.6",
+        "synth:brightness": "0.5",
+        "synth:darken":     "0.3",
+        "synth:bark":       "0.4",
+        "synth:reverb":     "0.3",
+        "synth:speaker":    "0.5",
+        "synth:tune":       "0.5",
+    },
+
+    /* helm's shape: root's own nav list holds only an empty items-picker
+     * level; the real categories hang off root.children. */
+    hier_children_nav: {
+        "synth:name": "ChildNav",
+        "synth:ui_hierarchy": JSON.stringify({
+            levels: {
+                root: {
+                    children: "main",
+                    knobs: ["cutoff", "reso"],
+                    params: [{ level: "jump", label: "Jump to Category" }],
+                },
+                jump: { knobs: [], params: [] },
+                main: {
+                    children: null,
+                    knobs: ["cutoff", "reso"],
+                    params: [
+                        { level: "osc",  label: "Oscillator" },
+                        { level: "filt", label: "Filter" },
+                    ],
+                },
+                osc:  { knobs: ["osc_wave", "osc_tune"] },
+                filt: { knobs: ["filt_a", "filt_b"] },
+            },
+        }),
+        "synth:chain_params": JSON.stringify([
+            { key: "cutoff",   name: "Cutoff", type: "float", min: 0, max: 1 },
+            { key: "reso",     name: "Reso",   type: "float", min: 0, max: 1 },
+            { key: "osc_wave", name: "Wave",   type: "float", min: 0, max: 1 },
+            { key: "osc_tune", name: "Tune",   type: "float", min: 0, max: 1 },
+            { key: "filt_a",   name: "Filt A", type: "float", min: 0, max: 1 },
+            { key: "filt_b",   name: "Filt B", type: "float", min: 0, max: 1 },
+        ]),
+    },
+
+    /* dexed's shape: a level with BOTH knobs and sub-levels. */
+    hier_knobs_and_children: {
+        "synth:name": "KnobsKids",
+        "synth:ui_hierarchy": JSON.stringify({
+            levels: {
+                root: { knobs: ["vol"], params: [{ level: "ops", label: "Operators" }] },
+                ops:  { knobs: ["op_sel"], params: [{ level: "op1", label: "Operator 1" }] },
+                op1:  { knobs: ["op1_lvl"], params: [{ level: "op1_eg", label: "Envelope" }] },
+                op1_eg: { label: "Op1 Envelope", knobs: ["op1_atk", "op1_dec"] },
+            },
+        }),
+        "synth:chain_params": JSON.stringify([
+            { key: "vol",     name: "Vol",   type: "float", min: 0, max: 1 },
+            { key: "op_sel",  name: "Sel",   type: "int",   min: 0, max: 5 },
+            { key: "op1_lvl", name: "Level", type: "float", min: 0, max: 1 },
+            { key: "op1_atk", name: "Atk",   type: "float", min: 0, max: 1 },
+            { key: "op1_dec", name: "Dec",   type: "float", min: 0, max: 1 },
+        ]),
+    },
+
+    /* A level whose knob list exactly copies root's — one page, not two. */
+    hier_alias_level: {
+        "synth:name": "AliasDup",
+        "synth:ui_hierarchy": JSON.stringify({
+            levels: {
+                root:  { children: "patch", knobs: ["a", "b"] },
+                patch: { label: "Patch", knobs: ["a", "b"], params: [{ level: "deep", label: "Deep" }] },
+                deep:  { knobs: ["c"] },
+            },
+        }),
+        "synth:chain_params": JSON.stringify([
+            { key: "a", name: "A", type: "float", min: 0, max: 1 },
+            { key: "b", name: "B", type: "float", min: 0, max: 1 },
+            { key: "c", name: "C", type: "float", min: 0, max: 1 },
+        ]),
+    },
+
+    /* A level with knobs that nothing links to — swept in at the end. */
+    hier_orphan_level: {
+        "synth:name": "Orphan",
+        "synth:ui_hierarchy": JSON.stringify({
+            levels: {
+                root: { knobs: ["a"] },
+                perf: { label: "Perf", knobs: ["p1", "p2"] },
+            },
+        }),
+        "synth:chain_params": JSON.stringify([
+            { key: "a",  name: "A",  type: "float", min: 0, max: 1 },
+            { key: "p1", name: "P1", type: "float", min: 0, max: 1 },
+            { key: "p2", name: "P2", type: "float", min: 0, max: 1 },
+        ]),
+    },
+
+    /* A level whose params[] list is richer than its knobs[] row — the osirus
+     * shape. `bank_index` is degenerate (min==max) so it must NOT be rendered;
+     * `ui_scroll` is internal state; `dupe` is already a knob on root. */
+    hier_params_extras: {
+        "synth:name": "Extras",
+        "synth:chain_params": JSON.stringify([
+            { key: "cutoff",     name: "Cutoff",    type: "int", min: 0, max: 127 },
+            { key: "dupe",       name: "Dupe",      type: "int", min: 0, max: 127 },
+            { key: "pw",         name: "Osc1 PW",   type: "int", min: 0, max: 127 },
+            { key: "wave",       name: "Osc1 Wave", type: "enum", options: ["Sine", "Saw"] },
+            { key: "semi",       name: "Osc1 Semi", type: "int", min: 16, max: 112 },
+            { key: "bank_index", name: "Bank",      type: "int", min: 0, max: 0 },
+            { key: "ui_scroll",  name: "Scroll",    type: "int", min: 0, max: 9 },
+            { key: "rom",        name: "ROM",       type: "enum", options: ["A", "B", "C"] },
+            { key: "view",       name: "Visual Edit", type: "canvas" },
+        ]),
+        "synth:ui_hierarchy": JSON.stringify({
+            levels: {
+                root: {
+                    knobs: ["cutoff", "dupe"],
+                    params: [
+                        { key: "bank_index", label: "Bank" },
+                        { key: "ui_scroll",  label: "Scroll" },
+                        { key: "view",       label: "Visual Edit" },
+                        { level: "osc",      label: "Oscillators" },
+                        { level: "settings", label: "Settings" },
+                    ],
+                },
+                osc: {
+                    knobs: ["pw"],
+                    params: [
+                        { key: "pw",   label: "Osc1 PW" },
+                        { key: "wave", label: "Osc1 Wave" },
+                        { key: "semi", label: "Osc1 Semi" },
+                        { key: "dupe", label: "Dupe" },
+                    ],
+                },
+                settings: { knobs: [], params: [{ key: "rom", label: "ROM" }] },
+            },
+        }),
+        "synth:cutoff": "64", "synth:dupe": "0", "synth:pw": "0",
+        "synth:wave": "0", "synth:semi": "64", "synth:bank_index": "0",
+        "synth:ui_scroll": "0", "synth:rom": "0",
+    },
+
+    /* Ten keys on one level → two pages: bare name, then " - 2". */
+    hier_params_overflow: {
+        "synth:name": "Overflow",
+        "synth:chain_params": JSON.stringify(
+            ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"].map(k =>
+                ({ key: k, name: k.toUpperCase(), type: "int", min: 0, max: 127 })),
+        ),
+        "synth:ui_hierarchy": JSON.stringify({
+            levels: {
+                root: {
+                    knobs: ["a", "b"],
+                    params: ["c", "d", "e", "f", "g", "h", "i", "j"].map(k => ({ key: k, label: k })),
+                },
+            },
+        }),
+        ...Object.fromEntries(["a","b","c","d","e","f","g","h","i","j"].map(k => [`synth:${k}`, "0"])),
+    },
+
+    /* surge's shape: 50 pages across 30 banks (20 banks of two pages, 10 of one). */
+    hier_surge_pages: multiLevel('SurgeLike',
+        [...Array(20).fill(16), ...Array(10).fill(8)]),
+
+    /* minijv's shape: 70 pages across 51 banks (19 banks of two pages, 32 of one). */
+    hier_dense_pages: multiLevel('Dense',
+        [...Array(19).fill(16), ...Array(32).fill(8)]),
+
+    /* osirus's shape: 25 pages across 13 banks. */
+    hier_grouped_pages: multiLevel('Grouped',
+        [...Array(12).fill(16), ...Array(1).fill(8)]),
+
+    /* osirus's shape mid-ROM-load: the preset list is empty and the ROM enum
+     * carries a single "(loading)" option. env.setParams() rewrites these
+     * mid-test to simulate the ROM landing. */
+    hier_async_meta: {
+        "synth:name": "Loader",
+        "synth:chain_params": JSON.stringify([
+            { key: "cutoff", name: "Cutoff", type: "int", min: 0, max: 127 },
+            { key: "rom",    name: "ROM",    type: "enum", options: ["(loading)"] },
+        ]),
+        "synth:ui_hierarchy": JSON.stringify({
+            levels: {
+                root: {
+                    list_param: "preset", count_param: "preset_count", name_param: "preset_name",
+                    knobs: ["cutoff"],
+                    params: [{ key: "rom", label: "ROM" }],
+                },
+            },
+        }),
+        "synth:preset_count": "0",
+        "synth:cutoff": "64",
+        "synth:rom": "0",
+    },
+
+    /* 200 params on one level → 25 pages. Big enough that a whole-array refresh
+     * cursor takes ~200 ticks to reach a late page (minijv is this shape). */
+    hier_many_pages: {
+        "synth:name": "Many",
+        "synth:chain_params": JSON.stringify(
+            Array.from({ length: 200 }, (_, i) =>
+                ({ key: `p${i}`, name: `P${i}`, type: "int", min: 0, max: 127 })),
+        ),
+        "synth:ui_hierarchy": JSON.stringify({
+            levels: {
+                root: {
+                    knobs: ["p0", "p1"],
+                    params: Array.from({ length: 200 }, (_, i) => ({ key: `p${i}`, label: `P${i}` })),
+                },
+            },
+        }),
+        ...Object.fromEntries(Array.from({ length: 200 }, (_, i) => [`synth:p${i}`, "0"])),
+    },
+
+    /* Two levels, the first spanning two pages — the shape shift+jog exists for. */
+    hier_params_overflow_two_levels: {
+        "synth:name": "Groups",
+        "synth:chain_params": JSON.stringify(
+            ["a","b","c","d","e","f","g","h","i","j","k"].map(x =>
+                ({ key: x, name: x.toUpperCase(), type: "int", min: 0, max: 127 })),
+        ),
+        "synth:ui_hierarchy": JSON.stringify({
+            levels: {
+                root: {
+                    knobs: ["a", "b"],
+                    params: [
+                        ...["c","d","e","f","g","h","i","j"].map(x => ({ key: x, label: x })),
+                        { level: "fx", label: "Effects" },
+                    ],
+                },
+                fx: { knobs: ["k"], params: [{ key: "k", label: "k" }] },
+            },
+        }),
+        ...Object.fromEntries(["a","b","c","d","e","f","g","h","i","j","k"]
+            .map(x => [`synth:${x}`, "0"])),
+    },
+
+    /* jp8000's Performance-page shape (SP-25): a level that owns a page and
+     * declares distinct short_names for its keys, plus sibling levels visited
+     * LATER (so they write LAST into a hierarchy-wide flattened map) that
+     * redeclare the same keys with a colliding short_name. `main`'s own page
+     * must keep its own KeyMd/ArpMd rather than reading whichever level's def
+     * happened to be absorbed last. */
+    level_shadowed_short_name: {
+        "synth:name": "ShadowTest",
+        "synth:ui_hierarchy": JSON.stringify({
+            levels: {
+                root: {
+                    params: [
+                        { label: "Main",  level: "main"  },
+                        { label: "Setup", level: "setup" },
+                        { label: "Arp",   level: "arp"   },
+                    ],
+                },
+                main: {
+                    name: "Main",
+                    knobs: ["key_mode", "arp_mode"],
+                    params: [
+                        { key: "key_mode", label: "Key Mode", short_name: "KeyMd" },
+                        { key: "arp_mode", label: "Arp Mode", short_name: "ArpMd" },
+                    ],
+                },
+                setup: {
+                    name: "Setup",
+                    knobs: ["key_mode"],
+                    params: [{ key: "key_mode", label: "Key Mode", short_name: "Mode" }],
+                },
+                arp: {
+                    name: "Arp",
+                    knobs: ["arp_mode"],
+                    params: [{ key: "arp_mode", label: "Arp Mode", short_name: "Mode" }],
+                },
+            },
+        }),
+        "synth:chain_params": JSON.stringify([
+            { key: "key_mode", name: "Key Mode", type: "enum", options: ["A", "B"] },
+            { key: "arp_mode", name: "Arp Mode", type: "enum", options: ["X", "Y"] },
+        ]),
+        "synth:key_mode": "0", "synth:arp_mode": "0",
+    },
+
+    nav_levels: {
+        "synth:name": "NavTest",
+        "synth:ui_hierarchy": JSON.stringify({
+            levels: {
+                root: {
+                    knobs: ["main_a", "main_b"],
+                    params: [
+                        { label: "Main", level: "main" },
+                        { label: "Mod",  level: "mod"  },
+                    ],
+                },
+                main: {
+                    name: "Main",
+                    knobs: ["main_a", "main_b", "main_c", "main_d"],
+                },
+                mod: {
+                    name: "Mod",
+                    params: [
+                        { label: "Pitch", level: "pitch_mod" },
+                        { label: "Filt",  level: "filt_mod"  },
+                    ],
+                },
+                pitch_mod: {
+                    name: "Pitch",
+                    knobs: ["pm_lfo", "pm_env", "pm_vel"],
+                },
+                filt_mod: {
+                    name: "Filter",
+                    knobs: ["fm_lfo", "fm_env", "fm_vel"],
+                },
+            },
+        }),
+        "synth:chain_params": JSON.stringify([
+            { key: "main_a", name: "Main A", type: "float", min: 0, max: 1 },
+            { key: "main_b", name: "Main B", type: "float", min: 0, max: 1 },
+            { key: "main_c", name: "Main C", type: "float", min: 0, max: 1 },
+            { key: "main_d", name: "Main D", type: "float", min: 0, max: 1 },
+            { key: "pm_lfo", name: "LFO",    type: "float", min: -1, max: 1 },
+            { key: "pm_env", name: "Env",    type: "float", min: -1, max: 1 },
+            { key: "pm_vel", name: "Vel",    type: "float", min: -1, max: 1 },
+            { key: "fm_lfo", name: "LFO",    type: "float", min: -1, max: 1 },
+            { key: "fm_env", name: "Env",    type: "float", min: -1, max: 1 },
+            { key: "fm_vel", name: "Vel",    type: "float", min: -1, max: 1 },
+        ]),
+        "synth:main_a": "0.5", "synth:main_b": "0.5",
+        "synth:main_c": "0.5", "synth:main_d": "0.5",
+        "synth:pm_lfo": "0.0", "synth:pm_env": "0.0", "synth:pm_vel": "0.0",
+        "synth:fm_lfo": "0.0", "synth:fm_env": "0.0", "synth:fm_vel": "0.0",
+    },
+
+    /* quark 0.5.0's shape: a level whose knobs leave a slot empty with a
+     * literal null (its Melody page, knob 4). */
+    null_knob: {
+        "synth:name": "NullKnob",
+        "synth:ui_hierarchy": JSON.stringify({
+            levels: {
+                root: {
+                    knobs: ["nk_a", "nk_b", null, "nk_c"],
+                    params: ["nk_a", "nk_b", null, "nk_c"],
+                },
+            },
+        }),
+        "synth:chain_params": JSON.stringify([
+            { key: "nk_a", name: "A", type: "float", min: 0, max: 1 },
+            { key: "nk_b", name: "B", type: "float", min: 0, max: 1 },
+            { key: "nk_c", name: "C", type: "float", min: 0, max: 1 },
+        ]),
+        "synth:nk_a": "0.5", "synth:nk_b": "0.5", "synth:nk_c": "0.5",
+    },
+
+    moog: {
+        "synth:name":          "RaffoSynth",
+        "synth:preset_count":  "14",
+        "synth:ui_hierarchy":  JSON.stringify({ levels: {
+            root: {
+                children:    "main",
+                list_param:  "preset",
+                count_param: "preset_count",
+                name_param:  "preset_name",
+                knobs: ["cutoff","resonance","contour","key_follow","attack","decay","sustain","release"],
+                params: [],
+            },
+            main: {
+                params: [
+                    { level: "osc1",        label: "Oscillator 1" },
+                    { level: "osc2",        label: "Oscillator 2" },
+                    { level: "osc3",        label: "Oscillator 3" },
+                    { level: "osc4",        label: "Oscillator 4" },
+                    { level: "mixer",       label: "Mixer"        },
+                    { level: "filter",      label: "Filter"       },
+                    { level: "filt_env",    label: "Filter Env"   },
+                    { level: "amp_env",     label: "Amp Env"      },
+                    { level: "lfo",         label: "LFO"          },
+                    { level: "performance", label: "Performance"  },
+                ],
+            },
+            osc1:        { knobs: ["osc1_wave","osc1_volume","osc1_range","noise"]       },
+            osc2:        { knobs: ["osc2_wave","osc2_volume","osc2_range","osc2_detune"] },
+            osc3:        { knobs: ["osc3_wave","osc3_volume","osc3_range","osc3_detune"] },
+            osc4:        { knobs: ["osc4_wave","osc4_volume","osc4_range","osc4_detune"] },
+            mixer:       { knobs: ["glide","volume"]                                     },
+            filter:      { knobs: ["cutoff","resonance","contour","key_follow"]          },
+            filt_env:    { knobs: ["f_attack","f_decay","f_sustain","f_release"]         },
+            amp_env:     { knobs: ["attack","decay","sustain","release"]                 },
+            lfo:         { knobs: ["lfo_rate","lfo_pitch","lfo_filter","mod_filter"]     },
+            performance: { knobs: ["mod_pitch","bend_range","vel_sens"]                  },
+        }}),
+        "synth:chain_params": JSON.stringify([
+            { key: "osc1_wave",   name: "Osc1 Wave",   type: "int",   min: 0,  max: 3  },
+            { key: "osc1_volume", name: "Osc1 Volume", type: "float", min: 0,  max: 1  },
+            { key: "osc1_range",  name: "Osc1 Range",  type: "int",   min: -2, max: 2  },
+            { key: "osc2_wave",   name: "Osc2 Wave",   type: "int",   min: 0,  max: 3  },
+            { key: "osc2_volume", name: "Osc2 Volume", type: "float", min: 0,  max: 1  },
+            { key: "osc2_range",  name: "Osc2 Range",  type: "int",   min: -2, max: 2  },
+            { key: "osc2_detune", name: "Osc2 Detune", type: "float", min: 0,  max: 1  },
+            { key: "osc3_wave",   name: "Osc3 Wave",   type: "int",   min: 0,  max: 3  },
+            { key: "osc3_volume", name: "Osc3 Volume", type: "float", min: 0,  max: 1  },
+            { key: "osc3_range",  name: "Osc3 Range",  type: "int",   min: -2, max: 2  },
+            { key: "osc3_detune", name: "Osc3 Detune", type: "float", min: 0,  max: 1  },
+            { key: "osc4_wave",   name: "Osc4 Wave",   type: "int",   min: 0,  max: 3  },
+            { key: "osc4_volume", name: "Osc4 Volume", type: "float", min: 0,  max: 1  },
+            { key: "osc4_range",  name: "Osc4 Range",  type: "int",   min: -2, max: 2  },
+            { key: "osc4_detune", name: "Osc4 Detune", type: "float", min: 0,  max: 1  },
+            { key: "noise",       name: "Noise",       type: "float", min: 0,  max: 1  },
+            { key: "cutoff",      name: "Cutoff",      type: "float", min: 0,  max: 1  },
+            { key: "resonance",   name: "Resonance",   type: "float", min: 0,  max: 1  },
+            { key: "contour",     name: "Contour",     type: "float", min: 0,  max: 1  },
+            { key: "key_follow",  name: "Key Follow",  type: "float", min: 0,  max: 1  },
+            { key: "attack",      name: "Attack",      type: "float", min: 0,  max: 1  },
+            { key: "decay",       name: "Decay",       type: "float", min: 0,  max: 1  },
+            { key: "sustain",     name: "Sustain",     type: "float", min: 0,  max: 1  },
+            { key: "release",     name: "Release",     type: "float", min: 0,  max: 1  },
+            { key: "f_attack",    name: "F Attack",    type: "float", min: 0,  max: 1  },
+            { key: "f_decay",     name: "F Decay",     type: "float", min: 0,  max: 1  },
+            { key: "f_sustain",   name: "F Sustain",   type: "float", min: 0,  max: 1  },
+            { key: "f_release",   name: "F Release",   type: "float", min: 0,  max: 1  },
+            { key: "glide",       name: "Glide",       type: "float", min: 0,  max: 1  },
+            { key: "volume",      name: "Volume",      type: "float", min: 0,  max: 1  },
+            { key: "lfo_rate",    name: "LFO Rate",    type: "float", min: 0,  max: 1  },
+            { key: "lfo_pitch",   name: "LFO>Pitch",   type: "float", min: 0,  max: 1  },
+            { key: "lfo_filter",  name: "LFO>Filter",  type: "float", min: 0,  max: 1  },
+            { key: "mod_filter",  name: "Mod>Filter",  type: "float", min: 0,  max: 1  },
+            { key: "mod_pitch",   name: "Mod>Pitch",   type: "float", min: 0,  max: 1  },
+            { key: "bend_range",  name: "Bend Range",  type: "float", min: 0,  max: 1  },
+            { key: "vel_sens",    name: "Vel Sens",    type: "float", min: 0,  max: 1  },
+        ]),
+        ...Object.fromEntries([
+            "osc1_wave","osc1_volume","osc1_range","osc2_wave","osc2_volume","osc2_range",
+            "osc2_detune","osc3_wave","osc3_volume","osc3_range","osc3_detune","osc4_wave",
+            "osc4_volume","osc4_range","osc4_detune","noise","cutoff","resonance","contour",
+            "key_follow","attack","decay","sustain","release","f_attack","f_decay","f_sustain",
+            "f_release","glide","volume","lfo_rate","lfo_pitch","lfo_filter","mod_filter",
+            "mod_pitch","bend_range","vel_sens",
+        ].map(k => [`synth:${k}`, "0.5"])),
+    },
+
+    /* Granny-style: filepath in chain_params but NOT in any level's knobs array */
+    granny_like: {
+        "synth:name": "GrannyTest",
+        "synth:chain_params": JSON.stringify([
+            { key: "sample_path", name: "Sample File", type: "filepath",
+              root: "/data/UserData/UserLibrary/Samples", filter: ".wav" },
+            { key: "position", name: "Position", type: "float", min: 0, max: 1, step: 0.01 },
+            { key: "size_ms",  name: "Size",     type: "float", min: 5, max: 500, step: 0.5  },
+        ]),
+        "synth:ui_hierarchy": JSON.stringify({ levels: { root: {
+            knobs: ["position", "size_ms"],
+        }}}),
+        "synth:sample_path": "/data/UserData/UserLibrary/Samples/loop.wav",
+        "synth:position":    "0.2",
+        "synth:size_ms":     "100",
+    },
+
+    /* slicer-shaped, second half: the DSP serves no ui_hierarchy at all (a
+     * synth slot's comes from the plugin alone) and its chain_params omits the
+     * sample browser the module.json declares. */
+    module_json_hier: {
+        "synth:name":         "SlicerTest",
+        "synth_module":       "manifest-only",
+        "synth:ui_hierarchy": "{}",
+        "synth:chain_params": JSON.stringify([
+            { key: "threshold", name: "Sensitivity", type: "float", min: 0, max: 1 },
+        ]),
+        "synth:sample_path": "",
+        "synth:threshold":   "0.5",
+    },
+
+    /* slicer-shaped: the module publishes chain_params, but its filepath param
+     * is described only by the ui_hierarchy — root/filter/start_path live
+     * there, which is where module.json-declared browsers put them. */
+    hier_file_param: {
+        "synth:name": "SlicerTest",
+        "synth:chain_params": JSON.stringify([
+            { key: "pitch", name: "Pitch", type: "float", min: -24, max: 24, step: 0.5 },
+        ]),
+        "synth:ui_hierarchy": JSON.stringify({ levels: { root: {
+            knobs: ["sample_path", "pitch"],
+            params: [
+                { key: "sample_path", label: "Sample", type: "filepath",
+                  root: "/data/UserData/UserLibrary",
+                  filter: [".wav", ".aif"],
+                  start_path: "/data/UserData/UserLibrary/Samples" },
+            ],
+        }}}),
+        "synth:sample_path": "",
+        "synth:pitch":       "0",
+    },
+
+    file_param: {
+        "synth:name": "SamplerTest",
+        "synth:chain_params": JSON.stringify([
+            { key: "sample", name: "Sample", type: "filepath",
+              root: "/data/UserData/Samples", filter: [".wav"],
+              start_path: "/data/UserData/Samples" },
+            { key: "vol", name: "Volume", type: "float", min: 0, max: 1, step: 0.01 },
+        ]),
+        "synth:ui_hierarchy": JSON.stringify({ levels: { root: {
+            knobs: ["sample", "vol"],
+        }}}),
+        "synth:sample": "/data/UserData/Samples/kick.wav",
+        "synth:vol":    "0.8",
+    },
+
+    /* 9W9 (TR-909 style): one circuit per voice, so params are named after the
+     * VOICE (bd_c_tune, ohh_pitch) and the sampled cymbals have no Drive or
+     * Distortion at all. Nothing a {pad}-number template can address. Values
+     * differ per voice so a test can prove which key a knob actually reached.
+     * The hi-hat has Drive but no pitch-envelope depth — only the five circuit
+     * voices have one.
+     *
+     * Serves both layouts, since the keys are the module's either way: movy's
+     * bundled `src/modules/9w9.json` (a page per voice, each naming its pad —
+     * bundled because 9W9's own config predates the voice-run rule) and
+     * `padkeys-movy-config.json` (the pre-2.0 padSpecific layout, kept under
+     * MOCK_SYNTHS.padkeys below). */
+    nw9: {
+        "synth:name":           "9W9",
+        "synth_module":         "9w9",
+        "synth:chain_params": JSON.stringify([
+            { key: "bd_c_dist_type", name: "Distortion", type: "enum",
+              options: ["Diode (909)", "Hard Clip", "Wavefolder", "Bitcrush"] },
+        ]),
+        "synth:bd_c_tune":      "10",
+        "synth:bd_c_sweep_depth": "14",
+        "synth:bd_c_decay":     "11",
+        "synth:bd_c_drive":     "12",
+        "synth:bd_c_dist_type": "Hard Clip",
+        "synth:bd_c_level":     "13",
+        "synth:sd_c_tune":      "20",
+        "synth:sd_c_decay":     "21",
+        /* Pads 8 and 9 are the same hi-hat circuit with two decay knobs — the
+         * case a per-pad template cannot express at all. */
+        "synth:ohh_pitch":         "80",
+        "synth:ohh_decay_closed":  "81",
+        "synth:ohh_decay":         "91",
+        "synth:ohh_volume":        "82",
+        "synth:ohh_drive":         "83",
+    },
+
+    mrdrums: {
+        "synth:name":             "MrDrums",
+        "synth_module":           "mrdrums",
+        "synth:ui_current_pad":   "5",
+        /* The pad_mode alias is the only entry the config leans on the module
+         * for: its option list is deliberately NOT hardcoded in mrdrums.json so
+         * it can never drift from what the DSP will actually parse. */
+        "synth:chain_params": JSON.stringify([
+            { key: "pad_mode", name: "Mode", type: "enum", options: ["gate", "oneshot"] },
+        ]),
+        "synth:pad_vol":          "0.80",
+        "synth:pad_pan":          "0.00",
+        "synth:pad_tune":         "0.00",
+        "synth:pad_start":        "0.00",
+        "synth:pad_attack_ms":    "0.00",
+        "synth:pad_decay_ms":     "250.0",
+        "synth:pad_mode":         "oneshot",
+        "synth:g_master_vol":     "1.0",
+        "synth:g_polyphony":      "16",
+        /* Concrete per-pad keys movy addresses directly (focused-pad scoping). */
+        "synth:p01_vol":          "0.10",
+        /* The pad's sample start. Present so a knob edit has a base value to
+         * move from — without it applyKnobDelta bails before writing, which
+         * hid the wav_position encode bug from the model-level tests. */
+        "synth:p01_start":        "0.20",
+        "synth:p05_start":        "0.40",
+        "synth:p02_vol":          "0.20",
+        "synth:p05_vol":          "0.50",
+        /* Name format, as the real DSP reports it (mode_to_string) — this is
+         * what makes movy write "gate"/"oneshot" rather than an index. p01 is
+         * the default focused pad, p05 the one the screenshot scene selects. */
+        "synth:p01_mode":         "oneshot",
+        "synth:p05_mode":         "oneshot",
+    },
+
+    /* Weird Dreams: 8-voice machine. cv_* is the "current voice" alias; every
+     * voice param has a concrete v<N>_* key (1-indexed, no padding). */
+    weird_dreams: {
+        "synth:name":        "Weird Dreams",
+        "synth_module":      "weird-dreams",
+        "synth:cv_vol":      "0.90",
+        "synth:cv_pan":      "0.00",
+        "synth:cv_freq":     "440",
+        "synth:cv_decay":    "0.50",
+        "synth:v1_vol":      "0.11",
+        "synth:v1_pan":      "0.00",
+        "synth:v3_vol":      "0.33",
+        "synth:v3_pan":      "-0.50",
+        "synth:eq_lo":       "3.0",
+        "synth:master":      "0.80",
+    },
+
+    // Chunk 7 B2: 4-voice pad-scoped synth (cv_ alias → v{pad}_ concrete).
+    signal: {
+        "synth:name":        "Signal",
+        "synth_module":      "signal",
+        "synth:v1_vol":      "0.11", "synth:v1_attack": "0.02",
+        "synth:v3_vol":      "0.33", "synth:v3_attack": "0.04",
+        "synth:patch":       "2",
+    },
+
+    // Chunk 7 B2: 16-pad Kit A/B synth. Per-voice editing is playback-safe via
+    // padScoping cv_* → pv{pad}_ concrete keys (patched Forge DSP): pv1-8 = Kit A
+    // voices, pv9-16 = Kit B. Mix bank uses concrete v<N>_lvl.
+    forge: {
+        "synth:name":        "Forge",
+        "synth_module":      "forge",
+        "synth:pv1_wave":    "1",   "synth:pv1_f1_cut": "0.30",
+        "synth:pv3_wave":    "2",   "synth:pv11_wave":  "3",
+        "synth:v1_lvl":      "0.70", "synth:v5_lvl":    "0.50",
+        "synth:kit":         "4",
+    },
+
+    /* libpo32: 16-voice PO-32/Microtonic drum synth. Per-voice editing is
+     * PLAYBACK-SAFE via padScoping v_ → v{pad}_ (padDigits 2 for voices 1-16),
+     * addressing the patched DSP's direct per-index keys. Layout loads from the
+     * module's movy_config.json (served by the test). */
+    libpo32: {
+        "synth:name":        "Libpo32",
+        "synth_module":      "po32-drum",
+        "synth:v01_wave":    "1",    "synth:v01_freq":  "0.25",
+        "synth:v03_freq":    "0.33", "synth:v16_freq":  "0.50",
+        "synth:v01_nfmode":  "1",    "synth:v01_nffrq": "0.60",
+        "synth:kit":         "2",    "synth:level":     "1.0",  "synth:decay": "1.0",
+    },
+
+    /* C1: root has ≥8 knobs AND the preset key is also listed inside root.knobs.
+     * loadHierarchy adds a dedicated "Preset" page (presetSeparate) — the preset
+     * key must NOT also render on "Main - 1". Mirrors impressive-chords/breakbeat. */
+    preset_dup: {
+        "synth:name":         "PresetDup",
+        "synth:preset_count": "4",
+        "synth:ui_hierarchy": JSON.stringify({ levels: { root: {
+            list_param:  "preset",
+            count_param: "preset_count",
+            name_param:  "preset_name",
+            knobs: ["preset","base_note","transpose","invert","strum","tilt","length","choke"],
+        }}}),
+        "synth:chain_params": JSON.stringify([
+            { key: "base_note", name: "Base",   type: "int", min: 0, max: 127 },
+            { key: "transpose", name: "Trans",  type: "int", min: -24, max: 24 },
+            { key: "invert",    name: "Invert", type: "int", min: 0, max: 4 },
+            { key: "strum",     name: "Strum",  type: "float", min: 0, max: 1 },
+            { key: "tilt",      name: "Tilt",   type: "float", min: 0, max: 1 },
+            { key: "length",    name: "Length", type: "float", min: 0, max: 1 },
+            { key: "choke",     name: "Choke",  type: "int", min: 0, max: 1 },
+        ]),
+        "synth:preset":     "0",
+        "synth:base_note":  "60",
+        "synth:transpose":  "0",
+        "synth:invert":     "0",
+        "synth:strum":      "0.0",
+        "synth:tilt":       "0.5",
+        "synth:length":     "0.5",
+        "synth:choke":      "0",
+    },
+
+    /* B1: publishes chain_params but NO ui_hierarchy. Generic path must build
+     * pages straight from chain_params order. Mirrors branchage/smack-in/belt-in.
+     * Mixed float/enum/filepath + a ui_* internal key that must be skipped. */
+    chainparams_only: {
+        "synth:name": "ChainOnly",
+        "synth:chain_params": JSON.stringify([
+            { key: "map_x",   name: "Map X",  type: "float", min: 0, max: 1 },
+            { key: "map_y",   name: "Map Y",  type: "float", min: 0, max: 1 },
+            { key: "density", name: "Dens",   type: "float", min: 0, max: 1 },
+            { key: "mode",    name: "Mode",   type: "enum",  options: ["A","B","C"] },
+            { key: "sample",  name: "Sample", type: "filepath",
+              root: "/data/UserData/Samples", filter: [".wav"], start_path: "/data/UserData/Samples" },
+            { key: "gain",    name: "Gain",   type: "float", min: 0, max: 2 },
+            { key: "spread",  name: "Spread", type: "int",   min: -12, max: 12 },
+            { key: "chaos",   name: "Chaos",  type: "float", min: 0, max: 1 },
+            { key: "swing",   name: "Swing",  type: "float", min: 0, max: 1 },
+            { key: "ui_page", name: "UIPage", type: "int",   min: 0, max: 3 },
+        ]),
+        "synth:map_x":   "0.5",
+        "synth:map_y":   "0.5",
+        "synth:density": "0.5",
+        "synth:mode":    "1",
+        "synth:sample":  "/data/UserData/Samples/kick.wav",
+        "synth:gain":    "1.0",
+        "synth:spread":  "0",
+        "synth:chaos":   "0.0",
+        "synth:swing":   "0.0",
+        "synth:ui_page": "0",
+    },
+
+    /* C4: params with NO chain_params entry and NO hierarchy metadata → movy
+     * guesses float 0..1. An integer-valued read (base_note=60, transpose=-24)
+     * should infer int type + widened range on first read. */
+    guessed_meta: {
+        "synth:name": "GuessedMeta",
+        "synth:ui_hierarchy": JSON.stringify({ levels: { root: {
+            knobs: ["base_note","transpose","depth","plugin_index"],
+        }}}),
+        "synth:base_note":    "60",
+        "synth:transpose":    "-24",
+        "synth:depth":        "0.5",
+        "synth:plugin_index": "3",
+    },
+
+    /* C2: a page whose knob labels collide after 5-char shortening. "Wave 1..4"
+     * and "Shape 1..4" both used to render as bare digits (1 2 3 4 twice). */
+    collide_osc: {
+        "synth:name": "CollideOsc",
+        "synth:ui_hierarchy": JSON.stringify({ levels: { root: {
+            knobs: ["wave1","wave2","wave3","wave4","shape1","shape2","shape3","shape4"],
+        }}}),
+        "synth:chain_params": JSON.stringify([
+            { key: "wave1",  name: "Wave 1",  type: "float", min: 0, max: 1 },
+            { key: "wave2",  name: "Wave 2",  type: "float", min: 0, max: 1 },
+            { key: "wave3",  name: "Wave 3",  type: "float", min: 0, max: 1 },
+            { key: "wave4",  name: "Wave 4",  type: "float", min: 0, max: 1 },
+            { key: "shape1", name: "Shape 1", type: "float", min: 0, max: 1 },
+            { key: "shape2", name: "Shape 2", type: "float", min: 0, max: 1 },
+            { key: "shape3", name: "Shape 3", type: "float", min: 0, max: 1 },
+            { key: "shape4", name: "Shape 4", type: "float", min: 0, max: 1 },
+        ]),
+        ...Object.fromEntries(["wave1","wave2","wave3","wave4","shape1","shape2","shape3","shape4"]
+            .map(k => [`synth:${k}`, "0.50"])),
+    },
+
+    /* No synth loaded — model falls back to fallback test params */
+    no_params: {
+        "synth:name": null,
+        "synth:ui_hierarchy": null,
+        "synth:chain_params": null,
+    },
+
+    lfo_prefix: {
+        "synth:name": "LFO Test",
+        "synth:ui_hierarchy": JSON.stringify({ levels: { root: {
+            knobs: ["lfo_rate","lfo_shape","lfo_offset","lfo_amount","osc_wave","osc_level","osc_tune","osc_pan"],
+        }}}),
+        "synth:chain_params": JSON.stringify([
+            { key: "lfo_rate",   name: "LFO Rate",   type: "float", min: 0, max: 1 },
+            { key: "lfo_shape",  name: "LFO Shape",  type: "float", min: 0, max: 1 },
+            { key: "lfo_offset", name: "LFO Offset", type: "float", min: 0, max: 1 },
+            { key: "lfo_amount", name: "LFO Amount", type: "float", min: 0, max: 1 },
+            { key: "osc_wave",   name: "OSC Wave",   type: "float", min: 0, max: 1 },
+            { key: "osc_level",  name: "OSC Level",  type: "float", min: 0, max: 1 },
+            { key: "osc_tune",   name: "OSC Tune",   type: "float", min: 0, max: 1 },
+            { key: "osc_pan",    name: "OSC Pan",    type: "float", min: 0, max: 1 },
+        ]),
+        "synth:lfo_rate":   "0.50",
+        "synth:lfo_shape":  "0.30",
+        "synth:lfo_offset": "0.70",
+        "synth:lfo_amount": "0.40",
+        "synth:osc_wave":   "0.60",
+        "synth:osc_level":  "0.80",
+        "synth:osc_tune":   "0.50",
+        "synth:osc_pan":    "0.50",
+    },
+
+    /* dexed's real shape: a preset triple, six knobs, and a knobless `banks`
+     * level carrying items_param/select_param. The bank cell is the whole point
+     * of this fixture — it lands left of the preset cell. */
+    dexed_like: {
+        "synth:name": "Dexed",
+        "synth:ui_hierarchy": JSON.stringify({ levels: {
+            root: {
+                list_param: "preset", count_param: "preset_count", name_param: "preset_name",
+                knobs: ["output_level", "octave_transpose", "feedback",
+                        "lfo_speed", "lfo_pmd", "lfo_amd"],
+                params: [{ level: "banks", label: "Choose Bank" }],
+            },
+            banks: {
+                label: "SYX Banks", items_param: "syx_bank_list",
+                select_param: "syx_bank_index", children: null, knobs: [], params: [],
+            },
+        } }),
+        "synth:chain_params": JSON.stringify([
+            { key: "output_level",     name: "Output",  type: "int", min: 0,  max: 100 },
+            { key: "octave_transpose", name: "Octave",  type: "int", min: -3, max: 3 },
+            { key: "feedback",         name: "Feedback",type: "int", min: 0,  max: 7 },
+            { key: "lfo_speed",        name: "LFO Spd", type: "int", min: 0,  max: 99 },
+            { key: "lfo_pmd",          name: "LFO PMD", type: "int", min: 0,  max: 99 },
+            { key: "lfo_amd",          name: "LFO AMD", type: "int", min: 0,  max: 99 },
+        ]),
+        "synth:preset_count":     "32",
+        "synth:preset_name":      "E.PIANO 1",
+        "synth:preset":           "0",
+        "synth:syx_bank_list":    JSON.stringify([
+            { label: "ROM1A.syx", index: 0 }, { label: "ROM2A.syx", index: 1 },
+            { label: "ROM3A.syx", index: 2 }, { label: "MASTER.syx", index: 3 },
+        ]),
+        "synth:syx_bank_index":   "1",
+        "synth:output_level":     "50",
+        "synth:octave_transpose": "0",
+        "synth:feedback":         "4",
+        "synth:lfo_speed":        "35",
+        "synth:lfo_pmd":          "12",
+        "synth:lfo_amd":          "0",
+    },
+    obxd_like: {
+        "synth:name":   "OB-Xd",
+        "synth:ui_hierarchy": JSON.stringify({
+            modes: null,
+            levels: {
+                root: {
+                    list_param:  "preset",
+                    count_param: "preset_count",
+                    name_param:  "preset_name",
+                    knobs: ["cutoff","resonance","filter_env","attack","decay","sustain","release","octave_transpose"],
+                    params: [
+                        { level: "global", label: "Global" },
+                        { level: "filter", label: "Filter" },
+                    ],
+                },
+                global: {
+                    knobs:  ["volume","tune","portamento","unison"],
+                    params: ["volume","tune","portamento","unison"],
+                },
+                filter: {
+                    knobs:  ["cutoff","resonance","filter_env","key_follow"],
+                    params: ["cutoff","resonance","filter_env","key_follow"],
+                },
+            },
+        }),
+        "synth:chain_params": JSON.stringify([
+            { key: "preset",           name: "Preset",     type: "int",   min: 0,  max: 9999 },
+            { key: "cutoff",           name: "Cutoff",     type: "float", min: 0,  max: 1 },
+            { key: "resonance",        name: "Resonance",  type: "float", min: 0,  max: 1 },
+            { key: "filter_env",       name: "Filter Env", type: "float", min: 0,  max: 1 },
+            { key: "attack",           name: "Attack",     type: "float", min: 0,  max: 1 },
+            { key: "decay",            name: "Decay",      type: "float", min: 0,  max: 1 },
+            { key: "sustain",          name: "Sustain",    type: "float", min: 0,  max: 1 },
+            { key: "release",          name: "Release",    type: "float", min: 0,  max: 1 },
+            { key: "octave_transpose", name: "Octave",     type: "int",   min: -3, max: 3 },
+            { key: "volume",           name: "Volume",     type: "float", min: 0,  max: 1 },
+            { key: "tune",             name: "Tune",       type: "float", min: 0,  max: 1 },
+            { key: "portamento",       name: "Portamento", type: "float", min: 0,  max: 1 },
+            { key: "unison",           name: "Unison",     type: "int",   min: 0,  max: 1 },
+            { key: "key_follow",       name: "Key Follow", type: "float", min: 0,  max: 1 },
+        ]),
+        "synth:preset_count":     "5",
+        "synth:preset_name":      "Init",
+        "synth:preset":           "0",
+        "synth:cutoff":           "0.70",
+        "synth:resonance":        "0.30",
+        "synth:filter_env":       "0.50",
+        "synth:attack":           "0.10",
+        "synth:decay":            "0.50",
+        "synth:sustain":          "0.70",
+        "synth:release":          "0.30",
+        "synth:octave_transpose": "0",
+        "synth:volume":           "0.80",
+        "synth:tune":             "0.50",
+        "synth:portamento":       "0.00",
+        "synth:unison":           "0",
+        "synth:key_follow":       "0.50",
+    },
+    "chordism": {
+        "synth:name":       "Chordism",
+        "synth_module":     "chordism",
+        "synth:ui_hierarchy": JSON.stringify({ levels: { root: {
+            list_param: "preset", count_param: "preset_count", name_param: "preset_name", knobs: [], params: [],
+        } } }),
+        "synth:preset_count": "57",
+        "synth:preset_names": JSON.stringify(["P0", "P1", "P2", "P3", "..."]),
+        "synth:chain_params": JSON.stringify([{"key": "chord_type", "name": "Chord", "type": "enum", "options": ["Octaves", "Fifth", "Minor", "Min 7", "Min 9", "Min 11", "Major", "Maj 7", "Maj 9", "Sus 4", "6/9", "Min 6", "10th", "Dom 7", "Dom 7 b9", "Half Dim"]}, {"key": "detune", "name": "Detune", "type": "float", "min": 0, "max": 1, "step": 0.01}, {"key": "width", "name": "Width", "type": "float", "min": 0, "max": 1, "step": 0.01}, {"key": "filter_cutoff", "name": "Cutoff", "type": "float", "min": 0, "max": 1, "step": 0.01}, {"key": "filter_resonance", "name": "Reso", "type": "float", "min": 0, "max": 1, "step": 0.01}, {"key": "filter_mode", "name": "Mode", "type": "enum", "options": ["LP", "HP", "BP"]}, {"key": "filter_slope", "name": "Slope", "type": "enum", "options": ["12 dB", "24 dB"]}, {"key": "filter_lfo_rate", "name": "Flt LFO Rate", "type": "float", "min": 0, "max": 1, "step": 0.01}, {"key": "filter_lfo_depth", "name": "Flt LFO Depth", "type": "float", "min": 0, "max": 1, "step": 0.01}, {"key": "filter_lfo_spread", "name": "Flt LFO Spread", "type": "float", "min": 0, "max": 1, "step": 0.01}, {"key": "filter_lfo_shape", "name": "Flt LFO Wave", "type": "enum", "options": ["Triangle", "Ramp Up", "Ramp Down", "Square"]}, {"key": "filter_env_attack", "name": "Env A", "type": "float", "min": 0, "max": 1, "step": 0.01}, {"key": "filter_env_decay", "name": "Env D", "type": "float", "min": 0, "max": 1, "step": 0.01}, {"key": "filter_env_depth", "name": "Env Amt", "type": "float", "min": -1, "max": 1, "step": 0.02}, {"key": "drive", "name": "Drive", "type": "float", "min": 0, "max": 1, "step": 0.01}, {"key": "volume", "name": "Volume", "type": "float", "min": 0, "max": 1, "step": 0.02}, {"key": "wave_1", "name": "Wave 1", "type": "enum", "options": ["Off", "Sine", "Triangle", "Saw", "Square", "Pulse Tr", "Wavetable"]}, {"key": "wave_2", "name": "Wave 2", "type": "enum", "options": ["Off", "Sine", "Triangle", "Saw", "Square", "Pulse Tr", "Wavetable"]}, {"key": "wave_3", "name": "Wave 3", "type": "enum", "options": ["Off", "Sine", "Triangle", "Saw", "Square", "Pulse Tr", "Wavetable"]}, {"key": "wave_4", "name": "Wave 4", "type": "enum", "options": ["Off", "Sine", "Triangle", "Saw", "Square", "Pulse Tr", "Wavetable"]}, {"key": "shape", "name": "Shape", "type": "float", "min": 0, "max": 1, "step": 0.01}, {"key": "shape_1", "name": "Shape 1", "type": "float", "min": 0, "max": 1, "step": 0.01}, {"key": "shape_2", "name": "Shape 2", "type": "float", "min": 0, "max": 1, "step": 0.01}, {"key": "shape_3", "name": "Shape 3", "type": "float", "min": 0, "max": 1, "step": 0.01}, {"key": "shape_4", "name": "Shape 4", "type": "float", "min": 0, "max": 1, "step": 0.01}, {"key": "morph_index", "name": "Morph", "type": "float", "min": 0, "max": 1, "step": 0.01}, {"key": "morph_intensity", "name": "Morph Int", "type": "float", "min": 0, "max": 1, "step": 0.01}, {"key": "pan_morph_index", "name": "Pan Morph", "type": "float", "min": 0, "max": 1, "step": 0.01}, {"key": "pan_morph_intensity", "name": "Pan Int", "type": "float", "min": 0, "max": 1, "step": 0.01}, {"key": "chord_spread", "name": "Spread", "type": "float", "min": 0, "max": 1, "step": 0.01}, {"key": "chord_rotation", "name": "Rotation", "type": "float", "min": 0, "max": 1, "step": 0.01}, {"key": "fm_modulator", "name": "FM Modulator", "type": "int", "min": 0, "max": 3, "step": 1}, {"key": "fm_amount", "name": "FM Amt", "type": "float", "min": 0, "max": 1, "step": 0.01}, {"key": "lfo_shape", "name": "LFO Wave", "type": "enum", "options": ["Triangle", "Ramp Up", "Ramp Down", "Square"]}, {"key": "lfo_rate", "name": "LFO Rate", "type": "float", "min": 0, "max": 1, "step": 0.01}, {"key": "lfo_depth", "name": "LFO Dpt", "type": "float", "min": 0, "max": 1, "step": 0.01}, {"key": "vib_depth", "name": "Vib Depth", "type": "float", "min": 0, "max": 1, "step": 0.01}, {"key": "vib_speed", "name": "Vib Speed", "type": "float", "min": 0, "max": 1, "step": 0.01}, {"key": "vib_delay", "name": "Vib Delay", "type": "float", "min": 0, "max": 1, "step": 0.01}, {"key": "sweep_amount", "name": "Sweep", "type": "float", "min": -1, "max": 1, "step": 0.02}, {"key": "sweep_rate", "name": "Sweep Rate", "type": "float", "min": 0, "max": 1, "step": 0.01}, {"key": "attack", "name": "Attack", "type": "float", "min": 0, "max": 1, "step": 0.01}, {"key": "release", "name": "Release", "type": "float", "min": 0, "max": 1, "step": 0.01}, {"key": "reverb_mix", "name": "Reverb Mix", "type": "float", "min": 0, "max": 1, "step": 0.01}, {"key": "reverb_decay", "name": "Reverb Decay", "type": "float", "min": 0, "max": 1, "step": 0.01}, {"key": "reverb_damp", "name": "Reverb Damp", "type": "float", "min": 0, "max": 1, "step": 0.01}, {"key": "grind", "name": "Grind", "type": "float", "min": 0, "max": 1, "step": 0.01}, {"key": "bit_shift", "name": "Shift", "type": "float", "min": 0, "max": 1, "step": 0.01}, {"key": "decimator", "name": "Decim", "type": "float", "min": 0, "max": 1, "step": 0.01}, {"key": "delay_mix", "name": "Delay Mix", "type": "float", "min": 0, "max": 1, "step": 0.01}, {"key": "delay_time", "name": "Delay Time", "type": "float", "min": 0, "max": 1, "step": 0.01}, {"key": "delay_feedback", "name": "Delay Feedback", "type": "float", "min": 0, "max": 1, "step": 0.01}, {"key": "delay_tone", "name": "Delay Tone", "type": "float", "min": 0, "max": 1, "step": 0.01}, {"key": "glide_rate", "name": "Glide", "type": "float", "min": 0, "max": 1, "step": 0.01}, {"key": "glide_legato", "name": "Glide Legato", "type": "enum", "options": ["Always", "Legato"]}, {"key": "vib_stray", "name": "Vibrato Stray", "type": "enum", "options": ["LFO", "Random"]}, {"key": "delay_mode", "name": "Delay Mode", "type": "enum", "options": ["Stereo", "Ping-Pong", "Flip-Flop", "Long", "Zenith", "Interval"]}, {"key": "delay_tone_hi", "name": "Delay Tone Hi", "type": "float", "min": 0, "max": 1, "step": 0.01}, {"key": "delay_tone_lo", "name": "Delay Tone Lo", "type": "float", "min": 0, "max": 1, "step": 0.01}, {"key": "delay_mod_rate", "name": "Delay Mod Rate", "type": "float", "min": 0, "max": 1, "step": 0.01}, {"key": "delay_mod_depth", "name": "Delay Mod Depth", "type": "float", "min": 0, "max": 1, "step": 0.01}, {"key": "reverb_shimmer", "name": "Reverb Shimmer", "type": "float", "min": 0, "max": 1, "step": 0.01}, {"key": "reverb_lowcut", "name": "Reverb Low Cut", "type": "float", "min": 0, "max": 1, "step": 0.01}, {"key": "reverb_size", "name": "Reverb Size", "type": "float", "min": 0, "max": 1, "step": 0.01}, {"key": "reverb_mod_rate", "name": "Reverb Mod Rate", "type": "float", "min": 0, "max": 1, "step": 0.01}, {"key": "reverb_mod_depth", "name": "Reverb Mod Depth", "type": "float", "min": 0, "max": 1, "step": 0.01}, {"key": "lm_lfo_rate", "name": "Lvl Morph LFO Rate", "type": "float", "min": 0, "max": 1, "step": 0.01}, {"key": "lm_lfo_depth", "name": "Lvl Morph LFO Depth", "type": "float", "min": 0, "max": 1, "step": 0.01}, {"key": "lm_lfo_shape", "name": "Lvl Morph LFO Wave", "type": "enum", "options": ["Triangle", "Ramp Up", "Ramp Down", "Square"]}, {"key": "pm_lfo_rate", "name": "Pan Morph LFO Rate", "type": "float", "min": 0, "max": 1, "step": 0.01}, {"key": "pm_lfo_depth", "name": "Pan Morph LFO Depth", "type": "float", "min": 0, "max": 1, "step": 0.01}, {"key": "pm_lfo_shape", "name": "Pan Morph LFO Wave", "type": "enum", "options": ["Triangle", "Ramp Up", "Ramp Down", "Square"]}, {"key": "amp_lfo_rate", "name": "Tremolo Rate", "type": "float", "min": 0, "max": 1, "step": 0.01}, {"key": "amp_lfo_depth", "name": "Tremolo Depth", "type": "float", "min": 0, "max": 1, "step": 0.01}, {"key": "amp_lfo_shape", "name": "Tremolo Wave", "type": "enum", "options": ["Triangle", "Ramp Up", "Ramp Down", "Square"]}, {"key": "vca_mode", "name": "VCA Mode", "type": "enum", "options": ["AD", "ASR", "Looping"]}, {"key": "vca_hard_reset", "name": "VCA Hard Reset", "type": "enum", "options": ["Off", "On"]}, {"key": "vca_drone", "name": "Drone", "type": "enum", "options": ["Off", "On"]}, {"key": "fenv_mode", "name": "Flt Env Mode", "type": "enum", "options": ["AD", "ASR", "Looping"]}, {"key": "fenv_hard_reset", "name": "Flt Env Hard Reset", "type": "enum", "options": ["Off", "On"]}, {"key": "quality_position", "name": "LoFi Position", "type": "enum", "options": ["Post-Flt", "Pre-Flt"]}, {"key": "fm_amount_1", "name": "FM Amount 1", "type": "float", "min": 0, "max": 1, "step": 0.01}, {"key": "fm_amount_2", "name": "FM Amount 2", "type": "float", "min": 0, "max": 1, "step": 0.01}, {"key": "fm_amount_3", "name": "FM Amount 3", "type": "float", "min": 0, "max": 1, "step": 0.01}, {"key": "fm_amount_4", "name": "FM Amount 4", "type": "float", "min": 0, "max": 1, "step": 0.01}, {"key": "mix_1", "name": "Mix 1", "type": "float", "min": 0, "max": 1, "step": 0.01}, {"key": "mix_2", "name": "Mix 2", "type": "float", "min": 0, "max": 1, "step": 0.01}, {"key": "mix_3", "name": "Mix 3", "type": "float", "min": 0, "max": 1, "step": 0.01}, {"key": "mix_4", "name": "Mix 4", "type": "float", "min": 0, "max": 1, "step": 0.01}, {"key": "vib_osc_enable", "name": "Vib Osc Enable", "type": "int", "min": 0, "max": 15, "step": 1}, {"key": "sweep_osc_enable", "name": "Sweep Osc Enable", "type": "int", "min": 0, "max": 15, "step": 1}, {"key": "shape_lfo_mode", "name": "LFO Mode", "type": "enum", "options": ["Free", "Note Reset", "One Shot"]}, {"key": "filter_lfo_mode", "name": "Flt LFO Mode", "type": "enum", "options": ["Free", "Note Reset", "One Shot"]}, {"key": "lm_lfo_mode", "name": "Lvl Morph LFO Mode", "type": "enum", "options": ["Free", "Note Reset", "One Shot"]}, {"key": "pm_lfo_mode", "name": "Pan Morph LFO Mode", "type": "enum", "options": ["Free", "Note Reset", "One Shot"]}, {"key": "fm_position", "name": "FM Position", "type": "enum", "options": ["Pre-Morph", "Post-Morph"]}, {"key": "arp_hold", "name": "Arp Hold", "type": "enum", "options": ["Off", "On"]}, {"key": "arp_euclid_steps", "name": "Euclid Steps", "type": "int", "min": 1, "max": 16, "step": 1}, {"key": "arp_euclid_beats", "name": "Euclid Beats", "type": "int", "min": 0, "max": 16, "step": 1}, {"key": "arp_variation_interval", "name": "Var Interval", "type": "int", "min": -12, "max": 12, "step": 1}, {"key": "arp_variations", "name": "Var Count", "type": "int", "min": 1, "max": 8, "step": 1}, {"key": "arp_clock_sync", "name": "Clock Sync", "type": "enum", "options": ["Internal", "MIDI Clk"]}, {"key": "arp_clock_division", "name": "Clock Division", "type": "enum", "options": ["1/4", "1/4T", "1/8", "1/8T", "1/16", "1/32"]}, {"key": "scale_index", "name": "Scale", "type": "enum", "options": ["Chromatic", "Major", "Minor", "Harm Min", "Pent Maj", "Pent Min", "Diminished", "Dorian", "Phrygian", "Lydian", "Mixolyd", "Locrian", "Blues Maj", "Blues Min", "Arabic", "Arabic2", "Hijaz", "Iwato", "Pelog", "Slendro", "Folk", "Japanese", "Gypsy", "Flamenco", "Whole Tone"]}, {"key": "scale_root", "name": "Scale Root", "type": "enum", "options": ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]}, {"key": "tuning_mode", "name": "Tuning", "type": "enum", "options": ["Chord", "Interval", "Chord Multi"]}, {"key": "chord_pc_0", "name": "C", "type": "enum", "options": ["Oct", "5th", "Min", "Min7", "Min9", "Min11", "Maj", "Maj7", "Maj9", "Sus4", "6/9", "Min6", "10", "Dom7", "Dom7b9", "HalfDim"]}, {"key": "chord_pc_1", "name": "C#", "type": "enum", "options": ["Oct", "5th", "Min", "Min7", "Min9", "Min11", "Maj", "Maj7", "Maj9", "Sus4", "6/9", "Min6", "10", "Dom7", "Dom7b9", "HalfDim"]}, {"key": "chord_pc_2", "name": "D", "type": "enum", "options": ["Oct", "5th", "Min", "Min7", "Min9", "Min11", "Maj", "Maj7", "Maj9", "Sus4", "6/9", "Min6", "10", "Dom7", "Dom7b9", "HalfDim"]}, {"key": "chord_pc_3", "name": "D#", "type": "enum", "options": ["Oct", "5th", "Min", "Min7", "Min9", "Min11", "Maj", "Maj7", "Maj9", "Sus4", "6/9", "Min6", "10", "Dom7", "Dom7b9", "HalfDim"]}, {"key": "chord_pc_4", "name": "E", "type": "enum", "options": ["Oct", "5th", "Min", "Min7", "Min9", "Min11", "Maj", "Maj7", "Maj9", "Sus4", "6/9", "Min6", "10", "Dom7", "Dom7b9", "HalfDim"]}, {"key": "chord_pc_5", "name": "F", "type": "enum", "options": ["Oct", "5th", "Min", "Min7", "Min9", "Min11", "Maj", "Maj7", "Maj9", "Sus4", "6/9", "Min6", "10", "Dom7", "Dom7b9", "HalfDim"]}, {"key": "chord_pc_6", "name": "F#", "type": "enum", "options": ["Oct", "5th", "Min", "Min7", "Min9", "Min11", "Maj", "Maj7", "Maj9", "Sus4", "6/9", "Min6", "10", "Dom7", "Dom7b9", "HalfDim"]}, {"key": "chord_pc_7", "name": "G", "type": "enum", "options": ["Oct", "5th", "Min", "Min7", "Min9", "Min11", "Maj", "Maj7", "Maj9", "Sus4", "6/9", "Min6", "10", "Dom7", "Dom7b9", "HalfDim"]}, {"key": "chord_pc_8", "name": "G#", "type": "enum", "options": ["Oct", "5th", "Min", "Min7", "Min9", "Min11", "Maj", "Maj7", "Maj9", "Sus4", "6/9", "Min6", "10", "Dom7", "Dom7b9", "HalfDim"]}, {"key": "chord_pc_9", "name": "A", "type": "enum", "options": ["Oct", "5th", "Min", "Min7", "Min9", "Min11", "Maj", "Maj7", "Maj9", "Sus4", "6/9", "Min6", "10", "Dom7", "Dom7b9", "HalfDim"]}, {"key": "chord_pc_10", "name": "A#", "type": "enum", "options": ["Oct", "5th", "Min", "Min7", "Min9", "Min11", "Maj", "Maj7", "Maj9", "Sus4", "6/9", "Min6", "10", "Dom7", "Dom7b9", "HalfDim"]}, {"key": "chord_pc_11", "name": "B", "type": "enum", "options": ["Oct", "5th", "Min", "Min7", "Min9", "Min11", "Maj", "Maj7", "Maj9", "Sus4", "6/9", "Min6", "10", "Dom7", "Dom7b9", "HalfDim"]}, {"key": "interval_1", "name": "Interval 1", "type": "int", "min": -24, "max": 24, "step": 1}, {"key": "interval_2", "name": "Interval 2", "type": "int", "min": -24, "max": 24, "step": 1}, {"key": "interval_3", "name": "Interval 3", "type": "int", "min": -24, "max": 24, "step": 1}, {"key": "lfo_phase_1", "name": "Shape LFO Phase 1", "type": "float", "min": 0, "max": 1, "step": 0.01}, {"key": "lfo_phase_2", "name": "Shape LFO Phase 2", "type": "float", "min": 0, "max": 1, "step": 0.01}, {"key": "lfo_phase_3", "name": "Shape LFO Phase 3", "type": "float", "min": 0, "max": 1, "step": 0.01}, {"key": "lfo_phase_4", "name": "Shape LFO Phase 4", "type": "float", "min": 0, "max": 1, "step": 0.01}, {"key": "ctrl_source", "name": "Ctrl Src", "type": "enum", "options": ["Aftertouch", "Random", "Coin Toss", "MIDI CC", "Velocity"]}, {"key": "ctrl_cc", "name": "Ctrl CC", "type": "int", "min": 0, "max": 127, "step": 1}, {"key": "ctrl_to_cutoff", "name": "Ctrl to Cutoff", "type": "float", "min": -1, "max": 1, "step": 0.02}, {"key": "ctrl_to_morph", "name": "Ctrl to Morph", "type": "float", "min": -1, "max": 1, "step": 0.02}, {"key": "ctrl_to_vib", "name": "Ctrl to Vibrato", "type": "float", "min": -1, "max": 1, "step": 0.02}, {"key": "ctrl_to_shape", "name": "Ctrl to Shape", "type": "float", "min": -1, "max": 1, "step": 0.02}, {"key": "ctrl_to_fm", "name": "Ctrl to FM", "type": "float", "min": -1, "max": 1, "step": 0.02}, {"key": "arp_enabled", "name": "Arp", "type": "enum", "options": ["Off", "On"]}, {"key": "arp_tempo", "name": "Arp Tempo", "type": "float", "min": 0, "max": 1, "step": 0.01}, {"key": "arp_direction", "name": "Arp Direction", "type": "enum", "options": ["Up", "Down", "Up/Down", "Random"]}]),
+    },
+    "sfz": {
+        "synth:name":       "SFZ",
+        "synth_module":     "sfz",
+        "synth:chain_params": JSON.stringify([{"key": "preset", "name": "Instrument", "type": "int", "min": 0}, {"key": "octave_transpose", "name": "Octave", "type": "int", "min": -4, "max": 4}, {"key": "gain", "name": "Gain", "type": "float", "min": 0, "max": 2, "step": 0.02}, {"key": "voices", "name": "Polyphony", "type": "int", "min": 1, "max": 128}, {"key": "attack", "name": "Atk +/-", "type": "float", "min": -50, "max": 50, "step": 1}, {"key": "decay", "name": "Dec +/-", "type": "float", "min": -50, "max": 50, "step": 1}, {"key": "sustain", "name": "Sus +/-", "type": "float", "min": -50, "max": 50, "step": 1}, {"key": "release", "name": "Rel +/-", "type": "float", "min": -50, "max": 50, "step": 1}, {"key": "tune", "name": "Tune +/-", "type": "float", "min": -100, "max": 100, "step": 1}, {"key": "cutoff", "name": "Cutoff +/-", "type": "float", "min": -50, "max": 50, "step": 1}, {"key": "reso", "name": "Reso +/-", "type": "float", "min": -50, "max": 50, "step": 1}, {"key": "knob_preset", "name": "Knob Preset", "type": "int", "min": 0, "max": 0}]),
+    },
+    "303": {
+        "synth:name":       "303",
+        "synth_module":     "303",
+        "synth:chain_params": JSON.stringify([{"key": "cutoff", "name": "Cutoff", "type": "float", "min": 0, "max": 1, "step": 0.02}, {"key": "resonance", "name": "Resonance", "type": "float", "min": 0, "max": 1, "step": 0.02}, {"key": "env_mod", "name": "Env Mod", "type": "float", "min": 0, "max": 1, "step": 0.02}, {"key": "decay", "name": "Decay", "type": "float", "min": 0, "max": 1, "step": 0.02}, {"key": "accent", "name": "Accent", "type": "float", "min": 0, "max": 1, "step": 0.02}, {"key": "volume", "name": "Volume", "type": "float", "min": 0, "max": 1, "step": 0.02}, {"key": "waveform", "name": "Waveform", "type": "enum", "options": ["Saw", "Square"]}, {"key": "tuning", "name": "Tuning", "type": "float", "min": 0, "max": 1, "step": 0.01}, {"key": "devil_mod_switch", "name": "Devilfish", "type": "enum", "options": ["Off", "On"]}, {"key": "normal_decay", "name": "Normal Decay", "type": "float", "min": 0, "max": 1, "step": 0.02}, {"key": "accent_decay", "name": "Accent Decay", "type": "float", "min": 0, "max": 1, "step": 0.02}, {"key": "feedback_hpf", "name": "Feedback HPF", "type": "float", "min": 0, "max": 1, "step": 0.02}, {"key": "soft_attack", "name": "Soft Attack", "type": "float", "min": 0, "max": 1, "step": 0.02}, {"key": "slide_time", "name": "Slide Time", "type": "float", "min": 0, "max": 1, "step": 0.02}, {"key": "tanh_shaper_drive", "name": "Shaper Drive", "type": "float", "min": 0, "max": 1, "step": 0.02}, {"key": "drive_model", "name": "Model", "type": "enum", "options": ["Soft", "RAT"]}, {"key": "drive", "name": "Drive", "type": "float", "min": 0, "max": 1, "step": 0.02}, {"key": "drive_mix", "name": "Mix", "type": "float", "min": 0, "max": 1, "step": 0.02}]),
+    },
+    "chiptune": {
+        "synth:name":       "Chiptune",
+        "synth_module":     "chiptune",
+        "synth:ui_hierarchy": JSON.stringify({ levels: { root: {
+            list_param: "preset", count_param: "preset_count", name_param: "preset_name", knobs: [], params: [],
+        } } }),
+        "synth:preset_count": "32",
+        "synth:preset_names": JSON.stringify(["P0", "P1", "P2", "P3", "..."]),
+        "synth:chain_params": JSON.stringify([{"key": "chip", "name": "Chip", "type": "enum", "options": ["NES", "GB"]}, {"key": "alloc_mode", "name": "Voice Mode", "type": "enum", "options": ["Auto", "Lead", "Locked"]}, {"key": "noise_mode", "name": "Noise Mode", "type": "enum", "options": ["Long", "Short"]}, {"key": "duty", "name": "Duty Cycle", "type": "int", "min": 0, "max": 3, "step": 1}, {"key": "env_attack", "name": "Attack", "type": "int", "min": 0, "max": 15, "step": 1}, {"key": "env_decay", "name": "Decay", "type": "int", "min": 0, "max": 15, "step": 1}, {"key": "env_sustain", "name": "Sustain", "type": "int", "min": 0, "max": 15, "step": 1}, {"key": "env_release", "name": "Release", "type": "int", "min": 0, "max": 15, "step": 1}, {"key": "sweep", "name": "Sweep", "type": "int", "min": 0, "max": 7, "step": 1}, {"key": "vibrato_depth", "name": "Vibrato Depth", "type": "int", "min": 0, "max": 12, "step": 1}, {"key": "vibrato_rate", "name": "Vibrato Rate", "type": "int", "min": 0, "max": 10, "step": 1}, {"key": "wavetable", "name": "Wavetable (GB)", "type": "int", "min": 0, "max": 7, "step": 1}, {"key": "channel_mask", "name": "Channel Mask", "type": "int", "min": 0, "max": 15, "step": 1}, {"key": "detune", "name": "Detune", "type": "int", "min": 0, "max": 50, "step": 1}, {"key": "volume", "name": "Volume", "type": "int", "min": 0, "max": 15, "step": 1}, {"key": "octave_transpose", "name": "Octave", "type": "int", "min": -3, "max": 3, "step": 1}, {"key": "pitch_env_depth", "name": "PEnv Depth", "type": "int", "min": 0, "max": 24, "step": 1}, {"key": "pitch_env_speed", "name": "PEnv Speed", "type": "int", "min": 0, "max": 15, "step": 1}]),
+    },
+    "hush1": {
+        "synth:name":       "Hush1",
+        "synth_module":     "hush1",
+        "synth:ui_hierarchy": JSON.stringify({ levels: { root: {
+            list_param: "preset", count_param: "preset_count", name_param: "preset_name", knobs: [], params: [],
+        } } }),
+        "synth:preset_count": "11",
+        "synth:preset_names": JSON.stringify(["P0", "P1", "P2", "P3", "..."]),
+        "synth:chain_params": JSON.stringify([{"key": "preset", "name": "Preset", "type": "int", "min": 0, "max": -1}, {"key": "volume", "name": "Volume", "type": "float", "min": 0, "max": 1}, {"key": "bend_range", "name": "Bend", "type": "float", "min": 0, "max": 12}, {"key": "saw", "name": "Saw", "type": "float", "min": 0, "max": 1}, {"key": "pulse", "name": "Pulse", "type": "float", "min": 0, "max": 1}, {"key": "sub", "name": "Sub", "type": "float", "min": 0, "max": 1}, {"key": "noise", "name": "Noise", "type": "float", "min": 0, "max": 1}, {"key": "sub_mode", "name": "Sub Mode", "type": "enum", "min": 0, "max": 2, "options": ["-2 Oct 50% PW", "-2 Oct", "-1 Oct"]}, {"key": "white_noise", "name": "White Noise", "type": "enum", "min": 0, "max": 1, "options": ["Off", "On"]}, {"key": "pulse_width", "name": "Pulse Width", "type": "float", "min": 0.05, "max": 0.95}, {"key": "pwm_mode", "name": "PWM Mode", "type": "enum", "min": 0, "max": 2, "options": ["Env", "Manual", "LFO"]}, {"key": "pwm_depth", "name": "PWM Depth", "type": "float", "min": 0, "max": 1}, {"key": "pwm_env_depth", "name": "PWM Env", "type": "float", "min": 0, "max": 1}, {"key": "cutoff", "name": "Cutoff", "type": "float", "min": 0, "max": 1}, {"key": "resonance", "name": "Res", "type": "float", "min": 0, "max": 1.2}, {"key": "env_amt", "name": "Env Amt", "type": "float", "min": 0, "max": 1}, {"key": "key_follow", "name": "Key Follow", "type": "float", "min": 0, "max": 1}, {"key": "filter_velocity_sens", "name": "Vel Filt", "type": "float", "min": 0, "max": 1}, {"key": "attack", "name": "Attack", "type": "float", "min": 0.001, "max": 4}, {"key": "decay", "name": "Decay", "type": "float", "min": 0.001, "max": 6}, {"key": "sustain", "name": "Sustain", "type": "float", "min": 0, "max": 1}, {"key": "release", "name": "Release", "type": "float", "min": 0.001, "max": 8}, {"key": "velocity_sens", "name": "Vel Amp", "type": "float", "min": 0, "max": 1}, {"key": "f_attack", "name": "F Attack", "type": "float", "min": 0.001, "max": 4}, {"key": "f_decay", "name": "F Decay", "type": "float", "min": 0.001, "max": 6}, {"key": "f_sustain", "name": "F Sustain", "type": "float", "min": 0, "max": 1}, {"key": "f_release", "name": "F Release", "type": "float", "min": 0.001, "max": 8}, {"key": "lfo_rate", "name": "LFO Rate", "type": "float", "min": 0.02, "max": 40}, {"key": "lfo_waveform", "name": "LFO Wave", "type": "enum", "min": 0, "max": 3, "options": ["Tri", "Rect", "Random", "Noise"]}, {"key": "lfo_trigger", "name": "LFO Trig", "type": "enum", "min": 0, "max": 1, "options": ["Free", "Retrig"]}, {"key": "lfo_sync", "name": "LFO Sync", "type": "enum", "min": 0, "max": 1, "options": ["Free", "Sync"]}, {"key": "lfo_invert", "name": "LFO Inv", "type": "enum", "min": 0, "max": 1, "options": ["Off", "On"]}, {"key": "lfo_pitch_snap", "name": "Pitch Snap", "type": "enum", "min": 0, "max": 1, "options": ["Off", "On"]}, {"key": "lfo_pitch", "name": "LFO Pitch", "type": "float", "min": 0, "max": 1}, {"key": "lfo_filter", "name": "LFO Filter", "type": "float", "min": 0, "max": 1}, {"key": "lfo_pwm", "name": "LFO PWM", "type": "float", "min": 0, "max": 1}, {"key": "glide", "name": "Glide", "type": "float", "min": 0, "max": 500}, {"key": "portamento_mode", "name": "Porta Mode", "type": "enum", "min": 0, "max": 2, "options": ["Off", "On", "Auto"]}, {"key": "portamento_linear", "name": "Porta Curve", "type": "enum", "min": 0, "max": 1, "options": ["Expo", "Linear"]}, {"key": "retrigger", "name": "Retrigger", "type": "enum", "min": 0, "max": 1, "options": ["Legato", "Trig"]}, {"key": "hold", "name": "Hold", "type": "enum", "min": 0, "max": 1, "options": ["Off", "On"]}, {"key": "transpose", "name": "Transpose", "type": "int", "min": -24, "max": 24}, {"key": "octave_transpose", "name": "Octave", "type": "int", "min": -2, "max": 2}, {"key": "fine_tune", "name": "Fine Tune", "type": "float", "min": -100, "max": 100}, {"key": "gate_trig_mode", "name": "Gate Mode", "type": "enum", "min": 0, "max": 2, "options": ["Gate", "Gate+Trig", "LFO"]}, {"key": "vca_mode", "name": "VCA Mode", "type": "enum", "min": 0, "max": 1, "options": ["Gate", "Envelope"]}, {"key": "adsr_declick", "name": "ADSR DeClick", "type": "float", "min": 0, "max": 1}, {"key": "priority", "name": "Priority", "type": "enum", "min": 0, "max": 1, "options": ["Last", "Low"]}, {"key": "velocity_mode", "name": "Vel Mode", "type": "enum", "min": 0, "max": 2, "options": ["Off", "Trigger", "Active"]}, {"key": "same_note_quirk", "name": "Same-Note", "type": "enum", "min": 0, "max": 1, "options": ["Off", "On"]}, {"key": "filter_env_full_range", "name": "Env Full Range", "type": "enum", "min": 0, "max": 1, "options": ["Off", "On"]}, {"key": "filter_env_polarity", "name": "Env Polarity", "type": "enum", "min": 0, "max": 1, "options": ["Positive", "Negative"]}, {"key": "filter_volume_correction", "name": "Vol Correction", "type": "float", "min": 0, "max": 1}]),
+    },
+};
+
+/* 8W8 (TR-808 style). Sixteen voices, each its own page naming its pad, plus
+ * Master/Reverb/Delay which name none — the shape the page rotation collapses
+ * to four entries. Params come from the fixture's own keys; the model boots
+ * fine without values, and this test is about navigation, not readback. */
+/*
+ * `ui_hierarchy` IS STATED, AND STATED EMPTY. None of these three publishes a
+ * contract — that is the whole of Cause E — and on device that reads as `""`:
+ * the shim answers a key the module does not serve with an error and a zeroed
+ * buffer, which is how the controller tells "there is none" (plan from
+ * chain_params) from "the read did not complete" (hold and ask again). This
+ * store answers an ABSENT key with null, so leaving the key out here would put
+ * the rack in the second state forever — a page that never resolves, which is
+ * not what the device does and not what any of these fixtures are about.
+ */
+MOCK_SYNTHS['8w8'] = { "synth:name": "8W8", "synth_module": "8w8",
+                       "synth:ui_hierarchy": "" };
+/* 6W6 and CW-78 round out the family. Same story: the fixture is the shipped
+ * config and carries the keys, so the mock only has to name the module. */
+MOCK_SYNTHS['6w6']  = { "synth:name": "6W6",   "synth_module": "6w6",
+                        "synth:ui_hierarchy": "" };
+MOCK_SYNTHS['cw78'] = { "synth:name": "CW-78", "synth_module": "cw78",
+                        "synth:ui_hierarchy": "" };
+
+/* The pre-2.0 9W9 layout, under a name that does not claim to be 9W9. 9W9
+ * deliberately stopped shipping padScoping/padKeys — one re-targeting row is
+ * mostly holes on a kit whose voices are separate circuits — so a mock still
+ * called "9w9" would assert a layout the module dropped on purpose. The form is
+ * still right for a kit whose pads share a control set, and this is its only
+ * exercise, so it keeps its coverage under its own name.
+ * Same params as 9W9: real per-voice keys are what make the addressing real. */
+MOCK_SYNTHS.padkeys = {
+    ...MOCK_SYNTHS.nw9,
+    "synth:name":   "PadKeys",
+    "synth_module": "padkeys",
+};
+
+/* `readouts` plus the hierarchy a DELEGATED page needs.
+ *
+ * The preset above is movy's own: movy builds a bank from `chain_params` when
+ * the module ships no hierarchy, so the readout scenes never needed one. A page
+ * Schwung plans is built from `ui_hierarchy` alone, so the same params have to
+ * be declared there too — kept as a separate preset rather than added to
+ * `readouts`, because the hierarchy changes which params end up on which page
+ * and the readout baselines are not about that. */
+MOCK_SYNTHS.readouts_hier = {
+    ...MOCK_SYNTHS.readouts,
+    "synth:ui_hierarchy": hier([
+        { key: "detected_key", label: "Key",    type: "enum" },
+        { key: "level_in",     label: "InLvl",  type: "float", min: 0, max: 1 },
+        { key: "sens",         label: "Sens",   type: "float", min: 0, max: 1 },
+        { key: "hold",         label: "Hold",   type: "int",   min: 0, max: 16 },
+    ]),
+};
+
+/* NO PRESET HERE DECLARES A DRUM RACK, and it is deliberate: `vm.drumPadName`
+ * can only come from a module's own `pad_layout: "drums"` declaration
+ * (`model/hierarchy.ts`), and a mock that invented one would make the SP-37
+ * precedence a question about the mock. The suites use a real rack instead —
+ * `dumpFixture('voice-poc')` out of `docs/module-dump/device-dump.json`. */

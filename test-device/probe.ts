@@ -1,0 +1,85 @@
+import type { Transport } from './transport.js';
+import { PARAM_POLL_GAP, until } from './wait.js';
+
+/* Frames of silence around every probe read. The probe rides the overtake_dsp
+ * param SHM like every other param reader, so it takes the shared gap rather
+ * than a number of its own — see PARAM_POLL_GAP for why it is what it is. */
+const PROBE_GAP = PARAM_POLL_GAP;
+
+const REQ = 'probereq';
+const RSP = 'probersp';
+
+/* Reads movy's UI state through the engine.
+ *
+ * The engine param channel reaches the DSP, never the UI's QuickJS context, so the engine is used as a postbox: write the question to
+ * `probereq`, movy notices it on the status poll it already makes, and writes
+ * the answer to `probersp`.
+ *
+ * Degrades rather than breaks: on a movy without the bridge `available()`
+ * answers false and a scenario falls back to log assertions. */
+export class Probe {
+    private id = 0;
+    constructor(private tx: Transport) {}
+
+    async ask(req: object): Promise<any> {
+        const id = ++this.id;
+        await this.tx.engineSet(REQ, JSON.stringify({ id, ...req }));
+        /* A QUIET WINDOW before the first read.
+         *
+         * The overtake_dsp param SHM is a single slot shared with movy's own
+         * writes. Polling into it is not merely wasteful — it starves the reply
+         * we are waiting for, and movy's answer is simply lost. Measured: three
+         * requests spaced by a bare WAIT_FRAME all answered, while the same
+         * three answered 1, then 2, then failed as soon as a poll loop ran in
+         * the gap. WAIT_FRAME costs the daemon nothing and touches no param, so
+         * this window is genuinely silent. */
+        await this.tx.frames(PROBE_GAP);
+        /* Waiting for OUR id, not merely for a non-empty value: the previous
+         * answer is still sitting in the mailbox, so "has a response" would be
+         * satisfied immediately and every read would be one round stale. */
+        const raw = await until(this.tx, `probe reply #${id}`,
+            () => this.tx.engineGet(RSP).catch(() => ''),
+            (v) => {
+                if (!v) return false;
+                try { return JSON.parse(v).id === id; } catch { return false; }
+            /* Poll SLOWLY. The overtake_dsp param SHM is a SINGLE SLOT shared
+             * with movy's own writes, so polling every couple of frames starves
+             * the very reply we are waiting for: measured, the first request
+             * answered and the second never did, while the same requests spaced
+             * out all succeeded. */
+            }, { within: 3000, every: PROBE_GAP });
+        return JSON.parse(raw);
+    }
+
+    async available(): Promise<boolean> {
+        try { return typeof (await this.ask({ key: 'tick' })).renderSeq === 'number'; }
+        catch { return false; }
+    }
+
+    tick()  { return this.ask({ key: 'tick' }); }
+    page()  { return this.ask({ key: 'page' }); }
+    auto()  { return this.ask({ key: 'auto' }); }
+    /* Null when no browser is up — which is itself the answer a scenario needs
+     * after a commit: the browser is torn down in the same call that writes. */
+    browse() { return this.ask({ key: 'browse' }); }
+
+    /* A MODULE-SUPPLIED WIDGET (SP-28). `available` is the library's own answer
+     * read through movy's binding to the registry, and `clear` is a mutation
+     * seam: it writes nothing durable, so a scenario can put
+     * the registry back to the state a module with no widget leaves it in and
+     * then look at the screen — which is the only way to watch the built-in
+     * draw in a cell a module had claimed. */
+
+    widget(kind: string, opts: { clear?: boolean } = {}) {
+        return this.ask({ verb: 'widgets', arg: { kind, clear: !!opts.clear } });
+    }
+
+    /* Wait until movy has repainted since `from`. This replaces every
+     * `sleep 0.45` after a gesture: a sleep asserts nothing, whereas this
+     * proves movy processed the input AND rendered. */
+    async settled(from: number): Promise<number> {
+        const t = await until(this.tx, `renderSeq > ${from}`,
+            () => this.tick(), (v) => v.renderSeq > from, { within: 3000, every: PROBE_GAP });
+        return t.renderSeq;
+    }
+}

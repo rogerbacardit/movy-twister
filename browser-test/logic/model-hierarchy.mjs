@@ -1,0 +1,343 @@
+/* browser-test/logic/model-hierarchy.mjs — how a module's hierarchy becomes the
+ * model's param registry: nav-only levels, level-graph traversal, async
+ * metadata. (The registry's bank structure is what movy's own pages drew; it
+ * is still how the params are indexed.)
+ *
+ * Run by browser-test/logic.mjs.
+ */
+
+import {
+    MOCK_SYNTHS, NAME_POLL_TICKS, META_RETRY_LIMIT, HIERARCHY_RETRY_TICKS, fail, eq, notMatch,
+    bootModel, _log, env, installMockFs, uninstallMockFs,
+} from './harness.mjs';
+
+/* The model's param registry, read through its layout snapshot: bank names,
+ * one page's params, and every param's label. */
+const bankNames = (m) => m.dumpLayout().banks.map((b) => b.name);
+const pageParams = (m, pg) => m.dumpLayout().params.slice(pg * 8, pg * 8 + 8).filter(Boolean);
+const labels = (m) => m.dumpLayout().params.filter(Boolean).map((p) => p.label);
+
+export async function run() {
+/* ── vm.moduleName is raw name — no track prefix ─────────────────────────── */
+
+_log('\nTest: vm.moduleName is raw module name (no track prefix)');
+
+for (const [name, preset] of [
+    ['Test 8',  MOCK_SYNTHS.test8    ],
+    ['Plaits',  MOCK_SYNTHS.plaits   ],
+    ['OB-Xd',  MOCK_SYNTHS.obxd_like],
+    ['Wurl',   MOCK_SYNTHS.wurl     ],
+]) {
+    const vm = bootModel(preset).getViewModel();
+    eq(`${name}: vm.moduleName`, vm.moduleName, name);
+    notMatch(`${name}: no T> prefix`, vm.moduleName, /^T\d+ > /);
+}
+
+/* ── moduleName is slot-independent ─────────────────────────────────────── */
+
+_log('\nTest: vm.moduleName does not vary by activeSlot');
+
+for (const slot of [0, 1, 2, 3]) {
+    const vm = bootModel(MOCK_SYNTHS.test8, slot).getViewModel();
+    eq(`slot ${slot}: moduleName = 'Test 8'`, vm.moduleName, 'Test 8');
+}
+
+/* ── nav-only level expansion ─────────────────────────────────────────────── */
+
+_log('\nTest: navigation-only levels expand recursively');
+
+{
+    const m = bootModel(MOCK_SYNTHS.nav_levels);
+    const names = bankNames(m);
+    eq('nav_levels: bankCount = 4', names.length, 4);
+    eq('nav_levels: bank 0 = Main',       names[0], 'Main');
+    eq('nav_levels: bank 1 = Main',       names[1], 'Main');
+    eq('nav_levels: bank 2 = Mod/Pitch',  names[2], 'Mod/Pitch');
+    eq('nav_levels: bank 3 = Mod/Filter', names[3], 'Mod/Filter');
+    eq('nav_levels: no bare Mod bank',    names.includes('Mod'), false);
+
+    eq('nav_levels: Mod/Pitch has 3 params', pageParams(m, 2).length, 3);
+}
+
+/* ── a null knob slot (quark) ─────────────────────────────────────────────── */
+
+_log('\nTest: a null in a level\'s knobs/params is an empty slot, not a crash');
+
+{
+    let m = null;
+    try { m = bootModel(MOCK_SYNTHS.null_knob); } catch (e) { fail(`null_knob: boot threw ${e}`); }
+    if (m) {
+        const got = labels(m);
+        for (const l of ['A', 'B', 'C']) eq(`null_knob: ${l} is a param`, got.includes(l), true);
+    }
+}
+
+/* ── moog: generic children-delegation hierarchy → 12 banks ─────────────── */
+
+_log('\nTest: moog hierarchy via children delegation (generic path)');
+
+{
+    const m = bootModel(MOCK_SYNTHS.moog);
+    const bankNames_ = bankNames(m);
+    eq('moog: bankCount = 12', bankNames_.length, 12);
+    eq('moog: bank 0  = Preset',       bankNames_[0],  'Preset');
+    eq('moog: bank 1  = Main',         bankNames_[1],  'Main');
+    eq('moog: bank 2  = Oscillator 1', bankNames_[2],  'Oscillator 1');
+    eq('moog: bank 6  = Mixer',        bankNames_[6],  'Mixer');
+    eq('moog: bank 11 = Performance',  bankNames_[11], 'Performance');
+
+    // Osc banks (2-5): [wave, volume, range, detune/noise]; wave+range are int
+    for (let bank = 2; bank <= 5; bank++) {
+        const row = m.dumpLayout().params.slice(bank * 8, bank * 8 + 4);
+        eq(`moog: Osc ${bank - 1} wave type = int`,  row[0]?.type, 'int');
+        eq(`moog: Osc ${bank - 1} range type = int`, row[2]?.type, 'int');
+    }
+    eq('moog: Main bank has 8 params', pageParams(m, 1).length, 8);
+}
+
+/* ── full level-graph traversal (generic path) ───────────────────────────── */
+
+
+_log('\nTest: root.children nav list is traversed (helm shape)');
+{
+    const names = bankNames(bootModel(MOCK_SYNTHS.hier_children_nav));
+    eq('children_nav: bankCount = 3',       names.length, 3);
+    eq('children_nav: bank 0 = Main',       names[0], 'Main');
+    eq('children_nav: bank 1 = Oscillator', names[1], 'Oscillator');
+    eq('children_nav: bank 2 = Filter',     names[2], 'Filter');
+}
+
+_log('\nTest: a level with knobs AND sub-levels renders both (dexed shape)');
+{
+    const names = bankNames(bootModel(MOCK_SYNTHS.hier_knobs_and_children));
+    eq('knobs_and_children: bankCount = 4',      names.length, 4);
+    eq('knobs_and_children: bank 0 = Main',      names[0], 'Main');
+    eq('knobs_and_children: bank 1 = Operators', names[1], 'Operators');
+    eq('knobs_and_children: bank 2 (depth 2)',   names[2], 'Operat/Operator 1');
+    eq('knobs_and_children: bank 3 (depth 3)',   names[3], 'Oper1/Envelope');
+}
+
+_log('\nTest: a level duplicating root renders once, its children still render');
+{
+    const names = bankNames(bootModel(MOCK_SYNTHS.hier_alias_level));
+    eq('alias_level: bankCount = 2',           names.length, 2);
+    eq('alias_level: bank 0 = Main',           names[0], 'Main');
+    eq('alias_level: no duplicate Patch page', names.includes('Patch'), false);
+    eq('alias_level: bank 1 = Deep',           names[1], 'Deep');
+}
+
+_log('\nTest: orphan levels with knobs are swept in');
+{
+    const names = bankNames(bootModel(MOCK_SYNTHS.hier_orphan_level));
+    eq('orphan_level: bankCount = 2', names.length, 2);
+    eq('orphan_level: bank 1 = Perf', names[1], 'Perf');
+}
+
+/* ── params[] extras: the osirus Preset/Bank/ROM gap ─────────────────────── */
+
+_log('\nTest: level params[] entries render after that level\'s knobs');
+{
+    const m = bootModel(MOCK_SYNTHS.hier_params_extras);
+    const keysOf = (pg) =>
+        m.dumpLayout().params.slice(pg * 8, pg * 8 + 8).filter(Boolean).map(p => p.key);
+    const names = bankNames(m);
+    eq('extras: page 0 = Main',        names[0], 'Main');
+    eq('extras: page 1 = Oscillators', names[1], 'Oscillators');
+    eq('extras: page 2 = Settings',    names[2], 'Settings');
+    eq('extras: root keeps its knobs',
+        JSON.stringify(keysOf(0)), JSON.stringify(['cutoff', 'dupe']));
+    eq('extras: osc knobs then params, deduped',
+        JSON.stringify(keysOf(1)), JSON.stringify(['pw', 'wave', 'semi']));
+    eq('extras: settings renders its params-only key',
+        JSON.stringify(keysOf(2)), JSON.stringify(['rom']));
+    const all = m.dumpLayout().params.filter(Boolean).map(p => p.key);
+    eq('extras: ui_* key never rendered',     all.includes('ui_scroll'), false);
+    eq('extras: degenerate min==max skipped', all.includes('bank_index'), false);
+    // pushnpull publishes a `canvas` param (a drawing surface for its web UI);
+    // there is no knob that can edit one.
+    eq('extras: non-knob type skipped',       all.includes('view'), false);
+    eq('extras: no key rendered twice',       all.length, new Set(all).size);
+}
+
+_log('\nTest: a page keeps its OWN level\'s short_name, not a later level\'s (SP-25)');
+{
+    // jp8000's Performance-page shape: a level ("main") declares distinct
+    // short_names for two keys; sibling levels visited LATER by the walk
+    // ("setup"/"arp") redeclare the same keys with a colliding short_name.
+    // A hierarchy-wide flattened map (absorbHierarchy, model/hierarchy.ts)
+    // absorbs whichever level is processed last for a given key, so "main"'s
+    // own page would read the LAST writer's value instead of its own.
+    const m = bootModel(MOCK_SYNTHS.level_shadowed_short_name);
+    const shortOf = (pg, i) => m.dumpLayout().params[pg * 8 + i]?.shortLabel;
+    const names = bankNames(m);
+    eq('shadow: page 0 = Main',  names[0], 'Main');
+    eq('shadow: page 1 = Setup', names[1], 'Setup');
+    eq('shadow: page 2 = Arp',   names[2], 'Arp');
+    eq('shadow: Main key_mode keeps its OWN short_name', shortOf(0, 0), 'KeyMd');
+    eq('shadow: Main arp_mode keeps its OWN short_name', shortOf(0, 1), 'ArpMd');
+    // Setup/Arp were already correct by coincidence of write order (nothing
+    // writes after them) — a regression guard that scoping to the owning
+    // level doesn't break the pages that were already right.
+    eq('shadow: Setup keeps its own short_name too', shortOf(1, 0), 'Mode');
+    eq('shadow: Arp keeps its own short_name too',    shortOf(2, 0), 'Mode');
+}
+
+_log('\nTest: a level overflowing 8 slots numbers from " - 2"');
+{
+    const names = bankNames(bootModel(MOCK_SYNTHS.hier_params_overflow));
+    eq('overflow: page 0 keeps the bare name', names[0], 'Main');
+    eq('overflow: page 1 is " - 2"',           names[1], 'Main - 2');
+}
+
+/* ── async metadata: preset list + enum options that arrive after load ───── */
+
+_log('\nTest: preset count and enum options are re-resolved when they land');
+{
+    const m = bootModel(MOCK_SYNTHS.hier_async_meta);
+    const romOf = () => m.dumpLayout().params.filter(Boolean).find(p => p.key === 'rom');
+    eq('async: no Preset knob while the count is 0',
+        m.dumpLayout().params.filter(Boolean).some(p => p.renderStyle === 'preset'), false);
+    eq('async: ROM shows the placeholder at first',
+        JSON.stringify(romOf().options), JSON.stringify(['(loading)']));
+
+    // The ROM lands: preset list and real options appear.
+    env.setParams({
+        ...MOCK_SYNTHS.hier_async_meta,
+        "synth:preset_count": "3",
+        "synth:preset_names": JSON.stringify(['Init', 'Bass', 'Lead']),
+        "synth:chain_params": JSON.stringify([
+            { key: "cutoff", name: "Cutoff", type: "int", min: 0, max: 127 },
+            { key: "rom",    name: "ROM",    type: "enum", options: ["Virus A", "Virus B", "Virus C"] },
+        ]),
+    });
+    for (let i = 0; i < 4 * NAME_POLL_TICKS; i++) m.tick();
+
+    const preset = m.dumpLayout().params.filter(Boolean).find(p => p.renderStyle === 'preset');
+    eq('async: Preset knob appears once the count is non-zero', !!preset, true);
+    eq('async: Preset knob carries the real names',
+        JSON.stringify(preset?.options), JSON.stringify(['Init', 'Bass', 'Lead']));
+    eq('async: ROM options are re-read',
+        JSON.stringify(romOf().options), JSON.stringify(['Virus A', 'Virus B', 'Virus C']));
+}
+
+_log('\nTest: a param that widens its range after load becomes reachable');
+{
+    /* osirus's Bank: device-measured 0..0 immediately after load, 0..1 once the
+     * ROM lists the banks (scripts/probe-async-meta.mjs). */
+    const withBank = (max) => ({
+        "synth:name": "Banker",
+        "synth:chain_params": JSON.stringify([
+            { key: "cutoff",     name: "Cutoff", type: "int", min: 0, max: 127 },
+            { key: "bank_index", name: "Bank",   type: "int", min: 0, max },
+        ]),
+        "synth:ui_hierarchy": JSON.stringify({
+            levels: { root: { knobs: ["cutoff"], params: [{ key: "bank_index", label: "Bank" }] } },
+        }),
+        "synth:cutoff": "64", "synth:bank_index": "0",
+    });
+    const keys = (m) => m.dumpLayout().params.filter(Boolean).map(p => p.key);
+
+    const m = bootModel(withBank(0));
+    eq('widen: unturnable Bank is not rendered at load', keys(m).includes('bank_index'), false);
+
+    env.setParams(withBank(1));
+    for (let i = 0; i < 4 * NAME_POLL_TICKS; i++) m.tick();
+    eq('widen: Bank appears once the module reports a real range',
+        keys(m).includes('bank_index'), true);
+}
+
+/* ── module.json as the hierarchy source ──────────────────────────────────
+ * Schwung serves a SYNTH slot's ui_hierarchy from the plugin only, so a module
+ * that describes its UI in module.json arrives with none, and everything it
+ * declares there — a sample browser above all — was unreachable. (Sample
+ * Slicer was the case that found this; it now has a movy config of its own, so
+ * this uses a module id no bundled config claims.) */
+
+_log('\nTest: a module.json hierarchy is read when the host serves none');
+
+const SLICER_MODULE_JSON = JSON.stringify({ capabilities: { ui_hierarchy: { levels: { root: {
+    label: 'Slicer',
+    knobs: ['sample_path', 'threshold'],
+    params: [{
+        key: 'sample_path', label: 'Sample', type: 'filepath',
+        root: '/data/UserData/UserLibrary',
+        filter: ['.wav'],
+        start_path: '/data/UserData/UserLibrary/Samples',
+    }],
+} } } } });
+
+{
+    // Control: with no manifest to read, all movy has is chain_params.
+    const m = bootModel(MOCK_SYNTHS.module_json_hier);
+    const names = labels(m);
+    eq('no manifest: only the chain_params param',
+       JSON.stringify(names), JSON.stringify(['Sensitivity']));
+}
+
+{
+    // Installed BEFORE boot: the manifest is read while the hierarchy loads.
+    installMockFs({ '/data/UserData/schwung/modules/sound_generators/manifest-only/module.json':
+                    SLICER_MODULE_JSON });
+    const m = bootModel(MOCK_SYNTHS.module_json_hier);
+    for (let i = 0; i < 20; i++) m.tick();
+    const first = m.dumpLayout().params[0];
+    eq('manifest: sample browser is the first param', first?.label, 'Sample');
+    eq('manifest: it is a file param',                first?.type, 'file');
+    eq('manifest: browse root is the declared one',
+       m.fileBrowseTargetForKey('sample_path')?.root, '/data/UserData/UserLibrary');
+    uninstallMockFs();
+}
+
+_log('\nTest: the async retry latches off and does not poll forever');
+{
+    const m = bootModel(MOCK_SYNTHS.hier_async_meta);   // never settles
+    let reads = 0;
+    const realGet = globalThis.shadow_get_param;
+    globalThis.shadow_get_param = (slot, key) => {
+        if (key === 'synth:preset_count' || key === 'synth:chain_params') reads++;
+        return realGet(slot, key);
+    };
+    for (let i = 0; i < 40 * NAME_POLL_TICKS; i++) m.tick();
+    globalThis.shadow_get_param = realGet;
+    /* Absolute bound, not META_RETRY_LIMIT + n: comparing against the constant
+     * under test would pass however large it grew. 40 polls of a module that
+     * never settles must still cost only the handful of probes the latch allows. */
+    eq(`async: probes stop after the retry budget (${reads} reads in 40 polls)`,
+        reads <= 10, true);
+    eq('async: META_RETRY_LIMIT is a small budget', META_RETRY_LIMIT <= 16, true);
+}
+
+/* ── mfx-slot-params-stale: a named module read back with NOTHING ─────────
+ *
+ * A master FX slot loads by DSP path under a BLOCKING write sized for
+ * dlopen + create_instance (browser/handler.ts, MASTER_LOAD_TIMEOUT_MS) — not
+ * for the module's OWN first publish of its ui_hierarchy/chain_params, so
+ * movy's first read can land in that gap: name resolved, nothing else has.
+ * Reproduced on device (4k-eq into an empty master FX slot, `off` arm — one
+ * run in several came back with `cells=[]`, module named correctly). Not
+ * master-specific in movy's own model: hierarchy.ts's B1 bail — "genuinely
+ * nothing: no hierarchy, no config, no chain_params" — is the same code for
+ * every component, so a plain synth slot proves it here. */
+_log('\nTest: a NAMED module with nothing published yet gets its params (mfx-slot-params-stale)');
+{
+    const RACING  = { 'synth:name': 'raceload', 'synth_module': 'raceload' };
+    const SETTLED = {
+        'synth:name': 'raceload', 'synth_module': 'raceload',
+        'synth:chain_params': JSON.stringify([
+            { key: 'bypass', name: 'Bypass', type: 'int', min: 0, max: 1 },
+        ]),
+        'synth:ui_hierarchy': JSON.stringify({ levels: { root: { knobs: ['bypass'] } } }),
+        'synth:bypass': '0',
+    };
+
+    const m = bootModel(RACING);
+    eq('race: the empty read has no params yet', labels(m).length, 0);
+
+    env.setParams(SETTLED);   // the module finishes publishing, same load
+    for (let i = 0; i < HIERARCHY_RETRY_TICKS + 1; i++) m.tick();
+    const names = labels(m);
+    eq('race: the retry catches the module once it publishes (no reopen)',
+        JSON.stringify(names), JSON.stringify(['Bypass']));
+}
+
+}

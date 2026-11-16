@@ -1,0 +1,1294 @@
+//! The saver thread: every byte of a Set's files moves through here.
+//!
+//! **Nothing in this module's I/O runs on the audio thread.** `set_param`,
+//! `get_param` and `render_block` all do, and a cold `dlopen` already holds
+//! that thread for 78-276 ms — schwung has been moving file work off it for
+//! exactly this reason (`shadow_set_pages.c:411`), and davebox writing its
+//! state file inline from `set_param` is the shape we are deliberately not
+//! copying.
+//!
+//! The lock discipline that makes the audio side safe: **the mutex is never
+//! held across file I/O.** The worker reads or writes first and locks only to
+//! publish a few fields, so an audio-thread `status()` waits microseconds at
+//! worst.
+//!
+//! **Nothing logged from this thread is ever seen.** A device run produced every file the restore promises and not one of the
+//! `host::log` lines beside them, while the same call from the audio thread
+//! (`create_instance`) landed in `debug.log` as usual. The log calls below stay
+//! as a local record, but anything a user or a suite must be able to READ is
+//! published in the status and logged by the UI.
+//!
+//! What crosses the wire is a COMMAND, never a payload. A lost command is
+//! harmless and idempotent on retry — an engine that has not opened a Set
+//! cannot overwrite one — where the `state` push this replaces destroyed data
+//! when it was lost (docs/persistence-hazards.md §2).
+
+use crate::set_envelope::BLANK_STATE;
+use crate::set_store::SetStore;
+use crate::version_index::Why;
+use crate::version_store::{read_index, wire_rows, write_version, Capture};
+use std::sync::mpsc::{channel, Sender};
+use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// ~10 minutes. The autosave runs every few seconds forever, so `auto` needs a
+/// floor or the history is just the rotation with extra steps.
+const VERSION_MIN_MS: u64 = 600_000;
+
+fn now_ms() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
+}
+
+pub enum Job {
+    Open { uuid: String, seed: Option<String> },
+    Rename { from: String, to: String },
+    Blank { uuid: String },
+    Save { uuid: String, payload: String, gen: u32, chains: String },
+    /// The one capture that is a command: a teardown or a Set switch, where
+    /// the UI knows a boundary has been reached and the engine does not.
+    Keep { uuid: String, why: Why },
+    /// Put a kept version back. The UI names `n` from the menu it was served.
+    Restore { uuid: String, n: u32 },
+    /// The once-per-session sweep. It runs here because it is file work, and
+    /// it is pure hygiene: it must never delay an instrument becoming playable.
+    Gc { keep: String, paths: crate::set_gc::GcPaths },
+    /// A track was frozen or unfrozen (freeze_files.rs): write the loop that
+    /// was just frozen, if any, then the manifest, and drop WAVs it no longer
+    /// names. The samples are shared with the audio thread's player, so the
+    /// handover cost no copy.
+    Freeze { uuid: String, manifest: String, wavs: Vec<crate::freeze_files::Wav> },
+    /// The second half of an open: the frozen loops of the Set just applied.
+    /// Not read with the Set, because the engine still held the previous
+    /// Set's loops then and both were in (locked) RAM at once; the audio thread
+    /// asks once those are freed (lib.rs `frozen_due`).
+    ReadFrozen { uuid: String },
+    /// movy's own library (set_lib_jobs.rs): on this thread so a duplicate or
+    /// a delete can never race an autosave of the same Set.
+    Lib(crate::set_lib_jobs::LibCmd),
+    Flush,
+}
+
+enum Msg {
+    Work(Job),
+    /// Test-only rendezvous: the worker answers once every earlier job is done.
+    Sync(Sender<()>),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    Opening,
+    Ready,
+    Failed,
+}
+
+impl Phase {
+    fn as_str(self) -> &'static str {
+        match self {
+            Phase::Opening => "opening",
+            Phase::Ready => "ready",
+            Phase::Failed => "failed",
+        }
+    }
+}
+
+struct Shared {
+    uuid: String,
+    phase: Phase,
+    gen: u32,
+    reason: String,
+    /// Outstanding saves. The UI's `flush` waits for this to reach zero.
+    dirty: u32,
+    /// Bytes for the audio thread to apply: (payload, chains, gen).
+    loaded: Option<(String, String, u32)>,
+    /// An open whose files exist but do not parse, for the audio thread to
+    /// publish in its status: the UI polls that every block and never the
+    /// `set` GET, so this is how it learns the Set is unreadable.
+    failed_open: Option<String>,
+    /// The menu, already formatted. `get_param` runs on the audio thread, so
+    /// what it serves must already be a string.
+    versions: String,
+    /// The restored version's ui half, waiting for the UI: `pending` while the
+    /// job is queued, `none` when the version has no ui half or the answer has
+    /// already been taken, `failed` when the restore did not happen, otherwise
+    /// the bytes. The UI owns `ui-state.json` (spec §5), so the engine hands
+    /// the bytes back rather than writing that file.
+    vui: String,
+    /// The sweep's verdict: `idle`, `pending`, or `collected=<n>` and the
+    /// uuids. The UI drops those names from `name-index.json`, which is all
+    /// that file is for now that the sweep no longer walks it.
+    gc: String,
+    /// The library's answer (`set_library::wire`), empty until the first
+    /// `lib` command makes this a library-rooted saver.
+    lib: String,
+    /// A migration in progress as `done/total`; "" when none is running.
+    migp: String,
+    /// The frozen tracks the Set in `loaded` names (a mask from its manifest),
+    /// handed over with it: the audio thread holds their chains' loads until
+    /// `ReadFrozen` answers in `frozen`.
+    frozen_due: Option<(String, u32)>,
+    /// A `ReadFrozen`'s answer, taken by the audio thread.
+    frozen: Option<(String, Vec<crate::freeze_files::FrozenLoad>)>,
+    /// Waveform overviews of loops just written, `(uuid, track, slot,
+    /// peaks)`: computed here, off the audio thread, and taken by it.
+    peaks: Vec<(String, usize, usize, Vec<u8>)>,
+}
+
+pub struct Saver {
+    tx: Sender<Msg>,
+    shared: Arc<Mutex<Shared>>,
+    root: String,
+}
+
+/// Total by construction: this runs on the audio thread, and a malformed
+/// command must be ignored rather than panic inside someone else's callback.
+pub fn parse_cmd(val: &str, cur: &str) -> Option<Job> {
+    let mut it = val.split_whitespace();
+    match it.next()? {
+        "open" => {
+            let uuid = it.next()?.to_string();
+            let seed = it.next().and_then(|t| t.strip_prefix("seed=")).map(|s| s.to_string());
+            Some(Job::Open { uuid, seed })
+        }
+        "rename" => {
+            let from = it.next()?.to_string();
+            let to = it.next()?.to_string();
+            Some(Job::Rename { from, to })
+        }
+        "blank" => Some(Job::Blank { uuid: it.next()?.to_string() }),
+        /* The Set is the one the engine already has open: a capture command
+         * naming a different Set would be a command to capture a Set nobody is
+         * editing. */
+        "keep" => Some(Job::Keep { uuid: cur.to_string(), why: Why::from_str(it.next()?)? }),
+        "restore" => Some(Job::Restore { uuid: cur.to_string(), n: it.next()?.parse().ok()? }),
+        /* `keep=` is the Set the UI has open; `sets=` and `pages=` are Move's
+         * own directories, which are the UI's knowledge — the engine learns
+         * every path it touches rather than hardcoding one (see `setsdir`). */
+        "gc" => {
+            let (mut keep, mut sets, mut pages) = (String::new(), String::new(), String::new());
+            for tok in it {
+                if let Some(v) = tok.strip_prefix("keep=") { keep = v.to_string(); }
+                else if let Some(v) = tok.strip_prefix("sets=") { sets = v.to_string(); }
+                else if let Some(v) = tok.strip_prefix("pages=") { pages = v.to_string(); }
+            }
+            if sets.is_empty() { return None; }
+            Some(Job::Gc { keep, paths: crate::set_gc::GcPaths::from_cmd(&sets, &pages) })
+        }
+        "flush" => Some(Job::Flush),
+        "lib" => crate::set_lib_jobs::parse(val.trim_start().strip_prefix("lib")?).map(Job::Lib),
+        _ => None,
+    }
+}
+
+/// Keep a version, and republish the menu. `ui` comes from the Set's own file:
+/// that half is the UI's to write (spec §5) and the engine's only to copy.
+fn capture(store: &SetStore, shared: &Arc<Mutex<Shared>>, uuid: &str, why: Why,
+           payload: &str, gen: u32, chains: Option<&str>) {
+    let ui = std::fs::read_to_string(store.set_dir(uuid).join("ui-state.json")).ok();
+    let c = Capture { why, payload, gen, chains, ui: ui.as_deref(), now: now_ms() };
+    if !write_version(store, uuid, &c) {
+        /* Logged and dropped. The Set's CURRENT state outranks its history, so
+         * a capture never fails the save it rode in on. */
+        crate::host::log(&format!("versions: {} capture dropped for {uuid}", why.as_str()));
+    }
+    publish_versions(store, shared, uuid);
+}
+
+fn publish_versions(store: &SetStore, shared: &Arc<Mutex<Shared>>, uuid: &str) {
+    let rows = wire_rows(&read_index(store, uuid));
+    shared.lock().unwrap().versions = rows;
+}
+
+/// Seed a Set's history from what earlier builds left in the rotation.
+///
+/// A no-op once the Set has an index — this runs on every open. Adoption
+/// COPIES: the shadows are live rotation slots, so adopting them by reference
+/// would mean the history evaporates on the very next autosave.
+fn adopt_existing(store: &SetStore, shared: &Arc<Mutex<Shared>>, uuid: &str) {
+    if !read_index(store, uuid).v.is_empty() {
+        return;
+    }
+    let mut found: Vec<(String, u32)> = Vec::new();
+    for path in [store.state_path(uuid), store.shadow_path(uuid, 1), store.shadow_path(uuid, 2)] {
+        let Some(p) = std::fs::read_to_string(path).ok().and_then(|s| crate::set_envelope::parse(&s)) else { continue };
+        if found.iter().any(|(payload, _)| *payload == p.payload) {
+            continue;
+        }
+        found.push((p.payload, p.gen));
+    }
+    if found.is_empty() {
+        return;
+    }
+    found.sort_by_key(|(_, gen)| *gen);   // oldest gets the lowest n
+    let chains = store.read_chains(uuid);
+    for (i, (payload, gen)) in found.iter().enumerate() {
+        /* Only the NEWEST adopted version gets today's chains and ui blob.
+         * There is exactly one of each on disk — they were never rotated — so
+         * giving an older sequence today's instruments would be a quiet lie.
+         * An older adopted version restores the sequence alone, which the menu
+         * shows as SEQ ONLY. */
+        let newest = i == found.len() - 1;
+        let ui = if newest {
+            std::fs::read_to_string(store.set_dir(uuid).join("ui-state.json")).ok()
+        } else {
+            None
+        };
+        write_version(store, uuid, &Capture {
+            why: Why::Adopted, payload, gen: *gen,
+            chains: if newest { chains.as_deref() } else { None },
+            ui: ui.as_deref(), now: 0,
+        });
+    }
+    publish_versions(store, shared, uuid);
+}
+
+fn do_open(store: &SetStore, shared: &Arc<Mutex<Shared>>, uuid: &str, seed: Option<&str>) {
+    /* A seed is a FALLBACK, never a preference: a Set that owns state keeps it.
+     * Reversed, opening a copy would overwrite the copy's own work with its
+     * source's. */
+    if !store.has_state(uuid) {
+        if let Some(src) = seed {
+            store.seed(uuid, src);
+        }
+    }
+
+    /* Before movy can write anything to this Set: adopt whatever earlier builds
+     * left behind, then snapshot what is actually on disk. This one capture is
+     * what makes a Set that comes up blank a menu entry rather than a loss. */
+    adopt_existing(store, shared, uuid);
+    if let Some(p) = store.read_best(uuid) {
+        capture(store, shared, uuid, Why::Open, &p.payload, p.gen, store.read_chains(uuid).as_deref());
+    } else {
+        publish_versions(store, shared, uuid);
+    }
+
+    let had_files = store.has_state(uuid);
+    let best = store.read_best(uuid);
+    let due = crate::freeze_files::tracks(&store.set_dir(uuid));
+    let mut sh = shared.lock().unwrap();
+    sh.uuid = uuid.to_string();
+    match best {
+        Some(p) => {
+            sh.gen = p.gen;
+            sh.phase = Phase::Ready;
+            sh.reason.clear();
+            sh.loaded = Some((p.payload, store.read_chains(uuid).unwrap_or_default(), p.gen));
+            sh.frozen_due = Some((uuid.to_string(), due));
+        }
+        /* Files that exist but do not parse are NOT an empty Set. Reading them
+         * as one is how a Set gets blanked; the UI's recovery is scoped to a
+         * set-level failure precisely so it can offer that choice instead of
+         * making it. */
+        None if had_files => {
+            sh.phase = Phase::Failed;
+            sh.reason = "unreadable".to_string();
+            sh.loaded = None;
+            sh.failed_open = Some(uuid.to_string());
+        }
+        /* A Set with no files is a NEW Set, and its sequence opens blank.
+         * `None` here applied nothing, so the engine kept the previous Set's
+         * sequence and a new Set came up with its modules gone but its steps
+         * copied. Still writes nothing: the engine's last-saved mirror is the
+         * blank state, so nothing saves until the user plays into it.
+         *
+         * The CHAINS half stays empty (`restore` ignores ""): the UI already
+         * clears them for a Set with no UI blob, and this apply lands on a
+         * later audio callback than the UI's own chain document — an empty
+         * doc here wiped chains queued just after the open (device fixture:
+         * "movy chains not established"). */
+        None => {
+            sh.gen = 0;
+            sh.phase = Phase::Ready;
+            sh.reason.clear();
+            sh.loaded = Some((BLANK_STATE.to_string(), String::new(), 0));
+        }
+    }
+}
+
+fn worker(root: String, shared: Arc<Mutex<Shared>>, rx: std::sync::mpsc::Receiver<Msg>) {
+    let store = SetStore::new(&root);
+    /* The `auto` cadence, owned by the thread that captures. It starts at the
+     * open capture: without that it is still 0 when the first autosave lands
+     * ~8 s later, and a session opened and played into records its second
+     * version within seconds of its first — the rotation's job, not history's. */
+    let mut last_auto_ms = 0u64;
+    let mut lib: Option<crate::set_lib_jobs::LibState> = None;
+    while let Ok(msg) = rx.recv() {
+        match msg {
+            Msg::Sync(ack) => {
+                let _ = ack.send(());
+            }
+            Msg::Work(Job::Open { uuid, seed }) => {
+                let left = shared.lock().unwrap().uuid.clone();
+                do_open(&store, &shared, &uuid, seed.as_deref());
+                last_auto_ms = now_ms();
+                if let Some(w) = lib.as_mut().and_then(|l| l.on_open(&uuid)) {
+                    shared.lock().unwrap().lib = w;
+                }
+                /* After the open, so the Set left is no longer the open one —
+                 * and after the audio thread's save of it, which it queued
+                 * ahead of this job. */
+                if let Some(w) = lib.as_mut().and_then(|l| l.on_left(&store, &left, &uuid, now_ms())) {
+                    shared.lock().unwrap().lib = w;
+                }
+            }
+            Msg::Work(Job::Rename { from, to }) => {
+                /* The id changed but the Set did not, so the work in hand moves
+                 * with it. Seeding is a no-op when the destination already owns
+                 * state, which is the safe direction. */
+                if !store.has_state(&to) {
+                    store.seed(&to, &from);
+                }
+                /* The frozen loops move too, seeded or not: lib.rs saves the
+                 * work in hand under `to` before this job, so the seed above
+                 * is skipped and the directory removed below held the only
+                 * copy of the WAVs. A no-op when `to` already has a manifest. */
+                if from != to {
+                    crate::freeze_files::copy(&store.set_dir(&from), &store.set_dir(&to));
+                }
+                /* The pad's directory is now a stale copy of this Set, and
+                 * leaving it is how a device grows a `__pending-*` tree nothing
+                 * will ever read. Removed HERE and not by the UI because the
+                 * seed above may still need it, and the UI cannot know when
+                 * this job has run. Its version history goes with it, exactly
+                 * as `removeSetState` took it on the old path. */
+                if from != to {
+                    let _ = std::fs::remove_dir_all(store.set_dir(&from));
+                }
+                let mut sh = shared.lock().unwrap();
+                sh.uuid = to;
+            }
+            Msg::Work(Job::Blank { uuid }) => {
+                /* Unconditional, and before the files go: what is about to be
+                 * overwritten may be the only copy, and "it looked the same as
+                 * the last version" is not a reason to find out afterwards. */
+                if let Some(p) = store.read_best(&uuid) {
+                    capture(&store, &shared, &uuid, Why::PreWipe, &p.payload, p.gen,
+                            store.read_chains(&uuid).as_deref());
+                }
+                /* The deliberate exception to "a blank Set writes nothing": the
+                 * state files must GO, or reopening restores exactly what the
+                 * user asked to be rid of. The history is NOT state — it is the
+                 * record of what was destroyed, and it stays. */
+                store.blank_files(&uuid);
+                let mut sh = shared.lock().unwrap();
+                sh.gen = 0;
+                sh.phase = Phase::Ready;
+                sh.reason.clear();
+                sh.loaded = Some((BLANK_STATE.to_string(), "0\n".to_string(), 0));
+            }
+            Msg::Work(Job::Save { uuid, payload, gen, chains }) => {
+                let res = store.write(&uuid, &payload, gen, &chains);
+                /* Scoped so the lock is released before the capture below: the
+                 * mutex is never held across file I/O, or an audio-thread
+                 * `status()` would wait on a write. */
+                let saved = {
+                    let mut sh = shared.lock().unwrap();
+                    sh.dirty = sh.dirty.saturating_sub(1);
+                    match &res {
+                        Ok(()) => {
+                            sh.gen = gen;
+                            sh.reason.clear();
+                        }
+                        /* Left for the next save to retry. The engine keeps the
+                         * bytes — unlike the old path, where reading `state` out
+                         * of the engine cleared its dirty flag and a failed write
+                         * was then lost for good. */
+                        Err(e) => {
+                            crate::host::log(&format!("set: save failed: {e}"));
+                            sh.reason = "save-failed".to_string();
+                        }
+                    }
+                    res.is_ok()
+                };
+                if saved {
+                    if let Some(w) = lib.as_mut().and_then(|l| l.on_save(&uuid, &payload)) {
+                        shared.lock().unwrap().lib = w;
+                    }
+                }
+                /* Rides the save that just landed, so the history costs no
+                 * extra read — and is rate-limited here, because this arm runs
+                 * every few seconds for as long as movy is open. */
+                if saved && (last_auto_ms == 0 || now_ms() - last_auto_ms >= VERSION_MIN_MS) {
+                    capture(&store, &shared, &uuid, Why::Auto, &payload, gen, Some(&chains));
+                    /* Set even when the capture was dropped: the interval is
+                     * about how often we ASK, not how often we succeed. */
+                    last_auto_ms = now_ms();
+                }
+            }
+            Msg::Work(Job::Restore { uuid, n }) => {
+                let Some(src) = crate::version_store::read_state(&store, &uuid, n) else {
+                    crate::host::log(&format!("versions: cannot restore {n} of {uuid}"));
+                    shared.lock().unwrap().vui = "failed".to_string();
+                    continue;
+                };
+                /* Before anything is overwritten: a mis-press must not cost the
+                 * live take, so a restore is itself undoable. */
+                let cur = store.read_best(&uuid);
+                if let Some(c) = &cur {
+                    capture(&store, &shared, &uuid, Why::PreRestore, &c.payload, c.gen,
+                            store.read_chains(&uuid).as_deref());
+                }
+                /* Above every copy AND every version, so nothing on disk can
+                 * outrank the restore — including the capture just taken. */
+                let mut top = cur.map_or(0, |c| c.gen);
+                for r in &read_index(&store, &uuid).v {
+                    if r.gen > top {
+                        top = r.gen;
+                    }
+                }
+                let gen = top + 1;
+                /* The version's own chains, not today's: restoring the sequence
+                 * under the instruments that replaced it is the loss `ch`
+                 * exists to prevent. A version that carries none leaves the
+                 * chains alone, which the menu shows as SEQ ONLY. */
+                let chains = crate::version_store::read_chains(&store, &uuid, n)
+                    .or_else(|| store.read_chains(&uuid))
+                    .unwrap_or_else(|| "0\n".to_string());
+                let ui = crate::version_store::read_ui(&store, &uuid, n);
+                /* The Set's frozen loops are not versioned: the install checks
+                 * each against the restored chain, and a track whose chain
+                 * changed opens unfrozen. */
+                let frozen = crate::freeze_files::read(&store.set_dir(&uuid));
+                match store.write(&uuid, &src.payload, gen, &chains) {
+                    Ok(()) => {
+                        crate::host::log(&format!("versions: restored {n} of {uuid} at gen {gen}"));
+                        let mut sh = shared.lock().unwrap();
+                        sh.gen = gen;
+                        sh.loaded = Some((src.payload, chains, gen));
+                        sh.frozen = Some((uuid.clone(), frozen));
+                        sh.vui = ui.unwrap_or_else(|| "none".to_string());
+                    }
+                    Err(e) => {
+                        crate::host::log(&format!("versions: restore of {n} did not reach disk: {e}"));
+                        shared.lock().unwrap().vui = "failed".to_string();
+                    }
+                }
+                publish_versions(&store, &shared, &uuid);
+            }
+            Msg::Work(Job::Keep { uuid, why }) => {
+                if let Some(p) = store.read_best(&uuid) {
+                    capture(&store, &shared, &uuid, why, &p.payload, p.gen,
+                            store.read_chains(&uuid).as_deref());
+                }
+            }
+            Msg::Work(Job::Gc { keep, paths }) => {
+                /* Refused for a library. The sweep deletes any Set Move does
+                 * not know, and Move knows none of a library's ids — run there,
+                 * it would empty the library. */
+                let library = lib.is_some()
+                    || store.root.parent().is_some_and(|p| p.join("library.json").exists());
+                if library {
+                    shared.lock().unwrap().gc = "collected=0".to_string();
+                    continue;
+                }
+                let removed = crate::set_gc::collect(&store, &paths, &keep);
+                /* The uuids, not just a count: the UI drops those names from
+                 * `name-index.json`, and it has no way to list the directory
+                 * that would tell it which ones went. */
+                let mut line = format!("collected={}", removed.len());
+                for uuid in &removed {
+                    line.push(' ');
+                    line.push_str(uuid);
+                }
+                shared.lock().unwrap().gc = line;
+            }
+            Msg::Work(Job::Lib(cmd)) => {
+                let open = shared.lock().unwrap().uuid.clone();
+                let st = lib.get_or_insert_with(|| crate::set_lib_jobs::LibState::open(&store.root));
+                let force = matches!(cmd, crate::set_lib_jobs::LibCmd::Migrate { force: true, .. });
+                let progress = |done: u32, total: u32| {
+                    shared.lock().unwrap().migp = if done < total { format!("{done}/{total}") } else { String::new() };
+                };
+                let (w, replaced) = st.run(&store, cmd, &open, now_ms(), &progress);
+                let mut sh = shared.lock().unwrap();
+                sh.lib = w;
+                sh.migp.clear();
+                if force {
+                    /* The open Set replaced under the engine goes back the way a
+                     * restore does: its bytes to the audio thread, its ui half
+                     * to the UI, which reloads on it. `kept` = the open Set was
+                     * not one of them, so there is nothing to reload. */
+                    sh.vui = "kept".to_string();
+                    match replaced.into_iter().find(|r| r.id == open) {
+                        Some(r) => {
+                            sh.gen = r.gen;
+                            sh.phase = Phase::Ready;
+                            sh.reason.clear();
+                            sh.vui = r.ui.unwrap_or_else(|| "none".to_string());
+                            sh.loaded = Some((r.payload, r.chains, r.gen));
+                            drop(sh);
+                            publish_versions(&store, &shared, &open);
+                        }
+                        /* Handed back unchanged: the audio thread is holding
+                         * its autosave until it hears from this job. */
+                        None if !open.is_empty() => {
+                            drop(sh);
+                            let back = store.read_best(&open).map_or(
+                                (BLANK_STATE.to_string(), String::new(), 0),
+                                |p| (p.payload, store.read_chains(&open).unwrap_or_default(), p.gen));
+                            shared.lock().unwrap().loaded = Some(back);
+                        }
+                        None => {}
+                    }
+                }
+            }
+            Msg::Work(Job::Freeze { uuid, manifest, wavs }) => {
+                let peaks = match crate::freeze_files::write(&store.set_dir(&uuid), &manifest, &wavs) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        crate::host::log(&format!("freeze: {uuid} not written: {e}"));
+                        Vec::new()
+                    }
+                };
+                let mut sh = shared.lock().unwrap();
+                sh.peaks.extend(peaks.into_iter().map(|(t, s, p)| (uuid.clone(), t, s, p)));
+                sh.dirty = sh.dirty.saturating_sub(1);
+            }
+            Msg::Work(Job::ReadFrozen { uuid }) => {
+                /* Before the lock, like everything else here: megabytes of WAV. */
+                let frozen = crate::freeze_files::read(&store.set_dir(&uuid));
+                shared.lock().unwrap().frozen = Some((uuid, frozen));
+            }
+            Msg::Work(Job::Flush) => {}
+        }
+    }
+}
+
+impl Saver {
+    pub fn new(root: &str) -> Self {
+        let (tx, rx) = channel();
+        let shared = Arc::new(Mutex::new(Shared {
+            uuid: String::new(),
+            phase: Phase::Opening,
+            gen: 0,
+            reason: String::new(),
+            dirty: 0,
+            loaded: None,
+            failed_open: None,
+            versions: String::new(),
+            vui: "none".to_string(),
+            migp: String::new(),
+            gc: "idle".to_string(),
+            lib: String::new(),
+            frozen_due: None,
+            frozen: None,
+            peaks: Vec::new(),
+        }));
+        let w = Arc::clone(&shared);
+        let r = root.to_string();
+        /* Spawned from `set_param`, so from the audio thread on movy-host:
+         * named and moved off its core rather than inheriting both. */
+        std::thread::Builder::new()
+            .name("movy-saver".into())
+            .spawn(move || {
+                crate::threads::leave_audio_core();
+                worker(r, w, rx)
+            })
+            .expect("set saver thread");
+        Saver { tx, shared, root: root.to_string() }
+    }
+
+    pub fn root(&self) -> &str { &self.root }
+
+    pub fn submit(&self, job: Job) {
+        /* Counted BEFORE the send, so a status read between submit and the
+         * worker picking it up still reports the Set as un-saved. */
+        /* A freeze's WAV is Set data like a save: the UI's `flush` before a
+         * close must wait for it too. */
+        if matches!(job, Job::Save { .. } | Job::Freeze { .. }) {
+            self.shared.lock().unwrap().dirty += 1;
+        }
+        /* Marked before the send, so a UI that reads the answer between the
+         * command and the worker picking it up sees `pending` rather than the
+         * previous restore's verdict. */
+        if matches!(job, Job::Restore { .. }
+                    | Job::Lib(crate::set_lib_jobs::LibCmd::Migrate { force: true, .. })) {
+            self.shared.lock().unwrap().vui = "pending".to_string();
+        }
+        if matches!(job, Job::Gc { .. }) {
+            self.shared.lock().unwrap().gc = "pending".to_string();
+        }
+        let _ = self.tx.send(Msg::Work(job));
+    }
+
+    pub fn status(&self) -> String {
+        let sh = self.shared.lock().unwrap();
+        let mut s = format!(
+            "uuid={} phase={} gen={} dirty={}",
+            sh.uuid,
+            sh.phase.as_str(),
+            sh.gen,
+            if sh.dirty > 0 { 1 } else { 0 }
+        );
+        if !sh.reason.is_empty() {
+            s.push_str(&format!(" reason={}", sh.reason));
+        }
+        s
+    }
+
+    pub fn lib(&self) -> String {
+        self.shared.lock().unwrap().lib.clone()
+    }
+
+    pub fn versions(&self) -> String {
+        self.shared.lock().unwrap().versions.clone()
+    }
+
+    /// The sweep's verdict — taken once, for the same reason `vui` is.
+    pub fn gc(&self) -> String {
+        let mut sh = self.shared.lock().unwrap();
+        if sh.gc == "pending" {
+            return sh.gc.clone();
+        }
+        std::mem::replace(&mut sh.gc, "idle".to_string())
+    }
+
+    /// The restored version's ui half — taken once, so a verdict is never read
+    /// as a second restore's.
+    pub fn migp(&self) -> String {
+        self.shared.lock().unwrap().migp.clone()
+    }
+
+    pub fn vui(&self) -> String {
+        let mut sh = self.shared.lock().unwrap();
+        if sh.vui == "pending" {
+            return sh.vui.clone();
+        }
+        std::mem::replace(&mut sh.vui, "none".to_string())
+    }
+
+    /// Bytes waiting to be applied, taken exactly once.
+    /// What the audio thread has to act on: bytes to apply, and an open that
+    /// failed. One lock for both, because this runs every block.
+    pub fn take_handoff(&self) -> (Option<(String, String, u32)>, Option<String>) {
+        let mut sh = self.shared.lock().unwrap();
+        (sh.loaded.take(), sh.failed_open.take())
+    }
+
+    /// Which tracks of the Set just handed over are frozen on disk, taken
+    /// once. The audio thread asks right after it applies `loaded`; `do_open`
+    /// sets both under one lock, so the two cannot be seen apart.
+    pub fn take_frozen_due(&self) -> Option<(String, u32)> {
+        self.shared.lock().unwrap().frozen_due.take()
+    }
+
+    /// A `ReadFrozen`'s loops, taken once. `try_lock`: asked every block
+    /// while one is due, it never waits on the saver.
+    pub fn take_frozen(&self) -> Option<(String, Vec<crate::freeze_files::FrozenLoad>)> {
+        self.shared.try_lock().ok().and_then(|mut sh| sh.frozen.take())
+    }
+
+    /// Peaks the saver computed since the last call. `try_lock`: asked every
+    /// block, it never waits on the saver — a miss is the next block's.
+    pub fn take_peaks(&self) -> Vec<(String, usize, usize, Vec<u8>)> {
+        self.shared.try_lock().map(|mut sh| std::mem::take(&mut sh.peaks)).unwrap_or_default()
+    }
+
+    #[cfg(test)]
+    pub fn take_loaded(&self) -> Option<(String, String, u32)> {
+        self.shared.lock().unwrap().loaded.take()
+    }
+
+    #[cfg(test)]
+    pub fn drain_for_test(&self) {
+        let (ack, done) = channel();
+        let _ = self.tx.send(Msg::Sync(ack));
+        let _ = done.recv();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp(name: &str) -> String {
+        let d = std::env::temp_dir().join(format!("movy-saver-{name}"));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d.to_str().unwrap().to_string()
+    }
+
+    fn versions_of(root: &str, uuid: &str) -> Vec<crate::version_index::VersionRec> {
+        crate::version_store::read_index(&SetStore::new(root), uuid).v
+    }
+
+    /* The capture that makes a Set coming up blank a menu entry rather than a
+     * loss: a snapshot of what was on disk BEFORE movy can write anything. */
+    #[test]
+    fn opening_a_set_keeps_what_was_on_disk() {
+        let root = tmp("openkeep");
+        /* Seeded through the store rather than a Save job: a save that arrives
+         * before any open finds the auto cadence still at zero and captures
+         * immediately, which is correct — the UI always opens first — but it
+         * would put a second version in the way of what this test is about. */
+        SetStore::new(&root).write("u1", "movy1\ncl 0 0 16 0 x\n", 1, "0\n").unwrap();
+        let s = Saver::new(&root);
+        s.submit(Job::Open { uuid: "u1".into(), seed: None });
+        s.drain_for_test();
+        let v = versions_of(&root, "u1");
+        /* Two, and the pair is the point: a Set with files and no index looks
+         * exactly like one an earlier build wrote, so the rotation is adopted
+         * first and the open capture lands on top of it. */
+        assert_eq!(v.len(), 2, "got {v:?}");
+        assert_eq!(v[0].why, Why::Open);
+        assert_eq!(v[1].why, Why::Adopted);
+        assert_eq!(crate::version_store::read_state(&SetStore::new(&root), "u1", v[0].n).unwrap().payload,
+                   "movy1\ncl 0 0 16 0 x\n", "the open capture is what was on disk");
+    }
+
+    /* A Set with nothing on disk has nothing to keep. A version per visited
+     * pad is how a history becomes noise. */
+    /* Freeze persistence through the saver: a `Freeze` job writes the loop and
+     * the manifest beside the Set; the next open hands them to the audio
+     * thread with the Set's own bytes; an unfreeze's manifest drops the WAV;
+     * and `flush` waits for a freeze like it waits for a save. */
+    #[test]
+    fn a_frozen_track_survives_a_reopen_and_an_unfreeze_cleans_up() {
+        use crate::freeze::LoopMap;
+        use crate::freeze_files::{encode_manifest, ClipEntry, Entry, PEAK_COLS};
+        let root = tmp("freeze");
+        let map = LoopMap::new(seq_core::TICKS_PER_BAR, 12_000, 44_100).unwrap();
+        let samples: Vec<i16> = (0..map.frames() * 2).map(|i| (i % 1000) as i16).collect();
+        let win = seq_core::engine::RecWindow { start_ticks: 0, len_ticks: seq_core::TICKS_PER_BAR };
+        let manifest = encode_manifest(&[Entry { track: 3, bpm_x100: 12_000, rate: 44_100, chain_print: 7,
+            modules: "synth=obxd".into(),
+            clips: vec![ClipEntry { slot: 0, len_ticks: map.len_ticks(), frames: map.frames(), win, print: 1 }] }]);
+
+        let s = Saver::new(&root);
+        s.submit(Job::Open { uuid: "u1".into(), seed: None });
+        s.submit(Job::Save { uuid: "u1".into(), payload: "movy1\ncl 0 0 16 0 x\n".into(), gen: 1, chains: "0\n".into() });
+        s.submit(Job::Freeze { uuid: "u1".into(), manifest, wavs: vec![(3, 0, Arc::new(samples.clone()), 44_100)] });
+        s.drain_for_test();
+        assert_eq!(s.shared.lock().unwrap().dirty, 0, "the freeze counted and settled like a save");
+        let p = s.take_peaks();
+        assert_eq!((p.len(), p[0].1, p[0].2, p[0].3.len()), (1, 3, 0, PEAK_COLS), "the saver hands the peaks back");
+
+        let s2 = Saver::new(&root);
+        s2.submit(Job::Open { uuid: "u1".into(), seed: None });
+        s2.drain_for_test();
+        assert!(s2.take_loaded().is_some());
+        assert_eq!(s2.take_frozen_due(), Some(("u1".into(), 1 << 3)), "the open names the frozen tracks");
+        assert!(s2.take_frozen().is_none(), "and reads none of their loops: the engine still holds the last Set's");
+        s2.submit(Job::ReadFrozen { uuid: "u1".into() });
+        s2.drain_for_test();
+        let (uuid, frozen) = s2.take_frozen().expect("the frozen tracks, asked for");
+        assert_eq!((uuid.as_str(), frozen.len()), ("u1", 1));
+        assert_eq!((frozen[0].track, frozen[0].clips[0].map, &frozen[0].clips[0].samples), (3, map, &samples));
+
+        s2.submit(Job::Freeze { uuid: "u1".into(), manifest: encode_manifest(&[]), wavs: Vec::new() });
+        s2.drain_for_test();
+        assert!(!SetStore::new(&root).set_dir("u1").join("freeze/t3-s0.wav").exists(), "unfreeze drops the loop");
+    }
+
+    #[test]
+    fn opening_an_empty_set_keeps_nothing() {
+        let root = tmp("openempty");
+        let s = Saver::new(&root);
+        s.submit(Job::Open { uuid: "u1".into(), seed: None });
+        s.drain_for_test();
+        assert_eq!(versions_of(&root, "u1").len(), 0);
+    }
+
+    /* What earlier builds left behind is adopted once, oldest first, and
+     * COPIED: the shadows are live rotation slots, so adopting by reference
+     * would mean the history evaporates on the very next autosave. */
+    #[test]
+    fn an_older_set_adopts_its_rotation_once() {
+        let root = tmp("adopt");
+        let store = SetStore::new(&root);
+        std::fs::create_dir_all(store.set_dir("old")).unwrap();
+        std::fs::write(store.state_path("old"), crate::set_envelope::wrap("movy1\ncl 0 0 16 0 a\n", 4)).unwrap();
+        std::fs::write(store.shadow_path("old", 1), crate::set_envelope::wrap("movy1\ncl 0 0 16 0 b\n", 3)).unwrap();
+
+        let s = Saver::new(&root);
+        s.submit(Job::Open { uuid: "old".into(), seed: None });
+        s.drain_for_test();
+        let v = versions_of(&root, "old");
+        let adopted: Vec<_> = v.iter().filter(|r| r.why == Why::Adopted).collect();
+        assert_eq!(adopted.len(), 2, "both distinct copies");
+        assert!(adopted.iter().any(|r| r.gen == 3), "the shadow was adopted at its own generation");
+
+        let s2 = Saver::new(&root);
+        s2.submit(Job::Open { uuid: "old".into(), seed: None });
+        s2.drain_for_test();
+        assert_eq!(versions_of(&root, "old").iter().filter(|r| r.why == Why::Adopted).count(), 2,
+                   "adoption is a no-op after the first open");
+    }
+
+    /* The autosave runs every few seconds forever. Without a floor the history
+     * is just the rotation with extra steps. */
+    #[test]
+    fn the_autosave_capture_is_rate_limited() {
+        let root = tmp("auto");
+        let s = Saver::new(&root);
+        for i in 1..=5u32 {
+            s.submit(Job::Save {
+                uuid: "u1".into(),
+                payload: format!("movy1\ncl 0 0 16 0 {i}\n"),
+                gen: i, chains: "0\n".into(),
+            });
+        }
+        s.drain_for_test();
+        assert_eq!(versions_of(&root, "u1").iter().filter(|r| r.why == Why::Auto).count(), 1,
+                   "five saves inside the window are one version");
+    }
+
+    /* The capture the whole history exists for — and the trap the port
+     * creates: Blank used to take the Set's whole directory, which would
+     * delete the history at the one moment it matters. */
+    #[test]
+    fn blanking_keeps_the_history_it_just_captured() {
+        let root = tmp("blank");
+        let s = Saver::new(&root);
+        s.submit(Job::Save { uuid: "u1".into(), payload: "movy1\ncl 0 0 16 0 x\n".into(), gen: 1, chains: "0\n".into() });
+        s.submit(Job::Blank { uuid: "u1".into() });
+        s.drain_for_test();
+
+        let store = SetStore::new(&root);
+        assert!(!store.has_state("u1"), "the state files must be gone");
+        let v = versions_of(&root, "u1");
+        assert!(v.iter().any(|r| r.why == Why::PreWipe),
+                "the pre-wipe capture must survive the wipe: {v:?}");
+        assert_eq!(crate::version_store::read_state(&store, "u1", v[0].n).unwrap().payload,
+                   "movy1\ncl 0 0 16 0 x\n");
+    }
+
+    /* A teardown or a Set switch is the last chance this Set has to record
+     * where it got to. It is the one capture that is a command. */
+    #[test]
+    fn keep_exit_captures_the_current_state() {
+        let root = tmp("keepexit");
+        let s = Saver::new(&root);
+        s.submit(Job::Save { uuid: "u1".into(), payload: "movy1\ncl 0 0 16 0 x\n".into(), gen: 2, chains: "0\n".into() });
+        s.submit(Job::Keep { uuid: "u1".into(), why: Why::Exit });
+        s.drain_for_test();
+        assert!(versions_of(&root, "u1").iter().any(|r| r.why == Why::Exit));
+    }
+
+    #[test]
+    fn the_wire_rows_are_published_without_a_file_read() {
+        let root = tmp("pub");
+        SetStore::new(&root).write("u1", "movy1\ncl 0 0 16 0 x\n", 1, "0\n").unwrap();
+        let s = Saver::new(&root);
+        s.submit(Job::Keep { uuid: "u1".into(), why: Why::Exit });
+        s.drain_for_test();
+        let rows = s.versions();
+        assert_eq!(rows.lines().count(), 1, "got {rows:?}");
+        assert!(rows.contains(" exit "), "got {rows:?}");
+    }
+
+    /* A restore must win an ordinary read afterwards — including against the
+     * pre-restore capture just taken. A hand-copy that does NOT bump the
+     * generation loses to a newer blank in a shadow; that is what a device
+     * showed, and why MANUAL.md tells anyone recovering by hand to overwrite
+     * every copy. */
+    #[test]
+    fn a_restore_outranks_everything_on_disk() {
+        let root = tmp("restore");
+        let s = Saver::new(&root);
+        s.submit(Job::Save { uuid: "u1".into(), payload: "movy1\ncl 0 0 16 0 old\n".into(), gen: 1, chains: "0\n".into() });
+        s.submit(Job::Keep { uuid: "u1".into(), why: Why::Exit });
+        s.submit(Job::Save { uuid: "u1".into(), payload: "movy1\ncl 0 0 16 0 new\n".into(), gen: 9, chains: "0\n".into() });
+        s.drain_for_test();
+        let n = versions_of(&root, "u1")[0].n;
+
+        s.submit(Job::Restore { uuid: "u1".into(), n });
+        s.drain_for_test();
+
+        let store = SetStore::new(&root);
+        let best = store.read_best("u1").expect("reads");
+        assert_eq!(best.payload, "movy1\ncl 0 0 16 0 old\n");
+        assert!(best.gen > 9, "the restore must outrank the newest generation: {}", best.gen);
+    }
+
+    /* A mis-press must not cost the live take: the restore is itself undoable. */
+    #[test]
+    fn a_restore_keeps_what_it_replaced() {
+        let root = tmp("prerestore");
+        let s = Saver::new(&root);
+        s.submit(Job::Save { uuid: "u1".into(), payload: "movy1\ncl 0 0 16 0 a\n".into(), gen: 1, chains: "0\n".into() });
+        s.submit(Job::Keep { uuid: "u1".into(), why: Why::Exit });
+        s.submit(Job::Save { uuid: "u1".into(), payload: "movy1\ncl 0 0 16 0 live\n".into(), gen: 5, chains: "0\n".into() });
+        s.drain_for_test();
+        let n = versions_of(&root, "u1").iter().find(|r| r.why == Why::Exit).unwrap().n;
+
+        s.submit(Job::Restore { uuid: "u1".into(), n });
+        s.drain_for_test();
+        let pre = versions_of(&root, "u1").into_iter().find(|r| r.why == Why::PreRestore)
+            .expect("the live take was kept");
+        assert_eq!(crate::version_store::read_state(&SetStore::new(&root), "u1", pre.n).unwrap().payload,
+                   "movy1\ncl 0 0 16 0 live\n");
+    }
+
+    /* The restored bytes reach the audio thread the same way an open's do. */
+    #[test]
+    fn a_restore_publishes_what_the_engine_must_apply() {
+        let root = tmp("restoreapply");
+        let s = Saver::new(&root);
+        s.submit(Job::Save { uuid: "u1".into(), payload: "movy1\ncl 0 0 16 0 a\n".into(), gen: 1, chains: "7\n".into() });
+        s.submit(Job::Keep { uuid: "u1".into(), why: Why::Exit });
+        s.submit(Job::Save { uuid: "u1".into(), payload: "movy1\ncl 0 0 16 0 b\n".into(), gen: 4, chains: "0\n".into() });
+        s.drain_for_test();
+        let n = versions_of(&root, "u1").iter().find(|r| r.why == Why::Exit).unwrap().n;
+        let _ = s.take_loaded();
+
+        s.submit(Job::Restore { uuid: "u1".into(), n });
+        s.drain_for_test();
+        let (payload, chains, _gen) = s.take_loaded().expect("the restore must publish its bytes");
+        assert_eq!(payload, "movy1\ncl 0 0 16 0 a\n");
+        assert_eq!(chains, "7\n", "and the chains that were live with it");
+    }
+
+    /* An adopted OLDER sequence has no ui half, and overwriting the keyboard
+     * and chains with nothing would be worse than the wipe this feature exists
+     * to undo. `none` is the whole answer. */
+    #[test]
+    fn a_version_with_no_ui_half_answers_none() {
+        let root = tmp("restorenoui");
+        let s = Saver::new(&root);
+        s.submit(Job::Save { uuid: "u1".into(), payload: "movy1\ncl 0 0 16 0 a\n".into(), gen: 1, chains: "0\n".into() });
+        s.submit(Job::Keep { uuid: "u1".into(), why: Why::Exit });
+        s.drain_for_test();
+        let n = versions_of(&root, "u1")[0].n;
+        s.submit(Job::Restore { uuid: "u1".into(), n });
+        s.drain_for_test();
+        assert_eq!(s.vui(), "none");
+    }
+
+    #[test]
+    fn a_restore_of_a_version_that_is_gone_says_so() {
+        let root = tmp("restoremiss");
+        let s = Saver::new(&root);
+        s.submit(Job::Restore { uuid: "u1".into(), n: 7 });
+        s.drain_for_test();
+        assert_eq!(s.vui(), "failed");
+        /* Taken once: a stale verdict must not be read as a second failure. */
+        assert_eq!(s.vui(), "none");
+    }
+
+    #[test]
+    fn the_sweep_reports_what_it_collected() {
+        let root = tmp("gc");
+        /* Beside the saver's root, not inside it: on the device Move's library
+         * is a different tree, and a sweep that found it under `sets/` would
+         * treat it as a Set directory of its own. */
+        let sets = format!("{root}-library");
+        std::fs::create_dir_all(&sets).unwrap();
+        SetStore::new(&root).write("dead", "movy1\ncl 0 0 16 0 x\n", 1, "0\n").unwrap();
+        let s = Saver::new(&root);
+        assert_eq!(s.gc(), "idle");
+
+        s.submit(Job::Gc { keep: "live".into(), paths: crate::set_gc::GcPaths::from_cmd(&sets, "") });
+        s.drain_for_test();
+        assert_eq!(s.gc(), "collected=1 dead");
+        assert_eq!(s.gc(), "idle", "a verdict is read once");
+    }
+
+    #[test]
+    fn parses_the_gc_command() {
+        assert!(matches!(parse_cmd("gc keep=u1 sets=/Sets pages=/a,/b", "u1"), Some(Job::Gc { .. })));
+        /* Without Move's own directory there is nothing safe to compare
+         * against, so this is not a sweep at all. */
+        assert!(parse_cmd("gc keep=u1", "u1").is_none());
+    }
+
+    #[test]
+    fn parses_the_restore_command() {
+        assert!(matches!(parse_cmd("restore 4", "u1"), Some(Job::Restore { n: 4, .. })));
+        assert!(parse_cmd("restore", "u1").is_none());
+        assert!(parse_cmd("restore x", "u1").is_none());
+    }
+
+    #[test]
+    fn parses_the_keep_command() {
+        assert!(matches!(parse_cmd("keep exit", "u1"), Some(Job::Keep { why: Why::Exit, .. })));
+        assert!(parse_cmd("keep nonsense", "u1").is_none());
+        assert!(parse_cmd("keep", "u1").is_none());
+    }
+
+    /* Commands are parsed on the audio thread and executed on the saver
+     * thread, so parsing must be total: an unknown or malformed command is
+     * ignored, never a panic in someone else's audio callback. */
+    #[test]
+    fn parses_every_command() {
+        assert!(matches!(parse_cmd("open abc", ""), Some(Job::Open { .. })));
+        assert!(matches!(parse_cmd("open abc seed=def", ""), Some(Job::Open { seed: Some(_), .. })));
+        assert!(matches!(parse_cmd("rename a b", ""), Some(Job::Rename { .. })));
+        assert!(matches!(parse_cmd("blank a", ""), Some(Job::Blank { .. })));
+        assert!(matches!(parse_cmd("flush", ""), Some(Job::Flush)));
+        assert!(parse_cmd("open", "").is_none());
+        assert!(parse_cmd("nonsense a b c", "").is_none());
+        assert!(parse_cmd("", "").is_none());
+    }
+
+    #[test]
+    fn open_of_an_unknown_set_reports_ready_and_loads_blank() {
+        let root = tmp("unknown");
+        let s = Saver::new(&root);
+        s.submit(Job::Open { uuid: "u1".into(), seed: None });
+        s.drain_for_test();
+        let st = s.status();
+        assert!(st.contains("uuid=u1"), "got {st}");
+        assert!(st.contains("phase=ready"), "got {st}");
+        /* Blank, not nothing: applying nothing left the previous Set's steps
+         * in the engine under the new Set's name. */
+        let (payload, chains, gen) = s.take_loaded().expect("a new Set must replace what the engine holds");
+        assert_eq!(payload, BLANK_STATE);
+        assert_eq!(chains, "", "the chains are the UI's to clear; an empty doc here races its own");
+        assert_eq!(gen, 0);
+        assert!(!SetStore::new(&root).has_state("u1"), "a blank Set still writes nothing");
+    }
+
+    #[test]
+    fn a_saved_set_comes_back_on_open() {
+        let root = tmp("roundtrip");
+        let s = Saver::new(&root);
+        s.submit(Job::Save {
+            uuid: "u1".into(),
+            payload: "movy1\nbpm 12000\ncl 0 0 16 0 x\n".into(),
+            gen: 1,
+            chains: "0\n".into(),
+        });
+        s.submit(Job::Flush);
+        s.drain_for_test();
+
+        let s2 = Saver::new(&root);
+        s2.submit(Job::Open { uuid: "u1".into(), seed: None });
+        s2.drain_for_test();
+        let (payload, _chains, gen) = s2.take_loaded().expect("loaded");
+        assert_eq!(payload, "movy1\nbpm 12000\ncl 0 0 16 0 x\n");
+        assert_eq!(gen, 1);
+    }
+
+    /* The UI's only recovery is to blank the Set, which is scoped to a
+     * set-level failure — it cannot fix an engine that never started, and it
+     * would destroy a Set that is perfectly fine. So an open that fails must
+     * SAY it failed rather than looking like an empty Set. */
+    #[test]
+    fn an_unreadable_set_reports_failed_with_a_reason() {
+        let root = tmp("failed");
+        let s = Saver::new(&root);
+        std::fs::create_dir_all(format!("{root}/u1")).unwrap();
+        std::fs::write(format!("{root}/u1/seq-state.json"), "movy1\ngen 4\ntorn").unwrap();
+        s.submit(Job::Open { uuid: "u1".into(), seed: None });
+        s.drain_for_test();
+        let st = s.status();
+        assert!(st.contains("phase=failed"), "got {st}");
+        assert!(st.contains("reason="), "got {st}");
+        let (loaded, failed) = s.take_handoff();
+        assert!(loaded.is_none(), "an unreadable Set hands the engine nothing to apply");
+        assert_eq!(failed.as_deref(), Some("u1"), "and names itself to the audio thread");
+        assert_eq!(s.take_handoff().1, None, "once");
+    }
+
+    #[test]
+    fn dirty_clears_once_the_save_has_landed() {
+        let s = Saver::new(&tmp("dirty"));
+        s.submit(Job::Save {
+            uuid: "u1".into(),
+            payload: "movy1\nbpm 12000\ncl 0 0 16 0 x\n".into(),
+            gen: 1,
+            chains: "0\n".into(),
+        });
+        assert!(s.status().contains("dirty=1"), "got {}", s.status());
+        s.drain_for_test();
+        assert!(s.status().contains("dirty=0"), "got {}", s.status());
+    }
+
+    /* A seed is how copy-on-inherit survives the move: the UI names the source
+     * by name policy, the engine copies the bytes. */
+    #[test]
+    fn open_with_a_seed_inherits_when_the_set_has_nothing() {
+        let root = tmp("seed");
+        let s = Saver::new(&root);
+        s.submit(Job::Save {
+            uuid: "src".into(),
+            payload: "movy1\nbpm 15000\ncl 0 0 16 0 x\n".into(),
+            gen: 3,
+            chains: "0\n".into(),
+        });
+        s.submit(Job::Open { uuid: "copy".into(), seed: Some("src".into()) });
+        s.drain_for_test();
+        let (payload, _c, gen) = s.take_loaded().expect("loaded");
+        assert_eq!(payload, "movy1\nbpm 15000\ncl 0 0 16 0 x\n");
+        assert_eq!(gen, 1, "an inherited Set starts its own generation sequence");
+    }
+
+    /* A Set that owns state must NOT be overwritten by a seed — the seed is a
+     * fallback, never a preference. */
+    #[test]
+    fn a_seed_never_beats_the_sets_own_state() {
+        let root = tmp("seedown");
+        let s = Saver::new(&root);
+        s.submit(Job::Save { uuid: "src".into(), payload: "movy1\nbpm 15000\ncl 0 0 16 0 x\n".into(), gen: 3, chains: "0\n".into() });
+        s.submit(Job::Save { uuid: "own".into(), payload: "movy1\nbpm 90000\ncl 0 0 16 0 x\n".into(), gen: 2, chains: "0\n".into() });
+        s.submit(Job::Open { uuid: "own".into(), seed: Some("src".into()) });
+        s.drain_for_test();
+        assert_eq!(s.take_loaded().expect("loaded").0, "movy1\nbpm 90000\ncl 0 0 16 0 x\n");
+    }
+
+    fn lib_cmd(s: &Saver, cmd: &str) -> String {
+        s.submit(parse_cmd(cmd, "").expect(cmd));
+        s.drain_for_test();
+        s.lib()
+    }
+    fn field<'a>(w: &'a str, k: &str) -> &'a str {
+        w.lines().next().unwrap().split(' ').find_map(|t| t.strip_prefix(k)).unwrap()
+    }
+
+    #[test]
+    fn the_library_runs_on_the_saver_thread() {
+        let base = tmp("lib");
+        let root = format!("{base}/Movy/Sets");
+        let s = Saver::new(&root);
+        assert_eq!(s.lib(), "", "no library until a lib command arrives");
+
+        let w = lib_cmd(&s, &format!("lib migrate legacy={base}/none move={base}/none state={base}/none"));
+        assert_eq!(field(&w, "rev="), "1");
+        let w = lib_cmd(&s, "lib new 2026-10-10_01");
+        let id = field(&w, "made=").to_string();
+        assert!(w.contains(&format!("{id}\t0\t0\t2026-10-10_01")), "{w}");
+
+        /* The open records the last-open Set; the save caches its clips. */
+        s.submit(Job::Open { uuid: id.clone(), seed: None });
+        s.submit(Job::Save { uuid: id.clone(), payload: "movy1\ncl 0 0 16 0 x\n".into(), gen: 1, chains: "0\n".into() });
+        s.drain_for_test();
+        let w = s.lib();
+        assert_eq!(field(&w, "cur="), id);
+        assert!(w.contains(&format!("{id}\t1\t0\t")), "{w}");
+        let idx = std::fs::read_to_string(format!("{base}/Movy/library.json")).unwrap();
+        assert!(idx.contains(&format!("\"current\":\"{id}\"")), "{idx}");
+
+        /* The open Set cannot be deleted from under the saver. */
+        assert_eq!(field(&lib_cmd(&s, &format!("lib del {id}")), "err="), "busy");
+        let w = lib_cmd(&s, &format!("lib dup {id} 2026-10-10_01 Copy"));
+        let copy = field(&w, "made=").to_string();
+        let w = lib_cmd(&s, &format!("lib del {copy}"));
+        assert_eq!(field(&w, "err="), "-");
+        assert!(!w.lines().skip(1).any(|l| l.starts_with(copy.as_str())), "{w}");
+    }
+
+    /* A manual migration that replaces the OPEN Set goes back the way a
+     * restore does — bytes to the audio thread, the ui half to the UI. Written
+     * to disk alone, the engine's next autosave would put the old Set back. */
+    #[test]
+    fn a_manual_migration_hands_the_open_set_back() {
+        let base = tmp("lib-migrate-open");
+        let root = format!("{base}/Movy/Sets");
+        let legacy = format!("{base}/legacy");
+        SetStore::new(&legacy).write("u-1", "movy1\ncl 0 0 16 0 move\n", 2, "0\n").unwrap();
+        std::fs::write(format!("{legacy}/u-1/ui-state.json"), "{\"oct\":[5]}").unwrap();
+        std::fs::create_dir_all(format!("{base}/MoveSets/u-1/Song")).unwrap();
+        let s = Saver::new(&root);
+        let cmd = format!("lib migrate legacy={legacy} move={base}/MoveSets state={base}/none");
+        let w = lib_cmd(&s, &cmd);
+        assert_ne!(field(&w, "mig="), "0", "the first run marks the library");
+        s.submit(Job::Open { uuid: "u-1".into(), seed: None });
+        s.submit(Job::Save { uuid: "u-1".into(), payload: "movy1\ncl 0 0 16 0 edited\n".into(), gen: 9,
+                             chains: "0\n".into() });
+        s.drain_for_test();
+        let _ = s.take_loaded();
+
+        s.submit(parse_cmd(&format!("{cmd} force"), "u-1").unwrap());
+        assert_eq!(s.vui(), "pending", "pending from the command, not from the worker");
+        s.drain_for_test();
+        let (payload, _, gen) = s.take_loaded().expect("the open Set's bytes go to the engine");
+        assert_eq!(payload, "movy1\ncl 0 0 16 0 move\n");
+        assert!(gen > 9);
+        assert_eq!(s.vui(), "{\"oct\":[5]}");
+        assert!(s.versions().contains("pre-restore"), "{}", s.versions());
+
+        /* Not the open Set: nothing to reload. */
+        s.submit(Job::Open { uuid: "other".into(), seed: None });
+        s.submit(parse_cmd(&format!("{cmd} force"), "other").unwrap());
+        s.drain_for_test();
+        assert_eq!(s.vui(), "kept");
+        assert!(s.take_loaded().is_some(), "an open Set it kept is still handed back — the engine holds its autosave until then");
+    }
+
+    /* Leaving an empty Set drops it; leaving one with content keeps it; and
+     * the open one stays listed however empty, so a restart on it (reopening
+     * the same id) comes back to it rather than to some other Set. */
+    #[test]
+    fn leaving_an_empty_set_moves_it_to_trash() {
+        let base = tmp("lib-left");
+        let root = format!("{base}/Movy/Sets");
+        let s = Saver::new(&root);
+        lib_cmd(&s, &format!("lib migrate legacy={base}/none move={base}/none state={base}/none"));
+        let made = |s: &Saver, name: &str| field(&lib_cmd(s, &format!("lib new {name}")), "made=").to_string();
+        let empty = made(&s, "Empty");
+        let full = made(&s, "Full");
+        s.submit(Job::Open { uuid: empty.clone(), seed: None });
+        s.submit(Job::Open { uuid: empty.clone(), seed: None });   // a restart on it
+        s.drain_for_test();
+        assert!(s.lib().contains(&empty), "the open Set stays listed, however empty");
+        s.submit(Job::Open { uuid: full.clone(), seed: None });
+        s.submit(Job::Save { uuid: full.clone(), payload: "movy1\ncl 0 0 16 0 x\n".into(), gen: 1, chains: "0\n".into() });
+        s.drain_for_test();
+        let w = s.lib();
+        assert!(!w.contains(&empty), "left empty: gone from the list ({w})");
+        s.submit(Job::Open { uuid: empty.clone(), seed: None });
+        s.drain_for_test();
+        assert!(s.lib().contains(&full), "left with a clip: kept");
+    }
+
+    /* The Move-keyed sweep must never run over a library: every library id is
+     * one Move has never heard of, so it would delete them all. */
+    #[test]
+    fn the_dead_set_sweep_never_touches_a_library() {
+        let base = tmp("lib-gc");
+        let root = format!("{base}/Movy/Sets");
+        /* A REAL, empty Move Sets dir: an unreadable one makes the sweep
+         * collect nothing, which would pass this test with the guard gone. */
+        std::fs::create_dir_all(format!("{base}/MoveSets/someone-else")).unwrap();
+        let s = Saver::new(&root);
+        lib_cmd(&s, &format!("lib migrate legacy={base}/none move={base}/none state={base}/none"));
+        let w = lib_cmd(&s, "lib new A");
+        let id = field(&w, "made=").to_string();
+        s.submit(Job::Save { uuid: id.clone(), payload: "movy1\ncl 0 0 16 0 x\n".into(), gen: 1, chains: "0\n".into() });
+        s.submit(parse_cmd(&format!("gc keep=other sets={base}/MoveSets"), "").unwrap());
+        s.drain_for_test();
+        assert!(std::path::Path::new(&format!("{root}/{id}/seq-state.json")).exists(), "the library Set survives");
+        assert_eq!(s.gc(), "collected=0");
+
+        /* A fresh saver on the same library (before any lib command) too. */
+        let s2 = Saver::new(&root);
+        s2.submit(parse_cmd(&format!("gc keep=other sets={base}/MoveSets"), "").unwrap());
+        s2.drain_for_test();
+        assert!(std::path::Path::new(&format!("{root}/{id}/seq-state.json")).exists());
+    }
+
+    /* Reviewed: naming a new Set deleted its frozen loops. lib.rs saves the
+     * work in hand under the new id before the rename, so the rename found
+     * state there, skipped the seed (the only thing that copies freeze files)
+     * and removed the pending directory with the WAVs in it. */
+    #[test]
+    fn a_rename_carries_the_frozen_loops_when_the_new_id_already_has_state() {
+        use crate::freeze::LoopMap;
+        use crate::freeze_files::{encode_manifest, ClipEntry, Entry};
+        let root = tmp("freeze-rename");
+        let map = LoopMap::new(seq_core::TICKS_PER_BAR, 12_000, 44_100).unwrap();
+        let samples: Vec<i16> = vec![7; map.frames() * 2];
+        let win = seq_core::engine::RecWindow { start_ticks: 0, len_ticks: seq_core::TICKS_PER_BAR };
+        let manifest = encode_manifest(&[Entry { track: 3, bpm_x100: 12_000, rate: 44_100, chain_print: 7,
+            modules: "synth=obxd".into(),
+            clips: vec![ClipEntry { slot: 0, len_ticks: map.len_ticks(), frames: map.frames(), win, print: 1 }] }]);
+        let payload = "movy1\ncl 0 0 16 0 x\n";
+
+        let s = Saver::new(&root);
+        s.submit(Job::Open { uuid: "__pending-1".into(), seed: None });
+        s.submit(Job::Save { uuid: "__pending-1".into(), payload: payload.into(), gen: 1, chains: "0\n".into() });
+        s.submit(Job::Freeze { uuid: "__pending-1".into(), manifest, wavs: vec![(3, 0, Arc::new(samples), 44_100)] });
+        // lib.rs's rename: the work in hand under the new id, then the job.
+        s.submit(Job::Save { uuid: "named".into(), payload: payload.into(), gen: 2, chains: "0\n".into() });
+        s.submit(Job::Rename { from: "__pending-1".into(), to: "named".into() });
+        s.drain_for_test();
+
+        let s2 = Saver::new(&root);
+        s2.submit(Job::Open { uuid: "named".into(), seed: None });
+        s2.submit(Job::ReadFrozen { uuid: "named".into() });
+        s2.drain_for_test();
+        assert!(s2.take_loaded().is_some());
+        assert_eq!(s2.take_frozen().map_or(0, |(_, f)| f.len()), 1, "the named Set lost its frozen track");
+    }
+}

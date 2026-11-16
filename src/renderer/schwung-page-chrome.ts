@@ -1,0 +1,215 @@
+/* schwung-page-chrome.ts — the two bands movy keeps for itself under Schwung's
+ * page, and what goes in them.
+ *
+ * THE HEADER IS SCHWUNG'S ANSWER, DRAWN BY MOVY. `bands.header` stays false in
+ * schwung-page-render.ts, and that is a LAYOUT decision rather than a claim
+ * that movy has nothing to say: Schwung's own chrome needs 47 + 2 + 7 = 56
+ * rows below the header and movy leaves 54. So movy draws it, but it does not
+ * GET to decide what it says — `describePage().header` is built by Schwung's
+ * `movyHeaderFor`, the same function `renderPageMovy` draws its own header
+ * with, so the readout cannot drift from the one Schwung's host shows.
+ *
+ * ONLY WHILE A KNOB IS HELD. Nothing held, and movy's own header — track,
+ * module, pad grid icon — says more than Schwung's title branch does, and says
+ * it in movy's grammar. `inverted` is exactly the question "is a param under
+ * the hand": movyHeaderFor sets it on that branch and no other, so the flag is
+ * the gate rather than a re-derivation of it. (A knob held over an UNBOUND cell
+ * takes the other branch, whose left side is the empty title — drawing that
+ * would blank movy's header, so it is treated as no answer at all.)
+ *
+ * THE FOOTER'S WORDS ARE MOVY'S, ITS CONDITIONS ARE NOT. Schwung's own
+ * vocabulary lives in `footerHints()` in shadow_ui_param_pages.mjs — the
+ * shadow-side HOST, which movy may not import — so the verbs below are a second
+ * copy, and the project's rule about second copies ("ask the controller; do not
+ * restate") is answered by taking every CONDITION from the controller: which
+ * page kind, whether it is entered, whether the picker is over it, and what the
+ * cell under the hand is.
+ *
+ * A HELD KNOB EARNS A HINT ONLY WHERE THE CLICK IS THE ONLY WAY IN. Schwung's
+ * footer names a verb for every held cell — OPEN, FLIP, FIRE, and MENU for the
+ * rest — and movy copied it, which made the hint both noise and wrong: a plain
+ * knob's click does NOTHING (`applyInput` hands a held click to
+ * `onClick(held)`, which returns null for a non-divable cell, and movy's
+ * no-knob-held click is its module browser, not Schwung's menu), and a
+ * wav_position's OPEN reaches no screen in movy. Every other verb has a knob
+ * gesture that does the same thing — an enum steps as it turns, a two-way
+ * toggles, a trigger fires on its first detent — so naming the click only
+ * covered the Loop strip on every touch. What is left is a FILE or a CANVAS:
+ * not turnable, and the click is the one road to the browser or the module's
+ * own screen (`clickOnlyVerb`).
+ *
+ * THE JOG VERBS ARE ONLY THE KNOBS VIEW'S. On the chain view the jog moves
+ * CHAIN SLOTS, not pages (`chain-view.ts` argues this at length), so a
+ * `JOG PAGE` pill there would promise a thing the button does not do — the
+ * exact class of bug the upstream footer's own comments record three times.
+ * The caller passes `paging: false` there, and the footer keeps only the click
+ * pair, which is true on every view (`clickOnlyFooter`).
+ *
+ * THE PAGE LABEL IS THE THIRD THING, AND IT IS NOT A BAND. movy's header names
+ * the page on its right — and under `page` the bank BAR is already Schwung's
+ * (`schwungBankFor`, over `pageIndex`/`pageCount`) while that name was still
+ * movy's bank, so the bar paginated one set and the label named the other. On a
+ * module whose movy config opens with a preset bank the label is a constant.
+ * `pageLabel` rides here because this is the one place that composes what movy
+ * says while a delegated page is the body, and because the whole object is
+ * withheld where the delegated page is not what is drawn (`schwungChromeFor`
+ * returns undefined), which is what keeps `off` byte-identical.
+ */
+import type { SchwungLib } from './schwung-lib.js';
+import { fitHeldHeader } from './held-header-fit.js';
+import { clickOnlyFooter } from './schwung-file-param.js';
+
+export interface PageHeader {
+    left: string;
+    right: string | null;
+    inverted: boolean;
+}
+
+/** What movy draws in the rows Schwung is not asked for. `header` null means
+ *  movy's own header stands; `footer` null means movy's own footer does.
+ *  `pageLabel` is not a band: it is the page's own name, for the right-hand end
+ *  of a header movy is already drawing. */
+export interface PageChrome {
+    header: PageHeader | null;
+    footer: [string, string][] | null;
+    pageLabel: string | null;
+    /** Does a pad press re-target this page? The header's pad icon answers
+     *  that, and only the seat knows which of Schwung's pages are per-pad:
+     *  movy's own `isPadScoped` reads movy's banks, which are not on screen. */
+    padScoped: boolean;
+}
+
+/** Everything movy draws around Schwung's body, in one answer.
+ *  `paging` is false wherever the jog moves something that is not Schwung's
+ *  page set — the chain view, where it moves chain slots. */
+export function chromeFor(ctl: any, lib: SchwungLib, paging: boolean,
+                          padScoped = false): PageChrome {
+    const held = !!(ctl && ctl.state && ctl.state.touched >= 0);
+    return {
+        header: heldHeaderFor(ctl),
+        pageLabel: pageLabelFor(ctl),
+        padScoped,
+        /* A HAND ON A KNOB MAY TAKE THE BOTTOM ROWS — only for a hint it
+         * cannot do without (see the header: the click is the only way in).
+         *
+         * The hint band and the Loop strip occupy overlapping rows — the
+         * footer's 57..63 against the strip's 60..63, which it clears on EVERY
+         * tick, outside the dirty-frame block, so anything drawn there without
+         * the claim below keeps only its top three rows. They cannot both have
+         * it, and the persistent readout is not the one that should lose
+         * without reason: the strip is live musical feedback.
+         *
+         * So the footer is a TRANSIENT occupant, on exactly the terms movy's
+         * own bottom-row toasts already take the row (`jogHintVisible()` —
+         * the jog under a finger). */
+        footer: !held ? null : paging ? pageFooterFor(ctl, lib) : clickOnlyFooter(ctl),
+    };
+}
+
+/* THE PAGE'S OWN NAME, from the controller — never `page.name`. A page belonging
+ * to a CHILD level is named after WHICH CHILD it is showing, which the planned
+ * name cannot know: minijv plans "Edit Parts - 2" where the 2 is the second page
+ * OF THE LEVEL, so a user who has just chosen Part 2 reads the wrong number
+ * (`page_controller.mjs` says so at `pageLabel`, and Schwung's own host header
+ * takes the same answer — movy's header must not call the page something the
+ * host would not).
+ *
+ * GUARDED, like every optional read across the movy↔Schwung seam: a Schwung that
+ * cannot answer is the same as a page with no name, which is the header movy
+ * drew before this existed. `''` collapses to null for the same reason — an
+ * empty name must not win the `||` chain and blank the label movy would have
+ * shown. */
+export function pageLabelFor(ctl: any): string | null {
+    if (!ctl || typeof ctl.pageLabel !== 'function') return null;
+    const name = ctl.pageLabel();
+    /* THE THREE NULL-ISH INPUTS COLLAPSE TO ONE `null` ON PURPOSE, against the
+     * tri-state discipline the rest of this seam keeps: no controller, a
+     * controller that cannot name a page, and a name that is empty all mean the
+     * same thing to the one consumer — movy has no name for this page — and the
+     * header already has a good answer for that (`headerRightText`'s fallback
+     * chain, `knob-view.ts`): a bank or pad name, which beats a blank line. So
+     * there is nothing for a third state to say, and a consumer merging them
+     * back together is what this return does once instead. */
+    return (name === undefined || name === null || name === '') ? null : String(name);
+}
+
+export function heldHeaderFor(ctl: any): PageHeader | null {
+    if (!ctl || !ctl.state || ctl.state.touched < 0) return null;
+    const h = ctl.describePage({}).header;
+    return h && h.inverted ? fitHeldHeader(h) : null;
+}
+
+/* A door is inert until entered, so outside it the jog still pages and the
+ * click is what goes in; inside, the jog drives the list and Back comes out.
+ * Same shape for both kinds — only the noun and the click verb change, and
+ * those are the words the shadow footer uses. A preset door has no pills at
+ * all (pageFooterFor). The KINDS
+ * come from the controller's own constants rather than their string values, so
+ * a rename upstream cannot quietly turn a door into a plain knob page here. */
+function doorVerbs(lib: SchwungLib, kind: string): [[string, string], [string, string], [string, string]] | null {
+    switch (kind) {
+        case lib.PAGE_MENU:   return [['JOG', 'SEL'],  ['CLK', 'OPEN'], ['BACK', 'OUT']];
+        case lib.PAGE_ITEMS:  return [['JOG', 'SEL'],  ['CLK', 'LOAD'], ['BACK', 'OUT']];
+    }
+    return null;
+}
+
+export function pageFooterFor(ctl: any, lib: SchwungLib): [string, string][] | null {
+    if (!ctl) return null;
+
+    /* The picker is OVER the page, so nothing below it is what a click does. */
+    if (ctl.pickerOpen) return [['JOG', 'SECT'], ['CLK', 'GO'], ['BACK', 'EXIT']];
+
+    const p = ctl.page;
+    const entered = !!(ctl.menuEntered && ctl.menuEntered());
+    const verbs = p ? doorVerbs(lib, p.kind) : null;
+    /* No pills on a preset door: the Loop strip owns those rows there (see
+     * claimsBottomBand), and knob 1 browsing needs no click to explain. */
+    if (p && p.kind === lib.PAGE_PRESET) return null;
+    if (verbs) {
+        return entered ? verbs : [['JOG', 'PAGE'], ['CLK', 'ENTER']];
+    }
+
+    /* The page set is not in question here — the jog pages, as it does with
+     * no knob held — so the one pair is the click. */
+    return clickOnlyFooter(ctl);
+}
+
+/**
+ * Is this a REGULAR knob — a number the knob scrubs, whose click does nothing?
+ *
+ * Hold-to-modulate (`lfo/assign-mode.ts`) re-binds the click and the jog after
+ * HOLD_MS, and on a Schwung page the click already means something for every
+ * other kind: an enum opens its list or flips, a trigger fires, a file opens
+ * the browser. Arming there takes that click away a second after the touch,
+ * which is about how long reading the cell takes. A regular knob's click is
+ * free, so the hold costs nothing there. An LFO can still target the rest from
+ * the LFO page's own Target knob.
+ */
+export function regularKnob(meta: any, lib: SchwungLib): boolean {
+    return !!meta && !!lib.isTurnable && lib.isTurnable(meta) && meta.kind !== lib.KIND_ENUM;
+}
+
+/**
+ * Does Schwung's page draw into the BOTTOM BAND right now?
+ *
+ * The Loop strip repaints rows 60-63 on every tick, outside the dirty frame,
+ * so anything drawn there without a claim keeps only its top rows — Schwung's
+ * enum peek list ("TURN SET"), its section picker, a menu / items / preset
+ * page's footer and its hint card all lost their bottom line to the strip.
+ * Asked of the PAGE rather than listed per render branch (SP-60): each branch
+ * that forgot one kind was one more screen with the bug. No reads — state only.
+ */
+export function claimsBottomBand(ctl: any, lib: SchwungLib): boolean {
+    if (!ctl) return false;
+    if (typeof ctl.enumPeek === 'function' && ctl.enumPeek()) return true;
+    if (ctl.pickerOpen) return true;
+    if (ctl.state && ctl.state.hintLines) return true;
+    const p = ctl.page;
+    /* A PRESET DOOR LEAVES THE BAND TO THE LOOP STRIP. Its body ends at
+     * Schwung's footer rule (RESERVED_FOOTER, schwung-page-render.ts) and it
+     * has no footer of its own (pageFooterFor), so there is nothing down there
+     * to protect — and the bar position is what you want to see while picking
+     * a sound against a running clip. */
+    return !!p && p.kind !== undefined && p.kind !== lib.PAGE_KNOBS && p.kind !== lib.PAGE_PRESET;
+}

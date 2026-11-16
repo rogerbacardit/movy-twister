@@ -1,0 +1,107 @@
+# Settings & system
+
+## Opening and leaving Movy
+
+Open Movy from Schwung's **Tools** menu (hold **Shift**, touch the **volume
+knob**, click the **jog**), or set the Move to start in Movy at power-on (see
+[Install → Open Movy](../install.md#open-movy)).
+
+While Movy starts or a Set loads, the screen shows loading messages and the pads
+and knobs stay off until the instruments are ready. **Back** always works.
+
+**To leave**, press **Back** at the top level (the Chain view). **Leave Movy?**
+offers **Close Movy**: turn the jog to it and click. Movy saves first, then the
+Move returns to its own software with Schwung.
+
+**If Movy stops responding:** hold **Shift**, touch the **volume knob** and
+click the **jog**. Movy closes (saving if it can) and gives the device back
+within two seconds, whatever state it is in.
+
+## Powering off
+
+Tap the **power button** and Movy asks **Power off?**. Click the jog to confirm,
+or **Back** to carry on. Movy saves the Set, then the Move shuts down.
+
+![Power off?](../assets/screens/power_modal.png){ .small }
+
+## Settings
+
+**Shift** + **Step 2** opens Settings, a list: **jog** to move, **jog click** to
+open a row, **Back** to close. The line at the bottom explains the selected row.
+**Knob 1** changes the selected row's value, and its light shows that value
+(dim at the bottom, bright at the top), as on a parameter page.
+
+![Settings](../assets/screens/flags-top.png){ .small }
+
+| Row | What it does |
+| --- | --- |
+| **CLICK VOLUME** | How loud the metronome and count-in are. Turn **knob 1**: 0 dB to +11 dB. Kept for this Move, not per Set. |
+| **LINK** | Ableton Link on or off: turn **knob 1** right for on, left for off (or **jog click**) (see [Playing with Live over Link](#playing-with-live-over-link)). Off until you turn it on; kept for this Move, not per Set. |
+| **BACKUPS** | Older versions of the open Set (see [Backups](sets.md#backups)). |
+| **MIGRATE FROM MOVE** | Copy work from Movy 0.35 and earlier, and Schwung, out of your Move Sets again (see [Work from older Movy versions](sets.md#work-from-older-movy-versions-and-schwung)). Click once to arm (`CONFIRM?`), again to run. |
+
+## The CPU meter
+
+**Shift** + **Step 12** shows how much processing your Set uses. **Back** closes
+it; pressing **Shift** + **Step 12** again resets the peak marks.
+
+![CPU meter](../assets/screens/cpu-movy-tracks.png){ .small }
+
+- The **bar under the header** is the whole Set. **Under 80 % is comfortable;
+  near 100 % you are at the edge; over 100 % you will hear dropouts.** The notch
+  above the bar is the worst moment since you opened the page.
+- Each **column** is one track: solid for the instrument, checkered for its
+  effects, a dotted line for its peak. A short dash means the track is loaded but
+  silent, and costs nothing right now.
+- When send effects are loaded, three more columns appear on the right under `SND`.
+- An **F** over a column is a [frozen](sounds.md#freezing-a-track) track: the
+  column is what its loop costs, a microsecond or two.
+
+Six or seven tracks of ordinary synths is typical; light modules go much further.
+A silent track costs nothing, and a [frozen](sounds.md#freezing-a-track) one
+almost nothing.
+
+## The built-in speaker
+
+Movy applies the same speaker EQ as Move, so the built-in speaker sounds the
+same as under Move. It follows Schwung's **Global Settings → Audio → Spkr EQ**
+(Auto / Off / On). If you opened Movy from the Tools menu and the speaker sounds
+thin, set it to **On**. Headphones and line out are never affected.
+
+## Recording a video of your screen
+
+Schwung's web mirror works with Movy. On a computer, open
+<http://move.local:7700/mirror>. It shows the screen and every pad and button
+light, with your hands' presses. **Record** saves a video, **Save PNG** a still.
+Sound is included while Schwung's **Mirror Display** setting is on (Schwung
+Manager → Settings). Good for sharing a jam, or for showing a bug.
+
+## Playing with Live over Link
+
+Movy can join an Ableton Link session: it shares tempo, beat and Play/Stop with
+Live (or any Link app), and sends each track to Live as its own audio input.
+
+**Turn it on:** **Shift** + **Step 2** opens [Settings](#settings); jog to
+**LINK** and turn **knob 1** right so it reads **ON**. It is off until you turn it on,
+and stays as you left it.
+
+**Connect:** Move and the computer on the same WiFi, or Move plugged into the
+computer with its USB-C cable. In Live, turn on **Link** (and **Start Stop
+Sync** for shared Play/Stop).
+
+On the [Set page](sequencer.md#the-set-page) the tempo shows **LNK**
+while Movy follows another Link app; its header reads `LINK` and how many apps
+are connected.
+
+- **Tempo:** change it on either side; both follow. When Movy joins, it takes
+  the session's tempo.
+- **Play/Stop:** pressing Play on either side starts both on the next bar; Stop
+  stops both.
+- **Audio into Live:** set an audio track's input to **Movy 01** … **Movy 16**
+  (one per track, after its volume, pan and mute), **Movy Send 1** … **Movy Send 3**
+  (the send effects' returns) or **Movy Master** (everything, before Movy's
+  master volume). Record as usual: the recording lands on Live's grid.
+
+Listen on Move's own headphones or line out while you play. The copy in Live
+arrives a little late (more over WiFi than over USB-C), so it is for recording
+and mixing, not for monitoring. Only the inputs Live is using cost Movy any CPU.

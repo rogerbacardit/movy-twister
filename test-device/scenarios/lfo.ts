@@ -1,0 +1,260 @@
+/* Migrated from scripts/test-lfo.sh — an LFO assigned on a MOVY-hosted track
+ * actually modulates.
+ *
+ * The bug this exists for: the LFO target commit went through
+ * `shadow_set_param_timeout(track, …)`, schwung's SLOT-addressed API, which
+ * refuses any index past slot 3 (shadow_ui.c: `slot >= SHADOW_UI_SLOTS`). A movy
+ * track is a chain in movy's own engine, not a schwung slot, so on tracks 5-16
+ * the write returned false having written nothing: the target never changed and
+ * `enabled` stayed 0, so the chain's lfo_tick() skipped the LFO entirely.
+ *
+ * THE CHAIN NUMBER IS LOAD-BEARING. Chain 4 is the first chain past schwung's
+ * four slots, so it is the smallest one that exercises the movy-hosted path at
+ * all — the same assignment on chain 0 would have succeeded with the bug
+ * present and the suite would have proved nothing.
+ *
+ * The two halves this suite joins, neither of which any local test can reach:
+ * that the assignment LANDS (L2-L4) and that the chain host then really MOVES
+ * the driven param (L5). Both need the real chain DSP, so both are read back
+ * off the device through `chlfolog` — the engine diagnostic that makes a chain
+ * log its LFO state — because the write-only param socket cannot read.
+ *
+ * Covers:
+ *   L1  chain 4 holds the fixture's synth
+ *   L2  an unassigned LFO starts inactive
+ *   L3  the assignment reaches the chain instance
+ *   L4  the chain marks the LFO active
+ *   L5  the driven param actually MOVES
+ *   L6  clearing the target deactivates the LFO
+ *
+ * L5 WAS "KNOWN FAILING, inherited": the bash suite reported it rather than
+ * scoring it, on the argument that a suite every sweep reads as broken stops
+ * being read at all. Fixed 2026-09-12 — the freeze was never in the chain
+ * host. `chlfolog`'s own read-back (chain_slots.rs, `lfo_report`) asked for
+ * the PLAIN "<target>:<param>" key, which schwung's chain host deliberately
+ * shadows to the BASE value while a target is actively modulated
+ * (`chain_mod_get_base_for_plain_key`, guarding #276 — a mod-unaware reader
+ * must not see the value the overlay keeps writing into the plugin). The
+ * diagnostic needed "<target>:<param>:effective" instead
+ * (`chain_mod_get_effective_for_subkey`) — the same key the UI's own mod
+ * dot/marker use. Pinned forever by a Rust unit test
+ * (`chain_slots::tests::lfo_report_reads_the_effective_value_not_the_base`)
+ * that fakes the chain host's key-based dispatch with no device needed, and
+ * device-verified here: the four samples now read
+ * `1.000000 -> 1.000000 -> 1.000000 -> 0.630558` instead of frozen at 0.5.
+ *
+ * What the bash suite spent on `sleep`: 1.2 s per LFO report (six of them),
+ * 1 s after the assignment, 3 s after the module load, 8 s after the open, and
+ * 0.7 s per sample of the driven param. Every one is now a wait on the thing it
+ * was standing in for.
+ */
+import { scenario } from '../runner.js';
+import { Device } from '../device.js';
+import { Probe } from '../probe.js';
+import * as fixture from '../fixture.js';
+import { until } from '../wait.js';
+
+/* test-device/dist/scenarios/lfo.js at run time. */
+
+/* The first chain past schwung's four slots — see the header. */
+const CHAIN = 4;
+
+/* Asked for, never written down (MIGRATION.md rule 8): a hard-coded id is how
+ * this suite silently stops describing the fixture it runs against. */
+const SYNTH = fixture.fixtureSynth(0);
+
+const LFO = 1;
+const TARGET = 'synth';
+const TARGET_PARAM = 'morph';
+
+/* `chlfolog <n>` logs chain n's LFOs; `chain <n>: <comp> = <mod>` is the chain
+ * host's load trace (chain_slots.rs). Both are read out of band over SSH, as
+ * unload.ts and reselect.ts do, because the param socket the harness writes
+ * through has no read verb for either. */
+const LOG_LFOS   = `chain ${CHAIN} lfos:`;
+const LOG_LOADED = `chain ${CHAIN}: synth = ${SYNTH}`;
+
+/* Frames to let the engine act on a write before reading — a quantity of device
+ * work, never a wall clock. */
+const ACT = 90;
+
+type Lfo = { raw: string; target: string; param: string; active: string; value: string };
+
+const NO_REPORT: Lfo = { raw: '', target: '', param: '', active: '', value: '' };
+
+/* One `lfoN=[target:param active=A value=V]` group out of the report line, or
+ * `raw` alone when the line is missing or the group is not there. Read as
+ * FIELDS rather than as a substring of the rendered line: the spacing and the
+ * `-` placeholder are the logger's formatting, and a check that depends on them
+ * measures the formatter. */
+function parseLfo(line: string, n = LFO): Lfo {
+    const m = line.match(
+        new RegExp(`lfo${n}=\\[([^:]*):([^ ]*) active=(\\d+) value=([^\\]]*)\\]`));
+    if (!m) return { raw: line, target: '', param: '', active: '', value: '' };
+    return { raw: line, target: m[1], param: m[2], active: m[3], value: m[4] };
+}
+
+scenario('lfo', async (t) => {
+    fixture.setHost(t.host);
+    const dev   = new Device(t.tx);
+    const probe = new Probe(t.tx);
+    const open  = () => dev.open(probe);
+    const close = () => dev.close(probe);
+
+    /* A movy ENGINE param write, over the WebSocket the remote UI exposes.
+     *
+     * NOT the test bus, and that is forced rather than preferred: testd's
+     * SET_PARAM splits the wire line on its first space and treats a
+     * whitespace-only remainder as a MISSING value (`protocol_split_command`
+     * leaves `args` NULL, `cmd_set_param` answers ERR), so the EMPTY value that
+     * clearing an LFO target consists of is unreachable through the bus. The
+     * socket has no such narrowing. The bash suite wrote every one of these
+     * this way; keeping one writer keeps the assignment and the clear on the
+     * same path. */
+    const ep = (key: string, value: string): Promise<void> => t.tx.engineSetQueued(key, value);
+
+    /* `chlfolog` is write-to-read: the engine logs the report when it is poked,
+     * so wait for the poke's OWN line. The previous one describes the chain
+     * from before whatever the caller just wrote — fixture.ts's `chloaded`
+     * carries the same note for the same reason. */
+    const report = async (): Promise<string> => {
+        const before = (await dev.logLines(LOG_LFOS)).length;
+        await ep('chlfolog', String(CHAIN));
+        try {
+            const ls = await until(t.tx, 'the chlfolog answer',
+                () => dev.logLines(LOG_LFOS), (v) => v.length > before,
+                { within: 1400, every: 120 });
+            return ls[ls.length - 1];
+        } catch { return ''; }
+    };
+
+    await fixture.ensure(t.tx, open, close);
+    t.note('fixtureSynth', SYNTH);
+    await dev.deployUi();
+    await dev.open(probe);
+    await t.tx.frames(ACT);
+
+    // ── L1: the chain the rest of the suite runs on ──────────────────────────
+    /* A module load into a chain the host has not been configured for is
+     * DROPPED rather than deferred, so this is the one setup step whose failure
+     * would make everything below prove nothing — the bash suite treated it as
+     * a hard gate and said so. */
+    const loadBefore = (await dev.logLines(LOG_LOADED)).length;
+    await ep(`ch${CHAIN}:synth:module`, SYNTH);
+    let loaded = true;
+    try {
+        await until(t.tx, `chain ${CHAIN} to load ${SYNTH}`,
+            () => dev.logLines(LOG_LOADED), (v) => v.length > loadBefore,
+            { within: 3500, every: 120 });
+    } catch { loaded = false; }
+    t.note('chainLoadLines', (await dev.logLines(LOG_LOADED)).length);
+    t.check('chain-loaded', `chain ${CHAIN} holds a synth`,
+        loaded,
+        { expected: `a "${LOG_LOADED}" line in the device log`,
+          actual: loaded ? 'the chain reported the load'
+                         : 'the chain never loaded — the rest of this suite would prove nothing' });
+
+    // ── L2: an unassigned LFO is inactive ────────────────────────────────────
+    const beforeRaw = await report();
+    const before = parseLfo(beforeRaw);
+    t.note('lfoBefore', before);
+    t.check('lfo-starts-inactive', 'LFO 1 starts unassigned and inactive',
+        before.target === '' && before.param === '' && before.active === '0',
+        { expected: 'lfo1=[ : active=0 — no target, no param, inactive',
+          actual: beforeRaw || '<no chlfolog answer>' });
+
+    // ── L3 / L4: the assignment lands in the chain ───────────────────────────
+    /* Exactly the fields movy's assign path commits, in the same order. Then
+     * WAIT for the chain to report them rather than sleeping at it: the write
+     * is asynchronous (the engine services it on the audio thread), so the
+     * wait's budget is what tells a slow assignment apart from one that never
+     * happened. */
+    /* Park the base mid-range FIRST. `morph` is 0..1 and the depth below is 0.9,
+     * so a base left near either rail spends most of the cycle clamped and the
+     * readback below is legitimately constant — which is how this check failed
+     * on a build whose modulation was working (`1.000000` four times, against
+     * the same engine md5 that had just passed). Centring it makes a moving
+     * param unable to look frozen. */
+    await ep(`ch${CHAIN}:${TARGET}:${TARGET_PARAM}`, '0.5');
+    await ep(`ch${CHAIN}:lfo${LFO}:target`, TARGET);
+    await ep(`ch${CHAIN}:lfo${LFO}:target_param`, TARGET_PARAM);
+    await ep(`ch${CHAIN}:lfo${LFO}:enabled`, '1');
+    await ep(`ch${CHAIN}:lfo${LFO}:depth`, '0.9');
+    await ep(`ch${CHAIN}:lfo${LFO}:rate_hz`, '8.0');
+    await ep(`ch${CHAIN}:lfo${LFO}:sync`, '0');
+
+    let afterRaw = await report();
+    if (parseLfo(afterRaw).target !== TARGET) {
+        try {
+            afterRaw = await until(t.tx, 'the assignment to reach the chain',
+                () => report(),
+                (l) => parseLfo(l).target === TARGET,
+                { within: 1500, every: 150 });
+        } catch { /* the checks below report what the chain holds */ }
+    }
+    const after = parseLfo(afterRaw);
+    t.note('lfoAfter', after);
+
+    t.check('target-lands', 'the target reached the chain instance',
+        after.target === TARGET && after.param === TARGET_PARAM,
+        { expected: `lfo1=[${TARGET}:${TARGET_PARAM}`,
+          actual: afterRaw || '<no chlfolog answer>' });
+
+    t.check('lfo-active', 'the chain marked the LFO active',
+        after.active === '1',
+        { expected: `lfo1=[${TARGET}:${TARGET_PARAM} active=1`,
+          actual: afterRaw || '<no chlfolog answer>' });
+
+    // ── L5: THE claim — the driven param actually moves ──────────────────────
+    /* Sample until it MOVES, bounded — not a fixed count. A periodic value read
+     * at N arbitrary instants can legitimately come back the same N times, so a
+     * fixed sample count asks "was I lucky" and answers it differently on
+     * different runs. Polling to a deadline asks "did it move within 6 s",
+     * which has one answer. Each `report()` is its own device round trip, so
+     * the spacing between samples is real work, not a wall clock. */
+    const samples = [after.value];
+    try {
+        await until(t.tx, 'the driven param to move',
+            async () => { samples.push(parseLfo(await report()).value); return samples; },
+            (vs) => vs[0] !== '' && vs.some((v) => v !== vs[0]),
+            { within: 6000, every: ACT });
+    } catch { /* the check below reports every sample it took */ }
+    t.note('drivenParam', samples);
+    const seen  = samples.join(' -> ');
+    const moved = samples[0] !== '' && samples.some((v) => v !== samples[0]);
+    /* WAS known-failing (frozen at the base, 0.500000, on both hosts, since
+     * v0.31.0) — see the header note. The freeze was never in the chain host's
+     * mod runtime: `report()` above reads `chlfolog`, and that diagnostic
+     * (`chain_slots.rs::lfo_report`) asked for the plain "target:param" key,
+     * which the chain host deliberately shadows to the BASE value while a
+     * target is actively modulated. Fixed by asking for ":effective" instead —
+     * see the Rust unit test this restores teeth to
+     * (`chain_slots::tests::lfo_report_reads_the_effective_value_not_the_base`).
+     * This check is a real device readback, not decoration: it is what proved
+     * the fix, sampling `1.000000 -> 1.000000 -> 1.000000 -> 0.630558`. */
+    t.check('param-moving', 'the driven param is moving — modulation is live',
+        moved,
+        { expected: 'the sampled value to differ across four samples',
+          actual: moved ? `moving: ${seen}` : `frozen at ${samples[0] || '<no value>'}: ${seen}` });
+
+    // ── L6: clearing stops it ────────────────────────────────────────────────
+    await ep(`ch${CHAIN}:lfo${LFO}:target`, '');
+    await ep(`ch${CHAIN}:lfo${LFO}:target_param`, '');
+    await ep(`ch${CHAIN}:lfo${LFO}:enabled`, '0');
+
+    let clearedRaw = await report();
+    if (parseLfo(clearedRaw).active !== '0' || parseLfo(clearedRaw).target !== '') {
+        try {
+            clearedRaw = await until(t.tx, 'the LFO to deactivate',
+                () => report(),
+                (l) => parseLfo(l).active === '0' && parseLfo(l).target === '',
+                { within: 1500, every: 150 });
+        } catch { /* the check below reports what the chain holds */ }
+    }
+    const cleared = parseLfo(clearedRaw);
+    t.note('lfoCleared', cleared);
+    t.check('clear-deactivates', 'clearing the target deactivates the LFO',
+        cleared.target === '' && cleared.active === '0',
+        { expected: 'lfo1=[ : active=0 after the clear',
+          actual: clearedRaw || '<no chlfolog answer>' });
+});

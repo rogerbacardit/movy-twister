@@ -1,0 +1,272 @@
+/* New with SP-57 — movy's OWN pages, drawn by Schwung, on hardware.
+ *
+ * Set Params, Clip Params and the step page have no module behind them: movy
+ * writes their contract itself (`createVirtualSource`, the SP-53/SP-54 seam)
+ * and Schwung plans and draws from it. What the contract says is covered
+ * locally — `browser-test/logic/*-params-source.mjs` drives the real
+ * controller through it. What only the device can say is that the step page
+ * is actually REACHED under delegation by a real held-step gesture: the
+ * promotion clock, the occupancy rule and the jog walk below are all timing
+ * and state no checkout reproduces.
+ *
+ * THIS SCENARIO ONCE ALSO CHECKED THAT TURNING PROB RAISES THE ENUM PANEL. It
+ * settled SU-19 (the panel was missing only because movy's repaint gate never
+ * asked for the frame — SP-57 H5, pinned by `page-freshness.mjs`), and then
+ * SP-57 H6 made every step-page enum declare `peek: false`, because LEN, PROB
+ * and COND print in full in their square. From then on, the check was asserting
+ * a panel the page is designed not to raise, and it failed for that reason. The
+ * suppression is pinned locally (`step-params-source.mjs`,
+ * `set-params-source.mjs`), so there is nothing left on this page for a
+ * framebuffer grab to judge.
+ *
+ * Covers:
+ *   V1  the step page comes up under delegation while a step is held
+ */
+import { scenario } from '../runner.js';
+import { Device } from '../device.js';
+import { Probe } from '../probe.js';
+import * as fixture from '../fixture.js';
+import { STEP_NOTE_BASE } from '../midi.js';
+import { until } from '../wait.js';
+
+/* THE STEP PAGE IS ENTERED, NOT AUTOMATIC — and assuming otherwise is what made
+ * the first run of this scenario grade the wrong page.
+ *
+ * Holding a step makes the step page AVAILABLE; what SELECTS it is Left while
+ * the module is on its page 0 (`src/midi/router.ts`'s MoveLeft branch:
+ * `stepPageAvailable() && !stepPageState.selected && o.pageIndex === 0`). Until
+ * then the module's own page is still drawn — the first run held a step,
+ * reported `module=plaits`, turned what it thought was PROB and concluded the
+ * overlay was missing. It was grading a plaits knob.
+ *
+ * Left is CC 62 (`shared/constants.mjs`'s MoveLeft). Pressed until the probe
+ * says `step`, because the module may not be on page 0 to begin with and each
+ * press walks one page down before the step page is reachable. */
+/* A JOG COUNTER-CLOCKWISE, not the Left button.
+ *
+ * Both gestures reach the same rule — `stepPageAvailable() && !selected &&
+ * pageOwnerOf(m).pageIndex === 0` selects the step page (`src/midi/router.ts`,
+ * the jog branch and the MoveLeft branch state it separately) — but the jog is
+ * a first-class harness gesture (`dev.tap.jogTurn`), while Left had to be
+ * hand-rolled as a raw CC from a constant read out of schwung's source. Six
+ * such presses moved nothing at all, not even the page index, which is equally
+ * consistent with "the CC never arrived" — so the gesture the harness already
+ * knows how to deliver is the one to use. */
+const STEP_PAGE_MODULE = 'step';
+const MAX_LEFT_PRESSES = 6;
+
+/* A HELD STEP IS PROMOTED ON A CLOCK, not on the press. `stepAutoTick` enters
+ * step-automation mode once a single step has been held for STEP_AUTO_MS
+ * (300 ms, `seq/step-edit.ts`), and until it does `stepPageAvailable()` is
+ * false and Left only pages the module. The first run of this scenario waited
+ * six frames — 30..95 ms at the device's 63..205 Hz — and concluded the step
+ * page was unreachable.
+ *
+ * So it waits on the PROMOTION rather than on a frame count: `automationHeld`
+ * is what the module page reports while a step session is live (the probe's
+ * `held`), which is the state the step page becomes reachable from. */
+const PROMOTE_FRAMES = 120;
+
+/* Knob 3 is PROBABILITY, and a step entered without one is at 100%, so CCW is
+ * the direction that always has room to move. */
+const PROB_KNOB = 2;
+/* Whole option steps: the page charges 8 raw units per step, and one more
+ * than that so a rounding remainder cannot leave the value where it was. */
+const TURN_RAW = 12;
+const SETTLE_FRAMES = 120;
+
+type HeldPage = { module?: string; body?: string; held?: boolean; view?: string; pageIndex?: number };
+
+scenario('virtual-pages', async (t) => {
+    fixture.setHost(t.host);
+    const dev   = new Device(t.tx);
+    const probe = new Probe(t.tx);
+    const open  = () => dev.open(probe);
+    const close = () => dev.close(probe);
+
+    await fixture.ensure(t.tx, open, close);
+    await dev.deployUi();
+    await dev.open(probe);
+    await dev.selectTrack(0);
+
+    /* A STEP PAGE NEEDS A TRIG — `stepPageAvailable()` is
+     * `stepAutoMode && occHasStep(holdStep)` — and THE FIXTURE ALREADY SEEDS
+     * ONE HERE.
+     *
+     * This scenario first tapped the step to create one, which did the
+     * opposite: a tap TOGGLES, so it deleted the fixture's note and every run
+     * held an empty step. The symptom was indirect and cost three device runs
+     * — the step page simply never arrived, while `promoted: true` in the notes
+     * showed step-automation mode was live, which is what finally separated
+     * "not promoted" from "promoted with nothing to show".
+     *
+     * So nothing is tapped up front. If the step turns out to be empty anyway,
+     * the fallback below adds a note and tries once more — safe now, because a
+     * PROMOTED hold does not toggle on release (`markGestured`), so the state
+     * cannot oscillate the way it did when the hold was still a tap. */
+    /* WHICH STEP TO HOLD IS THE ENGINE'S ANSWER, not this file's.
+     *
+     * `stepPageAvailable()` is `stepAutoMode && occHasStep(holdStep)`, so the
+     * held step must carry a note — and an earlier version of this scenario
+     * TAPPED one in, which toggles: it deleted the fixture's note instead and
+     * every run held an empty step. Both occupancy states were then tried
+     * blind, which is two device runs spent on a question the engine answers
+     * directly: `status` carries `occ=<hex>`, the watched track's own
+     * occupancy bitmap (`occFromHex`, `seq/state.ts` — bit 0x80 >> (step & 7)
+     * of byte step >> 3).
+     *
+     * So the step is CHOSEN from it. Nothing is tapped, nothing is restored,
+     * and the scenario stops depending on what the fixture happens to seed. */
+    const status = await t.tx.engineGet('status');
+    const occHex = /(?:^|\s)occ=([0-9a-fA-F]+)/.exec(status)?.[1] ?? '';
+    const occupied: number[] = [];
+    for (let i = 0; i * 2 + 1 < occHex.length; i++) {
+        const byte = parseInt(occHex.slice(i * 2, i * 2 + 2), 16);
+        for (let b = 0; b < 8; b++) if (byte & (0x80 >> b)) occupied.push(i * 8 + b);
+    }
+    /* The step ROW addresses 16 buttons from the current bar, so a step beyond
+     * that is not one this gesture can hold. */
+    const holdStep = occupied.find((n) => n < 16) ?? -1;
+    t.note('occHex', occHex || '(none)');
+    t.note('occupiedSteps', occupied.slice(0, 12).join(',') || '(none)');
+    t.note('holdStep', holdStep);
+    t.check('a-step-to-hold', 'the watched clip has a note on the first bar',
+        holdStep >= 0,
+        { expected: 'at least one occupied step in 0..15 (occ= from the engine status)',
+          actual: occHex ? `occ=${occHex} → steps [${occupied.slice(0, 12).join(',')}]`
+                         : 'the engine status carried no occ= field' });
+
+    const stepNote = STEP_NOTE_BASE + Math.max(0, holdStep);
+
+    /* THE STEP PAGE IS A KNOBS PAGE, so the knobs view is where it can be the
+     * drawn one. `dev.open` lands in the CHAIN view, whose ViewModel names the
+     * selected slot's module ("plaits") no matter what the knobs are doing —
+     * so a run that stayed there could never read `module=step`, whatever the
+     * step page was up to. Measured as `viewDuringHold: "chain"` in the notes,
+     * after the occupancy theory had already been ruled out.
+     *
+     * A jog CLICK drills from the chain into that slot's knobs (`router.ts`);
+     * it is waited on rather than assumed, since a click on an EMPTY slot opens
+     * the module browser instead and the run would carry on in the wrong
+     * screen. */
+    const viewNow = async (): Promise<string> =>
+        ((await probe.page()) as unknown as HeldPage | null)?.view ?? '(none)';
+    if (await viewNow() !== 'knobs') {
+        await dev.tap.jog();
+        try {
+            await until(t.tx, 'the knobs view', viewNow, (v) => v === 'knobs',
+                        { within: 60, every: 4 });
+        } catch { /* reported by the check below, with the view it stalled in */ }
+    }
+    const enteredView = await viewNow();
+    t.note('viewBeforeHold', enteredView);
+    t.check('knobs-view', 'the knobs view is where the step page can be drawn',
+        enteredView === 'knobs',
+        { expected: 'view=knobs before the step is held',
+          actual: `view=${enteredView}` });
+
+    /* Gathered onto an object rather than into `let`s: the assignments happen
+     * inside the hold's callback, and TypeScript narrows a closure-assigned
+     * `let` to its initial type at every read after it. */
+    const got: { held: HeldPage | null; promoted: boolean; beforeLeft: HeldPage | null;
+                 trail: string[]; probBefore: number; probAfter: number; probRestored: number } =
+        { held: null, promoted: false, beforeLeft: null, trail: [],
+          probBefore: NaN, probAfter: NaN, probRestored: NaN };
+
+    /* ONE WHOLE ATTEMPT: hold, wait for the promotion, walk to the step page,
+     * and read which page is up — inside the hold, because the step page only
+     * exists while a step is held. */
+    const heldProb = async (): Promise<number> => {
+        const st = await t.tx.engineGet('status');
+        return Number(/(?:^|\s)hprob=(-?\d+)/.exec(st)?.[1] ?? NaN);
+    };
+    /* Touch, single-unit clicks with frames between, release — the shape a
+     * hand makes. A whole-detent CC value in one message is not. */
+    const turnKnob = (k: number, dir: 1 | -1) => dev.knobHold(k, async () => {
+        await t.tx.frames(4);
+        for (let i = 0; i < TURN_RAW; i++) { await dev.tap.knob(k, dir); await t.tx.frames(2); }
+        await t.tx.frames(4);
+    });
+
+    const attempt = async (): Promise<void> => {
+        await dev.hold(stepNote, async () => {
+            try {
+                await until(t.tx, 'step-automation mode',
+                    async () => (await probe.page()) as unknown as HeldPage | null,
+                    (p) => !!p?.held, { within: PROMOTE_FRAMES, every: 4 });
+                got.promoted = true;
+            } catch { /* not promoted; the notes below carry the state it stalled in */ }
+            got.beforeLeft = (await probe.page()) as unknown as HeldPage | null;
+
+            /* Left selects the step page once it is available, and only from
+             * the module's page 0 (`src/midi/router.ts`'s MoveLeft branch), so
+             * this walks rather than pressing once. */
+            /* A TRAIL, because "nothing happened" has two very different
+             * causes: the press not arriving at all, and it arriving and
+             * paging the module instead of selecting the step page. The page
+             * index after each press tells them apart. */
+            for (let i = 0; i < MAX_LEFT_PRESSES; i++) {
+                got.held = (await probe.page()) as unknown as HeldPage | null;
+                got.trail.push(`${got.held?.module ?? '?'}@${got.held?.pageIndex ?? '?'}`);
+                if (got.held?.module === STEP_PAGE_MODULE) break;
+                await dev.tap.jogTurn(-1);
+                await t.tx.frames(6);
+            }
+            got.held = (await probe.page()) as unknown as HeldPage | null;
+            if (got.held?.module !== STEP_PAGE_MODULE) return;
+
+            got.probBefore = await heldProb();
+            await turnKnob(PROB_KNOB, -1);
+            got.probAfter = await until(t.tx, 'probability follows the turn', heldProb,
+                (v) => v !== got.probBefore, { within: SETTLE_FRAMES, every: 4 })
+                .catch(heldProb);
+            await turnKnob(PROB_KNOB, +1);
+            got.probRestored = await until(t.tx, 'probability turned back', heldProb,
+                (v) => v === got.probBefore, { within: SETTLE_FRAMES, every: 4 })
+                .catch(heldProb);
+        });
+    };
+
+    await attempt();
+
+    /* THE THREE FACTS THAT SEPARATE THE CAUSES, noted on every run: whether the
+     * hold was promoted at all (stepAutoMode), which screen movy was on (the
+     * MoveLeft branch differs by view) and which page it sat on (the step page
+     * is only selectable from index 0). */
+    t.note('promoted', got.promoted);
+    t.note('jogTrail', got.trail.join(' → '));
+    t.note('viewDuringHold', got.beforeLeft?.view ?? '(none)');
+    t.note('pageIndexDuringHold', got.beforeLeft?.pageIndex ?? -1);
+    t.note('moduleBeforeLeft', got.beforeLeft?.module ?? '(none)');
+    t.note('heldPageModule', got.held?.module ?? '(none)');
+    t.note('heldPageBody', got.held?.body ?? '(none)');
+
+    /* BOTH halves, and the module name is the half that matters. `body=schwung`
+     * alone is true of the MODULE's page too, so asserting only that is what let
+     * the first run pass this check while grading plaits. */
+    t.check('step-page-delegated', 'the step page is the drawn one, through Schwung',
+        got.held?.module === STEP_PAGE_MODULE && got.held?.body === 'schwung',
+        { expected: `module=${STEP_PAGE_MODULE} body=schwung while a step is held`,
+          actual: `body=${got.held?.body ?? '(none)'} module=${got.held?.module ?? '(none)'}`
+                  + (got.held?.module === STEP_PAGE_MODULE ? '' : ' — the step page was never reached') });
+
+    /* A TURN, not just a touch: the step page answered touches (the top toast)
+     * while every turn was dropped, and a check on which page is drawn could
+     * not tell. Read back from the ENGINE's `hprob`, the held trig itself.
+     *
+     * NOT the regression that motivated it, and cannot be: that one needed a
+     * PHYSICALLY held step (the shim's held-step byte diverted every write to
+     * Schwung's p-lock), and an injected step press never reaches the shim.
+     * `step-params-source.mjs` stubs that byte and is the guard for it; this
+     * is the end-to-end half — the turn reaches the engine at all. */
+    t.note('probBefore', got.probBefore);
+    t.note('probAfter', got.probAfter);
+    t.check('step-knob-turns', 'a knob turn on the step page edits the held trig',
+        got.probAfter < got.probBefore,
+        { expected: `hprob below ${got.probBefore} after a CCW turn of knob ${PROB_KNOB + 1}`,
+          actual: `hprob=${got.probAfter}` });
+    t.check('step-knob-restored', 'the CW turn puts the probability back',
+        got.probRestored === got.probBefore,
+        { expected: `hprob=${got.probBefore}`, actual: `hprob=${got.probRestored}` });
+
+});
