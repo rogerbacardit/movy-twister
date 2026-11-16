@@ -1,7 +1,7 @@
 From 62baf09df16938db6f23b580ba34bb6d69c06a82 Mon Sep 17 00:00:00 2001
 From: rogerbacardit <rogerbacardit@gmail.com>
 Date: Mon, 16 Nov 2026 16:00:13 +0100
-Subject: [PATCH 1/7] External knob controller on USB-A: knobs, jog, Back and
+Subject: [PATCH 1/8] External knob controller on USB-A: knobs, jog, Back and
  presets
 
 A CC from a USB-A controller was dropped. It now stands for a Move control

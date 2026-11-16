@@ -9771,6 +9771,189 @@ function saveSet(id2, force = false) {
   if ((takeUiDirty() || force) && !writeUiBlob(id2, serializeUiState())) markUiStateDirty();
 }
 
+// src/midi/ext-out.ts
+var PER_TICK = 10;
+var queue = [];
+var slot = /* @__PURE__ */ new Map();
+var head = 0;
+function controlId(msg) {
+  const st = msg[1] & 255, cc2 = msg[2] & 127, v = msg[3] & 127;
+  const half = (st & 15) === 2 && v >= 64 ? 1 : 0;
+  return st << 9 | cc2 << 1 | half;
+}
+function twisterSend(msg) {
+  const id2 = controlId(msg);
+  const at = slot.get(id2);
+  if (at !== void 0 && at >= head) {
+    queue[at] = msg.slice();
+    return;
+  }
+  slot.set(id2, queue.length);
+  queue.push(msg.slice());
+}
+function twisterOutFlush(max = PER_TICK) {
+  let n = 0;
+  while (head < queue.length && n < max) {
+    const msg = queue[head];
+    slot.delete(controlId(msg));
+    head++;
+    n++;
+    platform.externalSend(msg);
+  }
+  if (head >= queue.length) {
+    queue.length = 0;
+    head = 0;
+  }
+}
+
+// src/midi/ext-knob-map.ts
+var EXT_REL_BASE = 71;
+var EXT_ABS_BASE = 102;
+var EXT_KNOBS = 8;
+var TW_KNOB_BASE = 8;
+var TW_JOG = 0;
+var TW_PRESET = 2;
+var TW_BACK = 3;
+var TW_JOG_STEPS = 10;
+var TW_ASSIGNED = [
+  TW_JOG,
+  TW_PRESET,
+  TW_BACK,
+  8,
+  9,
+  10,
+  11,
+  12,
+  13,
+  14,
+  15
+];
+function createExtKnobState() {
+  return { abs: /* @__PURE__ */ new Map(), jog: 0 };
+}
+function absDelta(st, id2, v) {
+  const last = st.abs.get(id2);
+  st.abs.set(id2, v);
+  if (last === void 0) return 0;
+  return Math.max(-63, Math.min(63, v - last));
+}
+var toRel = (d) => d >= 0 ? d : 128 + d;
+var cc = (n, value2) => ({ kind: "cc", cc: n, value: value2 });
+function extKnobActions(st, ch, d1, d2) {
+  if (d1 >= EXT_REL_BASE && d1 < EXT_REL_BASE + EXT_KNOBS) {
+    return d2 === 0 || d2 === 64 ? [] : [cc(MoveKnob1 + d1 - EXT_REL_BASE, d2)];
+  }
+  if (d1 >= EXT_ABS_BASE && d1 < EXT_ABS_BASE + EXT_KNOBS) {
+    const d = absDelta(st, "abs" + d1, d2);
+    return d ? [cc(MoveKnob1 + d1 - EXT_ABS_BASE, toRel(d))] : [];
+  }
+  if (ch === 2) {
+    const v = d2 > 0 ? 127 : 0;
+    if (d1 === TW_JOG) return [cc(MoveMainButton, v)];
+    if (d1 === TW_BACK) return [cc(MoveBack, v)];
+    if (v && d1 >= TW_KNOB_BASE && d1 < TW_KNOB_BASE + EXT_KNOBS) {
+      return [{ kind: "reset", knob: d1 - TW_KNOB_BASE }];
+    }
+    return [];
+  }
+  if (ch !== 1) return [];
+  if (d1 === TW_JOG) {
+    st.jog += absDelta(st, "tw" + d1, d2);
+    const out2 = [];
+    while (st.jog >= TW_JOG_STEPS) {
+      st.jog -= TW_JOG_STEPS;
+      out2.push(cc(MoveMainKnob, 1));
+    }
+    while (st.jog <= -TW_JOG_STEPS) {
+      st.jog += TW_JOG_STEPS;
+      out2.push(cc(MoveMainKnob, 127));
+    }
+    return out2;
+  }
+  if (d1 === TW_PRESET) {
+    const d = absDelta(st, "tw" + d1, d2);
+    return d ? [{ kind: "preset", delta: d }] : [];
+  }
+  if (d1 >= TW_KNOB_BASE && d1 < TW_KNOB_BASE + EXT_KNOBS) {
+    const d = absDelta(st, "tw" + d1, d2);
+    return d ? [{ kind: "knob", knob: d1 - TW_KNOB_BASE, delta: d, pos: d2 }] : [];
+  }
+  return [];
+}
+function isTwisterCc(ch, cc2) {
+  return (ch === 1 || ch === 2) && cc2 >= 0 && cc2 <= 15;
+}
+
+// src/midi/ext-colors.ts
+var TW_HUE_DEFAULT = 50;
+var TW_HUE = {
+  [GREEN_T]: 50,
+  [BLUE_T]: 1,
+  [ORANGE_T]: 72,
+  [PURPLE_T]: 104
+};
+var painted = -1;
+function twisterHue(color) {
+  return TW_HUE[color] ?? TW_HUE_DEFAULT;
+}
+function twisterColorsReset() {
+  painted = -1;
+}
+var ASSIGNED = new Set(TW_ASSIGNED);
+function twisterColorSync() {
+  const hue = twisterHue(trackColor(appState.activeTrack.index));
+  if (hue === painted) return;
+  painted = hue;
+  mlog("twister colour track=" + (appState.activeTrack.index + 1) + " hue=" + hue);
+  for (let enc = 0; enc < 16; enc++) {
+    if (ASSIGNED.has(enc)) {
+      twisterSend([11, 177, enc, hue]);
+      twisterSend([11, 178, enc, 47]);
+      twisterSend([11, 178, enc, 95]);
+    } else {
+      twisterSend([11, 178, enc, 17]);
+      twisterSend([11, 178, enc, 65]);
+    }
+  }
+}
+
+// src/midi/ext-follow.ts
+var armed2 = false;
+var onSync = null;
+var sent = new Array(EXT_KNOBS).fill(-1);
+var HOLD_MS2 = 350;
+var touchedMs = new Array(EXT_KNOBS).fill(0);
+function twisterTouched(knob, nowMs = Date.now()) {
+  if (knob < 0 || knob >= EXT_KNOBS) return;
+  touchedMs[knob] = nowMs;
+  sent[knob] = -1;
+}
+var defaultSync = null;
+function setTwisterSync(sync) {
+  defaultSync = sync;
+}
+function armTwisterFollow(sync = defaultSync) {
+  armed2 = true;
+  mlog("twister follow armed");
+  onSync = sync;
+  sent.fill(-1);
+  twisterColorsReset();
+}
+function twisterFollow(levels2, nowMs = Date.now()) {
+  if (!armed2) return;
+  twisterColorSync();
+  for (let k = 0; k < EXT_KNOBS; k++) {
+    if (nowMs - touchedMs[k] < HOLD_MS2) continue;
+    const lv = levels2[k];
+    if (lv === null || lv === void 0 || !isFinite(lv)) continue;
+    const v = Math.max(0, Math.min(127, Math.round(lv * 127)));
+    if (sent[k] === v) continue;
+    sent[k] = v;
+    onSync?.(TW_KNOB_BASE + k, v);
+    twisterSend([11, 176, TW_KNOB_BASE + k, v]);
+  }
+}
+
 // src/seq/set-lib-session.ts
 var bootedGen = -1;
 var madeBefore = null;
@@ -9884,6 +10067,7 @@ function settleTick() {
   refreshModelsForSet();
   phase = "ready";
   mlog("seq: set ready after " + settleWaited() + "ms");
+  armTwisterFollow();
 }
 function unreadableOpen() {
   if (!setId || seqState.setBad !== setId || !engineCaughtUp(openMark)) return false;
@@ -10212,13 +10396,13 @@ function resetEditOps() {
 // src/seq/step-rec-head.ts
 var TICKS_PER_STEP3 = 24;
 var MAX_STEPS2 = 256;
-var head = 0;
+var head2 = 0;
 var growMode = false;
 var fresh = true;
 var previewPending = false;
 var grown = 0;
 function headStep() {
-  return head;
+  return head2;
 }
 function headIsFresh() {
   return fresh;
@@ -10252,7 +10436,7 @@ function headEnd() {
   seqCmd("hold " + watchedTrack() + " -1");
 }
 function headReset() {
-  head = 0;
+  head2 = 0;
   growMode = false;
   grown = 0;
   fresh = true;
@@ -10260,12 +10444,12 @@ function headReset() {
 }
 function setHead(step) {
   previewPending = false;
-  head = step;
+  head2 = step;
   fresh = true;
-  seqState.barOffset = Math.min(Math.floor(head / NUM_STEP_BUTTONS), 15);
-  seqState.holdStep = head;
+  seqState.barOffset = Math.min(Math.floor(head2 / NUM_STEP_BUTTONS), 15);
+  seqState.holdStep = head2;
   seqState.holdNotes = [];
-  seqCmd("hold " + watchedTrack() + " " + head);
+  seqCmd("hold " + watchedTrack() + " " + head2);
 }
 function growTo(step) {
   if (!growMode) return;
@@ -10276,8 +10460,8 @@ function growTo(step) {
   seqCmd("clen " + watchedTrack() + " " + want);
 }
 function advanceHead() {
-  growTo(head);
-  let next = head + 1;
+  growTo(head2);
+  let next = head2 + 1;
   if (growMode) {
     if (next >= MAX_STEPS2) next = 0;
   } else if (next >= seqState.lenSteps) {
@@ -11661,7 +11845,7 @@ function restoreTrackState(prev) {
 }
 
 // src/seq/momentary.ts
-var HOLD_MS2 = 500;
+var HOLD_MS3 = 500;
 var active2 = null;
 function momentaryDownAt(button, nowMs, restore) {
   active2 = { button, pressMs: nowMs, restore, gestured: false };
@@ -11671,7 +11855,7 @@ function momentaryGesture() {
 }
 function momentaryUpAt(button, nowMs) {
   if (!active2 || active2.button !== button) return "none";
-  const revert = active2.gestured || nowMs - active2.pressMs >= HOLD_MS2;
+  const revert = active2.gestured || nowMs - active2.pressMs >= HOLD_MS3;
   const restore = active2.restore;
   active2 = null;
   if (revert) {
@@ -12275,21 +12459,21 @@ function resetLoopMode() {
 
 // src/seq/mixer-page.ts
 var MIXER_HOLD_MS = 300;
-var armed2 = false;
+var armed3 = false;
 var origin = VIEW_MIXER;
 function mixerPageActive() {
   return appState.currentView === VIEW_MIXER;
 }
 function mixerHoldArm(latched2) {
-  armed2 = latched2;
+  armed3 = latched2;
 }
 function mixerHoldTick(nowMs) {
-  if (!armed2 || mixerPageActive()) return false;
+  if (!armed3 || mixerPageActive()) return false;
   if (!momentaryPlainHold(CC_NOTE_SESSION, nowMs, MIXER_HOLD_MS)) {
-    if (!momentaryPlainHold(CC_NOTE_SESSION, nowMs, 0)) armed2 = false;
+    if (!momentaryPlainHold(CC_NOTE_SESSION, nowMs, 0)) armed3 = false;
     return false;
   }
-  armed2 = false;
+  armed3 = false;
   origin = appState.currentView;
   appState.currentView = VIEW_MIXER;
   momentaryCancel(CC_NOTE_SESSION);
@@ -12297,7 +12481,7 @@ function mixerHoldTick(nowMs) {
   return true;
 }
 function mixerRelease() {
-  armed2 = false;
+  armed3 = false;
   if (!mixerPageActive()) return false;
   appState.currentView = origin;
   appState.dirty = true;
@@ -14303,19 +14487,19 @@ function buildMasterModels() {
 
 // src/seq/drum-sync.ts
 var NUM_TRACKS = TRACK_COUNT;
-var sent = new Array(TRACK_COUNT).fill(-1);
+var sent2 = new Array(TRACK_COUNT).fill(-1);
 function drumSyncTick() {
   for (let t = 0; t < NUM_TRACKS; t++) {
     const model = appState.trackModels[t]?.[1];
     if (!model || !model.hasLoadedParams()) continue;
     const drum = trackIsDrum(t) ? 1 : 0;
-    if (sent[t] === drum) continue;
-    sent[t] = drum;
+    if (sent2[t] === drum) continue;
+    sent2[t] = drum;
     seqCmd("tdrum " + t + " " + drum);
   }
 }
 function resetDrumSync() {
-  sent.fill(-1);
+  sent2.fill(-1);
 }
 
 // src/undo/rec-pass.ts
@@ -16255,185 +16439,6 @@ function renderFileBrowseView(state7) {
     } else {
       fontPrint(2, y, label2, 1);
     }
-  }
-}
-
-// src/midi/ext-out.ts
-var PER_TICK = 10;
-var queue = [];
-var slot = /* @__PURE__ */ new Map();
-var head2 = 0;
-function controlId(msg) {
-  const st = msg[1] & 255, cc2 = msg[2] & 127, v = msg[3] & 127;
-  const half = (st & 15) === 2 && v >= 64 ? 1 : 0;
-  return st << 9 | cc2 << 1 | half;
-}
-function twisterSend(msg) {
-  const id2 = controlId(msg);
-  const at = slot.get(id2);
-  if (at !== void 0 && at >= head2) {
-    queue[at] = msg.slice();
-    return;
-  }
-  slot.set(id2, queue.length);
-  queue.push(msg.slice());
-}
-function twisterOutFlush(max = PER_TICK) {
-  let n = 0;
-  while (head2 < queue.length && n < max) {
-    const msg = queue[head2];
-    slot.delete(controlId(msg));
-    head2++;
-    n++;
-    platform.externalSend(msg);
-  }
-  if (head2 >= queue.length) {
-    queue.length = 0;
-    head2 = 0;
-  }
-}
-
-// src/midi/ext-knob-map.ts
-var EXT_REL_BASE = 71;
-var EXT_ABS_BASE = 102;
-var EXT_KNOBS = 8;
-var TW_KNOB_BASE = 8;
-var TW_JOG = 0;
-var TW_PRESET = 2;
-var TW_BACK = 3;
-var TW_JOG_STEPS = 10;
-var TW_ASSIGNED = [
-  TW_JOG,
-  TW_PRESET,
-  TW_BACK,
-  8,
-  9,
-  10,
-  11,
-  12,
-  13,
-  14,
-  15
-];
-function createExtKnobState() {
-  return { abs: /* @__PURE__ */ new Map(), jog: 0 };
-}
-function absDelta(st, id2, v) {
-  const last = st.abs.get(id2);
-  st.abs.set(id2, v);
-  if (last === void 0) return 0;
-  return Math.max(-63, Math.min(63, v - last));
-}
-var toRel = (d) => d >= 0 ? d : 128 + d;
-var cc = (n, value2) => ({ kind: "cc", cc: n, value: value2 });
-function extKnobActions(st, ch, d1, d2) {
-  if (d1 >= EXT_REL_BASE && d1 < EXT_REL_BASE + EXT_KNOBS) {
-    return d2 === 0 || d2 === 64 ? [] : [cc(MoveKnob1 + d1 - EXT_REL_BASE, d2)];
-  }
-  if (d1 >= EXT_ABS_BASE && d1 < EXT_ABS_BASE + EXT_KNOBS) {
-    const d = absDelta(st, "abs" + d1, d2);
-    return d ? [cc(MoveKnob1 + d1 - EXT_ABS_BASE, toRel(d))] : [];
-  }
-  if (ch === 2) {
-    const v = d2 > 0 ? 127 : 0;
-    if (d1 === TW_JOG) return [cc(MoveMainButton, v)];
-    if (d1 === TW_BACK) return [cc(MoveBack, v)];
-    if (v && d1 >= TW_KNOB_BASE && d1 < TW_KNOB_BASE + EXT_KNOBS) {
-      return [{ kind: "reset", knob: d1 - TW_KNOB_BASE }];
-    }
-    return [];
-  }
-  if (ch !== 1) return [];
-  if (d1 === TW_JOG) {
-    st.jog += absDelta(st, "tw" + d1, d2);
-    const out2 = [];
-    while (st.jog >= TW_JOG_STEPS) {
-      st.jog -= TW_JOG_STEPS;
-      out2.push(cc(MoveMainKnob, 1));
-    }
-    while (st.jog <= -TW_JOG_STEPS) {
-      st.jog += TW_JOG_STEPS;
-      out2.push(cc(MoveMainKnob, 127));
-    }
-    return out2;
-  }
-  if (d1 === TW_PRESET) {
-    const d = absDelta(st, "tw" + d1, d2);
-    return d ? [{ kind: "preset", delta: d }] : [];
-  }
-  if (d1 >= TW_KNOB_BASE && d1 < TW_KNOB_BASE + EXT_KNOBS) {
-    const d = absDelta(st, "tw" + d1, d2);
-    return d ? [{ kind: "knob", knob: d1 - TW_KNOB_BASE, delta: d, pos: d2 }] : [];
-  }
-  return [];
-}
-function isTwisterCc(ch, cc2) {
-  return (ch === 1 || ch === 2) && cc2 >= 0 && cc2 <= 15;
-}
-
-// src/midi/ext-colors.ts
-var TW_HUE_DEFAULT = 50;
-var TW_HUE = {
-  [GREEN_T]: 50,
-  [BLUE_T]: 1,
-  [ORANGE_T]: 72,
-  [PURPLE_T]: 104
-};
-var painted = -1;
-function twisterHue(color) {
-  return TW_HUE[color] ?? TW_HUE_DEFAULT;
-}
-function twisterColorsReset() {
-  painted = -1;
-}
-var ASSIGNED = new Set(TW_ASSIGNED);
-function twisterColorSync() {
-  const hue = twisterHue(trackColor(appState.activeTrack.index));
-  if (hue === painted) return;
-  painted = hue;
-  mlog("twister colour track=" + (appState.activeTrack.index + 1) + " hue=" + hue);
-  for (let enc = 0; enc < 16; enc++) {
-    if (ASSIGNED.has(enc)) {
-      twisterSend([11, 177, enc, hue]);
-      twisterSend([11, 178, enc, 47]);
-      twisterSend([11, 178, enc, 95]);
-    } else {
-      twisterSend([11, 178, enc, 17]);
-      twisterSend([11, 178, enc, 65]);
-    }
-  }
-}
-
-// src/midi/ext-follow.ts
-var armed3 = false;
-var onSync = null;
-var sent2 = new Array(EXT_KNOBS).fill(-1);
-var HOLD_MS3 = 350;
-var touchedMs = new Array(EXT_KNOBS).fill(0);
-function twisterTouched(knob, nowMs = Date.now()) {
-  if (knob < 0 || knob >= EXT_KNOBS) return;
-  touchedMs[knob] = nowMs;
-  sent2[knob] = -1;
-}
-function armTwisterFollow(sync) {
-  armed3 = true;
-  mlog("twister follow armed");
-  onSync = sync;
-  sent2.fill(-1);
-  twisterColorsReset();
-}
-function twisterFollow(levels2, nowMs = Date.now()) {
-  if (!armed3) return;
-  twisterColorSync();
-  for (let k = 0; k < EXT_KNOBS; k++) {
-    if (nowMs - touchedMs[k] < HOLD_MS3) continue;
-    const lv = levels2[k];
-    if (lv === null || lv === void 0 || !isFinite(lv)) continue;
-    const v = Math.max(0, Math.min(127, Math.round(lv * 127)));
-    if (sent2[k] === v) continue;
-    sent2[k] = v;
-    onSync?.(TW_KNOB_BASE + k, v);
-    twisterSend([11, 176, TW_KNOB_BASE + k, v]);
   }
 }
 
@@ -18676,6 +18681,7 @@ function onMidiMessageInternal(data) {
 
 // src/midi/ext-knobs.ts
 var state6 = createExtKnobState();
+setTwisterSync((cc2, v) => state6.abs.set("tw" + cc2, v));
 var WAKE_GAP_MS = 1e4;
 var lastCcMs = 0;
 function presetTurn(delta) {

@@ -1,7 +1,7 @@
 From 00e84b45e307b651a89c054b00195d43832a7835 Mon Sep 17 00:00:00 2001
 From: rogerbacardit <rogerbacardit@gmail.com>
 Date: Mon, 16 Nov 2026 17:24:02 +0100
-Subject: [PATCH 2/7] Twister rings 9-16 follow the parameters knobs 1-8 edit
+Subject: [PATCH 2/8] Twister rings 9-16 follow the parameters knobs 1-8 edit
 
 Ported from the device-side ui.js edit of 2026-11-16 into source
 (midi/ext-follow.ts, called from knob-leds.ts). A factory Twister is

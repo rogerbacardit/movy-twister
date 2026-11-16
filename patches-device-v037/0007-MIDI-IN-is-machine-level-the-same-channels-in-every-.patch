@@ -1,7 +1,7 @@
 From fe2709b5479acece00b06d1e9fb885af7af4066f Mon Sep 17 00:00:00 2001
 From: rogerbacardit <rogerbacardit@gmail.com>
 Date: Mon, 16 Nov 2026 21:14:32 +0100
-Subject: [PATCH 7/7] MIDI IN is machine-level: the same channels in every set
+Subject: [PATCH 7/8] MIDI IN is machine-level: the same channels in every set
 
 The channels describe the rig on USB-A (a KeyStep Pro's tracks), not the
 song, and a new set started all SEL (user, 2026-11-16). They now live in

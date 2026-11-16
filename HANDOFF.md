@@ -104,3 +104,9 @@ El usuario tiene dudas sobre la implementación: empezar por escucharlas.
 - **El Twister NO responde después de reiniciar el Move y moverlo a los altavoces.** Con un diagnóstico (log de los mensajes USB que llegan) se vio que llegan las notas del KeyStep (canal 3) pero CERO mensajes CC del Twister. El Twister hace su animación de encendido. Es un problema físico o de reconocimiento USB, no del código. Pendiente: probar el Twister directo al Move sin hub, o reiniciar el Move con todo conectado.
 - En el Move está desplegado el ui.js limpio (md5 4f1b7b9c, la rama device-v037 en HEAD), con dsp.so f6c3aa1d.
 - Parches: `patches-device-v037/` (0001-0007).
+
+## 2026-11-16: TODO FUNCIONA en todos los Sets
+- Twister: el problema era el **puerto del hub**. En otro puerto del mismo hub funciona. Directo al Move también funciona.
+- Commit 2be657cb: el Twister se arma al cargar el Set (pinta los aros y sigue los parámetros sin tocarlo). Si se enchufa con Movy ya abierto, hace falta girar un encoder.
+- Estado final desplegado en el Move: ui.js md5 7e6a46a6 (device-v037 HEAD 2be657cb), dsp.so f6c3aa1d.
+- Backup: GitHub rogerbacardit/movy-twister, ramas `code-snapshot` (código) y `notes` (este archivo + parches).

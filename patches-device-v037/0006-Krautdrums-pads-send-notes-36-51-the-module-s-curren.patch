@@ -1,7 +1,7 @@
 From 24e41a2393e583cf98df6d4ee663a8b2ace5d916 Mon Sep 17 00:00:00 2001
 From: rogerbacardit <rogerbacardit@gmail.com>
 Date: Mon, 16 Nov 2026 20:04:23 +0100
-Subject: [PATCH 6/7] Krautdrums: pads send notes 36-51, the module's current
+Subject: [PATCH 6/8] Krautdrums: pads send notes 36-51, the module's current
  voice map
 
 The bundled template sent the raw Move pad notes (rawMidi, 68-83), but
