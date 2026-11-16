@@ -1,5 +1,6 @@
 import { mlog } from '../log.js';
 import { ledBudgetTake } from '../seq/led-cache.js';
+import { twisterFollow } from '../midi/ext-follow.js';
 
 /* White intensity scale (knobs 1-4) — always lit so row is identifiable */
 function whiteLevel(nv: number): number {
@@ -88,6 +89,7 @@ export function updateKnobLEDsFrom(levels: readonly (number | null)[]): void {
         scratchColor[physK] = knobColor(physK, scratchNv[physK]);
     }
     writeKnobRow(scratchColor, scratchNv);
+    twisterFollow(levels);   // an external Twister's rings, when one is connected
 }
 
 /** Light exactly one knob at `nv` (0..1) and darken the other seven.

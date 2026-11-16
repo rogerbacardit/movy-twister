@@ -8,6 +8,7 @@ import { platform } from '../platform/index.js';
 import { pageOwnerOf } from '../app/page-owner.js';
 import { onMidiMessageInternal, knobModel } from './router.js';
 import { createExtKnobState, extKnobActions, TW_ASSIGNED } from './ext-knob-map.js';
+import { armTwisterFollow } from './ext-follow.js';
 
 const state = createExtKnobState();
 
@@ -46,7 +47,12 @@ function presetTurn(delta: number): void {
 
 export function onExternalControlChange(data: number[]): void {
     const now = Date.now();
-    if (now - lastCcMs > WAKE_GAP_MS) paintTwister();
+    if (now - lastCcMs > WAKE_GAP_MS) {
+        paintTwister();
+        /* The rings then follow the parameters, and the absolute decoder
+         * counts from where each ring was put (midi/ext-follow.ts). */
+        armTwisterFollow((cc, v) => state.abs.set('tw' + cc, v));
+    }
     lastCcMs = now;
     const ch = (data[0] & 0x0F) + 1;
     for (const a of extKnobActions(state, ch, data[1] & 0x7F, data[2] & 0x7F)) {
