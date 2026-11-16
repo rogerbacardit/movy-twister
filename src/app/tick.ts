@@ -44,6 +44,7 @@ import { renderChainView }    from '../renderer/chain-view.js';
 import type { PageChrome } from '../renderer/schwung-page-chrome.js';
 import { renderFileBrowseView } from '../renderer/file-browse-view.js';
 import { updateKnobLEDsFrom, updateSingleKnobLED } from '../renderer/knob-leds.js';
+import { twisterOutFlush } from '../midi/ext-out.js';
 import { seqEngineTick, takeLabelSync, requestLabelSync } from '../seq/engine.js';
 import { drumSyncTick, resetDrumSync } from '../seq/drum-sync.js';
 import { bindLanes } from '../seq/lane-mapping.js';
@@ -392,6 +393,9 @@ let labelRetryGap = LABEL_RETRY_MIN;
 export function tick(): void {
     perfProbeEnter();
     tickBody();
+    /* Outside tickBody so none of its early returns stalls the queue: what this
+     * tick painted leaves this tick, paced (midi/ext-out.ts). */
+    twisterOutFlush();
     /* Outside tickBody so its early returns are still accounted for. */
     perfProbeTick();
 }

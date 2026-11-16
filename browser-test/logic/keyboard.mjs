@@ -244,7 +244,7 @@ export async function run() {
     const { keyboardState, resetPadMapCache } = await import('../../dist/esm/keyboard/state.js');
 
     const C_BLACK = 0, C_WHITE = 120, C_DARKGREY = 124, C_LIGHTGREY = 118, C_GREEN = 11;
-    const TRACK0 = 65;  // track 1 = Bright Red dim
+    const TRACK0 = 126; // track 1 = Green
     const PAD_MIN = 68;
 
     keyboardState.rootPc = 0; keyboardState.scale = 0;

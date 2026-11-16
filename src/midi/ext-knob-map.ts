@@ -19,7 +19,7 @@
  *        encoder 1      turn = jog (geared down), push = jog click
  *        encoder 3      turn = previous / next preset of the knobs' module
  *        encoder 4      push = Back
- *        encoders 9-16  knobs 1-8
+ *        encoders 9-16  knobs 1-8, push = back to the preset's value
  *    Encoder 2 is left alone: it sends CC 1, which the engine plays as the
  *    mod wheel (ext_route.rs) before this side sees it, so mapping it here
  *    would turn a knob AND modulate the synth. The rest are free.
@@ -43,7 +43,12 @@ export const TW_ASSIGNED: readonly number[] = [TW_JOG, TW_PRESET, TW_BACK,
 
 export type ExtAction =
     | { kind: 'cc'; cc: number; value: number }   /* replay as a Move control */
-    | { kind: 'preset'; delta: number };          /* step the preset list */
+    | { kind: 'preset'; delta: number }           /* step the preset list */
+    /* A Twister knob (0-7): the signed steps AND where the ring now sits, so
+     * the dispatch can pick per parameter — steps for a continuous one, the
+     * position for an enum or a short range (midi/ext-param.ts). */
+    | { kind: 'knob'; knob: number; delta: number; pos: number }
+    | { kind: 'reset'; knob: number };            /* push: back to the preset's value */
 
 export interface ExtKnobState {
     abs: Map<string, number>;
@@ -80,6 +85,9 @@ export function extKnobActions(st: ExtKnobState, ch: number, d1: number, d2: num
         const v = d2 > 0 ? 127 : 0;
         if (d1 === TW_JOG) return [cc(MoveMainButton, v)];
         if (d1 === TW_BACK) return [cc(MoveBack, v)];
+        if (v && d1 >= TW_KNOB_BASE && d1 < TW_KNOB_BASE + EXT_KNOBS) {
+            return [{ kind: 'reset', knob: d1 - TW_KNOB_BASE }];
+        }
         return [];
     }
     if (ch !== 1) return [];
@@ -96,7 +104,14 @@ export function extKnobActions(st: ExtKnobState, ch: number, d1: number, d2: num
     }
     if (d1 >= TW_KNOB_BASE && d1 < TW_KNOB_BASE + EXT_KNOBS) {
         const d = absDelta(st, 'tw' + d1, d2);
-        return d ? [cc(MoveKnob1 + d1 - TW_KNOB_BASE, toRel(d))] : [];
+        return d ? [{ kind: 'knob', knob: d1 - TW_KNOB_BASE, delta: d, pos: d2 }] : [];
     }
     return [];
+}
+
+/** A CC a factory Twister sends: rotation on channel 1, a push on channel 2,
+ *  CC 0-15. Only these say "the Twister is there" (midi/ext-knobs.ts) — a
+ *  keyboard's CCs on the same USB-A hub must not wake it or repaint it. */
+export function isTwisterCc(ch: number, cc: number): boolean {
+    return (ch === 1 || ch === 2) && cc >= 0 && cc <= 15;
 }

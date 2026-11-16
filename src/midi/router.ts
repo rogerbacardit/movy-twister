@@ -10,6 +10,7 @@ import { openSchwungEditor, schwungEditorActive, schwungEditorJog,
          schwungEditorCommit, schwungEditorCancel } from '../renderer/schwung-editor.js';
 import { openSchwungDive } from '../browser/schwung-dive.js';
 import { canvasDiveTakes } from './canvas-dive-input.js';
+import { extBaseNote } from './ext-param.js';
 
 /*
  * WHICH PARAMETER IS UNDER KNOB k — one answer, for every gesture.
@@ -645,6 +646,7 @@ export function onMidiMessageInternal(data: number[]): void {
          */
         const owner = pageOwnerOf(model);
         const info = owner.knobParamInfo(k);
+        extBaseNote(owner, k, info);    /* what a Twister push returns to (midi/ext-param.ts) */
         if (info && handleAutomationKnob(track, k, info, delta,
                 mappingFor(info, (key, val) => portFor(track).setParam(key, val)))) {
             return;

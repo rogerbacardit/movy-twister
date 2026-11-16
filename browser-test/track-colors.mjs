@@ -112,6 +112,7 @@ _log('\npalette indices still mean what movy thinks they mean:');
 const EXPECTED = {
     65: '661914', 7: 'FADC3B', 95: '134566', 23: '972BFF',
     9: 'B6FF0E', 2: '800400', 3: 'C93C00', 69: '5D1700',
+    126: '00FF00', 125: '0000FF', 85: '144D08', 99: '0A1466', 109: '3C1166',
 };
 for (const [idx, hex] of Object.entries(EXPECTED)) {
     eq(`index ${idx} is #${hex} (${name(+idx)})`, PAL.get(+idx)?.hex, hex);
