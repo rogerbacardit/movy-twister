@@ -323,6 +323,9 @@ await esbuild.build({
         /* The external knob controller's mapping, pure — driven by the
          * logic suite (ext-knobs.mjs) without a router behind it. */
         resolve(root, 'src/midi/ext-knob-map.ts'),
+        /* A track's MIDI IN and its track menu, driven by midi-in.mjs. */
+        resolve(root, 'src/track/midi-in.ts'),
+        resolve(root, 'src/seq/track-menu.ts'),
         resolve(root, 'src/track/chain-persist.ts'),
         resolve(root, 'src/track/chains-file.ts'),
         resolve(root, 'src/track/chain-payload.ts'),

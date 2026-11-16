@@ -8,6 +8,7 @@ import { clipPageActive } from '../seq/clip-page.js';
 import { buildFlagsPageVM } from '../seq/flags-page-vm.js';
 import { buildVersionsPageVM } from '../seq/versions-page-vm.js';
 import { versionsPageState } from '../seq/versions-page.js';
+import { trackMenuActive, buildTrackMenuVM } from '../seq/track-menu.js';
 import { renderFlagsView } from '../renderer/flags-view.js';
 import { renderSetsView } from '../renderer/sets-view.js';
 import { buildSetsPageVM } from '../seq/sets-page-vm.js';
@@ -953,6 +954,8 @@ function tickBody(): void {
          * leave modal, both of which own the screen while they are up. */
         if (undoToastActive()) drawUndoOverlay(undoToast()!);
         // Leave-Movy modal draws on top of everything else.
+        /* The track menu owns the screen while open, under the leave dialog. */
+        if (trackMenuActive()) renderFlagsView(buildTrackMenuVM());
         if (leaveModalActive()) drawLeaveModal(leaveModalLabels(), leaveModalSel(), leaveModalTitle());
         lastToastShowing = toastShowing;
         lastHeaderShowing = headerShowing;

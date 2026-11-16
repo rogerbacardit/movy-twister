@@ -91,6 +91,8 @@ import { jogHintTouch } from '../app/jog-hint.js';
 import { MASTER_CC, volumeTrackDown, volumeTrackUp, volumeTouch, volumeKnobDelta } from '../mixer/track-volume.js';
 import { masterVolumeKnob, masterVolumeTouch } from '../mixer/master-volume.js';
 import { toggleSolo } from '../mixer/track-mutes.js';
+import { openTrackMenu } from '../seq/track-menu.js';
+import { trackMenuMidi } from '../seq/track-menu-input.js';
 import { mlog } from '../log.js';
 import { platform } from '../platform/index.js';
 
@@ -290,6 +292,9 @@ export function onMidiMessageInternal(data: number[]): void {
             appState.dirty = true;
         }
     }
+
+    /* The track menu owns the controls while it is up (seq/track-menu-input.ts). */
+    if (trackMenuMidi(data)) { appState.dirty = true; return; }
 
     if (seqHandleMidi(data, appState.shiftHeld)) return;
     const status = data[0];
@@ -678,6 +683,13 @@ export function onMidiMessageInternal(data: number[]): void {
             /* Snapshot before switching so the hold-release closure returns
              * exactly here. beginTrackSwitch also closes the global Main/Clip
              * Params pages, which a track button always leaves. */
+            /* Shift + track button: that track's menu (MIDI IN,
+             * seq/track-menu.ts), without switching to it. */
+            if (appState.shiftHeld) {
+                openTrackMenu(track);
+                appState.dirty = true;
+                return;
+            }
             const prev = beginTrackSwitch();
             momentaryDown(d1, () => restoreTrackState(prev));
             switchToTrack(track, prev);

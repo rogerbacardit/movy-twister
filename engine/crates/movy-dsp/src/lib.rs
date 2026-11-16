@@ -297,11 +297,12 @@ impl Instance {
              * there: the release that would have done so now reaches another track. */
             "extmap" => match self.ext.set_map(val) {
                 Err(()) => host::log("extmap: refused a malformed map"),
-                Ok(Some(left)) => {
-                    self.chains.on_midi(left, &[0xE0, 0, 0x40], MOVE_MIDI_SOURCE_INTERNAL);
-                    self.chains.on_midi(left, &[0xB0, 1, 0], MOVE_MIDI_SOURCE_INTERNAL);
+                Ok(left) => {
+                    for c in left {
+                        self.chains.on_midi(c, &[0xE0, 0, 0x40], MOVE_MIDI_SOURCE_INTERNAL);
+                        self.chains.on_midi(c, &[0xB0, 1, 0], MOVE_MIDI_SOURCE_INTERNAL);
+                    }
                 }
-                Ok(None) => {}
             },
             /* `clickdb <0..11>` — metronome boost over the default level. The
              * UI pushes it on every engine boot, since a re-dlopened engine
