@@ -1,0 +1,74 @@
+/* The algorithmic generators' shared shapes (plans/2026-10-27-algorithmic-
+ * generators-design.md). Notes are the engine's: ticks of 1/24 step, 16 steps
+ * to the bar, pitches as stored. */
+
+import type { AiNote, AiClip } from '../ai/clip-dump.js';
+import type { AiTrackInput } from '../ai/set-input.js';
+import type { Role, RoleKind } from '../ai/role.js';
+
+export type Note = AiNote;
+export type { AiClip, AiTrackInput, Role, RoleKind };
+
+
+export const TPS = 24;              // ticks per step
+export const SPB = 16;              // steps per bar
+export const BAR = TPS * SPB;
+export const BEAT = TPS * 4;
+export const HALF = BAR / 2;        // harmony is read per half-bar (design §10)
+
+/* double: Smart Double, the clip at twice its length with new seams.
+ * create: New Clip, a part from nothing (plans/2026-10-28-new-clip-design.md). */
+export type Task = 'quantize' | 'variation' | 'double' | 'create';
+
+export type Quality = 'maj' | 'min' | 'dim' | 'aug' | 'sus2' | 'sus4' | '5' | 'maj7' | '7' | 'm7' | 'm7b5';
+
+/** pcs[0] is the root; the rest follow the template's order (third, fifth, seventh). */
+export interface Chord { root: number; quality: Quality; pcs: number[]; bass: number }
+
+/** `mode`: the Set's own 7-note mode (semitones per degree), when the notes
+ *  heard agree with it; absent, the key is plain major or minor. */
+export interface Key { tonic: number; minor: boolean; score: number; mode?: number[] }
+
+/** Design §2: who owns the harmony of the target scene. */
+export type Freedom = 'locked' | 'partial' | 'free';
+
+/** One onset of a melodic part: the notes struck together, each keeping its
+ *  own small offset, length and velocity so the player's feel survives. */
+export interface Voice { pitch: number; dt: number; gate: number; vel: number }
+export interface Ev { tick: number; voices: Voice[] }
+
+/** How a part sits on chords it may not change (HARMONY when locked). */
+export type Sit = 'asis' | 'roots' | 'inv' | '7th' | '9th';
+
+/** The target harmony of one request at one HARMONY position. */
+export interface HarmonyPlan {
+    chords: (Chord | null)[];       // per half-bar of the TARGET clip, in clip ticks
+    sit: Sit;
+    pedal: number | null;           // a pitch class held under the progression
+    label: string;
+    /** Past the usual range: reached by turning HARMONY, never drawn for a take. */
+    ext?: boolean;
+    /** A named loop's place among them, which a take's opening is drawn by;
+     *  absent on one the grammar derived (on the map, never a take's opening). */
+    seed?: number;
+    /** New Clip: the chords a 4-bar phrase moves through, HARMONY's section (2, 4 or 8). */
+    count?: number;
+}
+
+export type PresetClass = 'close' | 'rhythm' | 'exp';
+
+/** What the request was given: the Set as the job reads it. */
+export interface GenInput {
+    task: Task;
+    tracks: AiTrackInput[];
+    target: { track: number; slot: number };
+    source: { track: number; slot: number } | null;
+    len: number;                    // target clip length, steps
+    scale: [number, number];        // target playback speed (num/den)
+    drum: boolean;
+    kit: number[];                  // pads a drum option may use
+    root?: string;                  // the Set's key setting: a hint, never a rule
+    mode?: string;
+    nonce?: number;                 // New Clip: one per run, so every run differs
+    pad?: number;                   // New Clip on drums: the pad a per-pad option writes
+}

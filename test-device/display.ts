@@ -1,0 +1,60 @@
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+import { readFileSync, mkdtempSync } from 'node:fs';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { SSH_OPTS } from './ssh.js';
+
+const run = promisify(execFile);
+
+/* The Move's screen is 128x64, 1bpp, stored as 8 pages of 128 bytes with bit 0
+ * topmost — the same layout renderer/layout.ts draws into. */
+export const W = 128;
+export const H = 64;
+
+/* `/dev/shm/schwung-display`, NOT `schwung-display-live`: the latter is the
+ * manager's overlay buffer and stays blank exactly while a tool owns the
+ * screen, which is when a test wants a shot. */
+const FB = '/dev/shm/schwung-display';
+
+/* Multiplexed through ssh.ts — the jog-hint touch check has a 1 s deadline,
+ * and an unmultiplexed grab (~1.1 s handshake) always lands after the hold. */
+
+/* The device's framebuffer, as bytes — the overtake transport's `framebuffer`.
+ *
+ * This is the capability the migration recorded as blocked on a schwung change
+ * (`SNAPSHOT_DISPLAY`, MIGRATION.md). It never needed one: the buffer is a file
+ * in /dev/shm and scp reads it, which is what scripts/test-jog-hint.mjs did all
+ * along. */
+let dir: string | undefined;
+let n = 0;
+
+export async function scpFramebuffer(host: string): Promise<Buffer> {
+    dir ??= mkdtempSync(join(tmpdir(), 'movy-fb-'));
+    const out = join(dir, `fb-${n++}.bin`);
+    await run('scp', ['-q', ...SSH_OPTS, `ableton@${host}:${FB}`, out]);
+    return readFileSync(out);
+}
+
+export class Display {
+    constructor(private src: { framebuffer(): Promise<Buffer> }) {}
+
+    grab(): Promise<Buffer> { return this.src.framebuffer(); }
+
+    /* Fraction of a horizontal band that is lit, 0..1. The toast hint is an
+     * INVERTED full-width bar, so a drawn one fills its band almost solid
+     * (minus the glyph pixels) while ordinary page content leaves it mostly
+     * dark — which is why a fraction, not a pixel match, is the right assertion:
+     * it does not re-encode the font. */
+    static bandFill(buf: Buffer, y0: number, h: number): number {
+        let lit = 0;
+        for (let y = y0; y < y0 + h; y++) {
+            for (let x = 0; x < W; x++) if ((buf[(y >> 3) * W + x] >> (y & 7)) & 1) lit++;
+        }
+        return lit / (W * h);
+    }
+
+    async bandFill(y0: number, h: number): Promise<number> {
+        return Display.bandFill(await this.grab(), y0, h);
+    }
+}

@@ -1,0 +1,639 @@
+# Movy track performance — all measurements
+
+Everything measured on device for the 16-track work: how much CPU a track costs,
+how many you can run, and how long a note takes to reach a synth.
+
+Measured 2026-08-15/16 on `move.local`. Reproduce with the scripts named in each
+section.
+
+**Everything below §1 and §2 was measured with chain render SERIAL**, which is
+no longer the default. Both sections now carry a second table measured
+2026-08-24 with **parallel render on and no pinning** — **and that is now the
+shipped configuration**, so the serial tables are the historical arm. The
+mechanism is `plans/2026-08-23-parallel-render-prototype.md`.
+
+> **The flag names below no longer exist.** `chparallel` 1, `chlanes` 3,
+> `chpin` 0 and `chidle` 3 were the settings these tables were measured under,
+> and they are what movy now does unconditionally — the engine params, the
+> Global Params rows and the A/B harnesses that produced the serial arms were
+> all removed once the numbers had settled. The tables stay as the record of
+> how the configuration was chosen; they cannot be re-run as written.
+
+---
+
+## 1. The budget
+
+The ceiling is **~2000 µs of work per audio frame**, of which ~146-263 µs is
+movy's own baseline, leaving **~1737 µs for tracks**.
+
+That number had to be measured, because the two obvious candidates are both
+wrong:
+
+- **`total` frame time (~2660 µs) does not move when you add tracks.** It is
+  `pre + ioctl + post`, and the ioctl is mostly the *blocking wait* for the next
+  SPI transfer. Work displaces that wait, so `total` reads flat right up until
+  the wait is gone. Measuring it "proves" tracks are free.
+- **The 2900 µs frame period is not a work budget** either — the transfer itself
+  occupies part of it.
+
+Found by ramping obxd from 0 to 12 chains, 4-note chords held
+(`scripts/measure-work-ceiling.sh`, overtake; deleted in WP11 — on movy-host the
+budget is measured by `measure-render-pool.mjs ceiling`, §8):
+
+| chains | work (`pre`+`post`) | `total` | |
+|---|---|---|---|
+| 0 | 263 µs | 2663 µs | |
+| 3 | 971 | 2644 | flat — wait absorbing |
+| 7 | 2000 | 2624 | **last flat row** |
+| 8 | 2236 | 2710 | climbing |
+| 9 | 2422 | 2897 | past the shim's 2850 µs overrun threshold |
+| 12 | 3213 | 3684 | badly overrun |
+
+Beyond ~2400 µs the shim's own `OVERRUN_THRESHOLD_US` (`schwung_shim.c:4357`) is
+breached and it begins **skipping DSP work**.
+
+> `overruns=` in the log is NOT a usable pass/fail signal: it is cumulative since
+> boot and already runs at ~1700 per sampling window at idle, because the debug
+> logging that makes these measurements possible is itself causing them.
+
+### The same ramp with parallel render on
+
+Same script, same synth, same four held notes — `chparallel` 1, `chlanes` 3,
+`chpin` 0 (measured 2026-08-24):
+
+| chains | work | `total` | serial work (above) |
+|---|---|---|---|
+| 0 | 405 µs | 2665 µs | 263 |
+| 1 | 653 | 2657 | |
+| 2 | 680 | 2651 | |
+| 3 | 691 | 2647 | 971 |
+| 4 | 932 | 2640 | |
+| 6 | 956 | 2633 | |
+| 7 | 1188 | 2627 | 2000 |
+| 8 | 1218 | 2620 | 2236 |
+| 9 | 1225 | 2616 | 2422 |
+| 10 | 1445 | 2613 | |
+| 11 | 1470 | 2609 | |
+| 12 | **1495** | **2601** | 3213 |
+
+**Twelve obxd chains at four notes cost 1495 µs against the ~2000 µs ceiling** —
+2.15× less than serial, and the row that was `2422 µs, past the overrun
+threshold` at nine chains is now 1225 µs.
+
+Two things confirm the number rather than just report it:
+
+- **`total` falls monotonically from 2665 to 2601 µs across the whole ramp.** In
+  the serial table it turned and climbed at eight chains, which is the ioctl
+  wait running out. Here the wait absorbs everything to twelve, so the frame is
+  never late at any point on the ramp.
+- **The work column is a staircase, stepping at 1, 4, 7 and 10** — every third
+  chain. That is the three-lane packing showing through: chains 2 and 3 join
+  lanes that are already running and cost the audio thread nothing, and only the
+  chain that starts a new round adds to the critical path. A flat-then-jump
+  shape is what a working fan-out looks like; a smooth line would have meant the
+  lanes were not really running at the same time.
+
+The ceiling itself does not move — it is a property of the frame, not of who
+computes in it. What moves is how many chains fit under it.
+
+---
+
+## 2. Per-track cost, all 12 movy chains loaded
+
+`scripts/stress-16-tracks.sh` — the same synth in every movy chain, a chord held
+in each. **The `sounding` column is the one that makes the rest trustworthy**:
+it reports how many chains were actually producing output, read from the engine's
+own per-chain output peak.
+
+| synth | 1 note | 2 | 3 | 4 | sounding | per track |
+|---|---|---|---|---|---|---|
+| **dexed** | 197 µs ✅ | 203 ✅ | 216 ✅ | 223 ✅ | 12/12 | ~6 µs |
+| **plaits** | 460 ✅ | 456 ✅ | 457 ✅ | 457 ✅ | 12/12 | ~26 µs |
+| **freak** (MrHyde) | 617 ✅ | 836 ✅ | 1143 ✅ | 1403 ✅ | 12/12 | ~105 µs |
+| **nusaw** | 793 ✅ | 1355 ✅ | 1863 ✅ | 2487 ❌ | 12/12 | ~143 µs @3 |
+| **moog** (RaffoSynth) | 1021 ✅ | 1034 ✅ | 1055 ✅ | 1062 ✅ | 10/12 | ~92 µs |
+| **obxd** | 1243 ✅ | 1835 ✅ | 2406 ❌ | 3112 ❌ | 12/12 | ~141 µs @2 |
+| **hera** | 2314 ❌ | 2783 ❌ | 3301 ❌ | 3729 ❌ | 12/12 | ~181 µs @1 |
+| **noisemaker** (preset 9) | 2780 ❌ | 2869 ❌ | 2826 ❌ | 2908 ❌ | — | ~220 µs |
+| **surge** | 3000 ❌ | 3383 ❌ | 3761 ❌ | 4016 ❌ | 11/12 loaded | ~238 µs |
+| **helm** | 4105 ❌ | 5309 ❌ | 6753 ❌ | 8125 ❌ | 12/12 | ~330 µs @1 |
+
+✅ under the ~2000 µs ceiling · ❌ over it, frame genuinely late.
+
+**moog is genuinely monophonic** (a Minimoog emulation), which is why it is flat
+across polyphony — that flatness is real, unlike the cases in §4.
+
+> `surge` loaded into only 11 of 12 chains and `moog` into 10. Not diagnosed.
+> Both are far past the budget anyway, so it does not change their verdict.
+
+### The same table with parallel render on
+
+`chparallel` 1, `chlanes` 3, `chpin` 0 — twelve chains of one synth, chord held
+in every one, all 12 sounding in every row (measured 2026-08-24). Baseline with
+movy open and no chains: **404 µs**, against 263 µs serial — the pool costs
+~140 µs before a single chain renders.
+
+> **That 140 µs did not reproduce, and the pool is not what it was.** Re-measured
+> 2026-08-24 before defaulting `chparallel` on, because a fixed ~140 µs tax on
+> every light set would have been a reason not to:
+>
+> | set | serial | parallel |
+> |---|---|---|
+> | no chains loaded at all | 378 µs | 380 µs |
+> | twelve chains loaded, all asleep (`chidle` 3) | 445 µs | 440 µs |
+>
+> **The pool costs an idle set nothing** — ~2 µs on an empty one, and nothing
+> distinguishable from noise on a sleeping one. The 404-vs-263 pair above is two
+> numbers taken in different device states, not a measurement of the pool.
+>
+> `render_pool::render_block` does now skip the rendezvous when no helper lane
+> has a task, and a unit test holds it. Do not expect that line to show up in a
+> mean: the second row is what it is worth, and it was **measured against a build
+> with the line removed** — 441 µs vs 444 µs, indistinguishable. It is kept
+> because not waking three threads to do nothing is obviously right, not because
+> it bought anything. Recorded here so the idea does not get rediscovered and
+> re-argued.
+
+| synth | 1 note | 2 | 3 | 4 | serial @4 | speedup @4 |
+|---|---|---|---|---|---|---|
+| **freak** (MrHyde) | 601 µs ✅ | 716 ✅ | 803 ✅ | 893 ✅ | 1403 | 1.57× |
+| **nusaw** | 660 ✅ | 858 ✅ | 1054 ✅ | 1247 ✅ | 2487 ❌ | 2.00× |
+| **obxd** | 799 ✅ | 1055 ✅ | 1252 ✅ | 1491 ✅ | 3112 ❌ | 2.09× |
+| **hera** | 1199 ✅ | 1367 ✅ | 1530 ✅ | 1702 ✅ | 3729 ❌ | 2.19× |
+| **surge** | 1864 ✅ | 2209 ❌ | 2458 ❌ | 2615 ❌ | 4016 ❌ | 1.54× |
+| **helm** | 3401 ❌ | 4072 ❌ | 4954 ❌ | 5865 ❌ | 8125 ❌ | 1.39× |
+
+**Three synths cross the line.** obxd and nusaw passed at 12 chains only at
+reduced polyphony and now pass at four notes; **hera fails at one note serially
+and passes at four in parallel**; surge goes from hopeless to usable at one note
+per chain. helm does not move far enough to matter.
+
+**The speedup shrinks as the synth gets heavier** — 2.0-2.2× through the middle
+of the range, 1.54× for surge, 1.39× for helm, against a three-lane ideal of 3×
+for twelve equal chains. Not diagnosed here. Two candidates, and they are not
+exclusive: the four A72s share L2 and one memory controller, so the heaviest
+synths are the most likely to be bandwidth-bound rather than compute-bound (§7's
+contention ramp saturates at ~24%); and both of these arms are *already over the
+frame*, where the shim starts skipping DSP work above its 2850 µs overrun
+threshold — a number measured on a frame that is being dropped into is not a
+clean measurement of anything. **Trust the speedups in rows that pass; treat
+surge's and helm's as a lower bound on a broken frame.**
+
+The lighter half of the fleet (dexed, plaits, moog) was not re-run: at 223 µs
+and 457 µs for twelve chains they are nowhere near the ceiling, so nothing about
+their verdict could change.
+
+---
+
+## 3. But you asked about **16** tracks
+
+Movy hosts **16** chains, one per track. Tracks 1-4 use schwung's own slots by
+default, rendered serially by the shim, and their movy chains sit empty until
+`chtracks` is turned on (Global Params page) — which is the point of that flag:
+a host slot renders on the audio thread, a movy chain renders on the parallel
+lanes. All 16 draw on the *same* frame budget either way, so a full set costs
+`baseline + 16 × per-track`.
+
+> Movy hosted **12** chains until 2026-08-24, numbered 0-11 for tracks 5-16.
+> `ch<N>` is now track N throughout.
+
+> **`chtracks` itself is gone as of 2026-09-11.** Tracks 1-4 are unconditionally
+> movy chains now — an older set still on schwung's slots is migrated onto them
+> automatically on open. The "+ 4 host" column below, and the single host-slot
+> data point it extrapolates from, describe an arrangement that can no longer
+> exist; they stay as the record of how "one host renders all 16 chains" was
+> decided, not as today's numbers.
+
+One clean host-slot measurement (helm: **694 µs** on a host slot against 741 µs
+on a movy chain) says the per-track cost is about the same either way. On that
+basis:
+
+| synth | per track | 12 movy | + 4 host = **16** |
+|---|---|---|---|
+| dexed (4 notes) | 6 µs | 223 ✅ | ~249 ✅ |
+| plaits (4) | 26 µs | 457 ✅ | ~561 ✅ |
+| moog (4, mono) | 92 µs | 1062 ✅ | ~1613 ✅ |
+| freak (4) | 105 µs | 1403 ✅ | ~1823 ⚠️ marginal |
+| obxd (2) | 141 µs | 1835 ✅ | ~2399 ❌ |
+| nusaw (3) | 143 µs | 1863 ✅ | ~2435 ❌ |
+| hera (1) | 181 µs | 2314 ❌ | ❌ |
+
+**So obxd-at-2-notes and nusaw-at-3, which pass at 12 movy tracks, fail at a full
+16.** The last column is extrapolated from a single host-track data point — the
+host-phase benchmark only ever routed MIDI channel 0 to slot 0, so per-host-track
+cost is not properly measured yet. Treat that column as the right shape, not a
+measurement.
+
+### With parallel render, the host tracks become the ceiling
+
+Parallel render fans out **movy's twelve chains only**. Tracks 1-4 are rendered
+by the shim, serially, in the same frame, and they cost exactly what they always
+did. So a full 16 is now `12 movy chains in parallel + 4 host tracks in series`,
+and the second term stops being a rounding error:
+
+| synth (4 notes) | 12 movy, parallel | + 4 host, serial | 16 |
+|---|---|---|---|
+| freak | 893 | 4 × 95 = 380 | ~1273 ✅ |
+| nusaw | 1247 | 4 × 185 = 741 | ~1988 ⚠️ marginal |
+| obxd | 1491 | 4 × 237 = 950 | ~2441 ❌ |
+| hera | 1702 | 4 × 289 = 1156 | ~2858 ❌ |
+
+Same caveat as the table above it, and one more on top: the per-host-track figure
+is the serial 12-chain slope divided by twelve, resting on the single host-slot
+data point. It is the right shape, not a measurement. What is solid is the
+direction — **the four serial host tracks now cost more than half the budget of a
+full 16 for anything mid-weight**, so they, not the movy chains, are what a
+16-track set runs out of room on.
+
+### Which synths run on all 16
+
+- **dexed, plaits** — any polyphony, comfortably.
+- **moog** — any polyphony, because it is monophonic.
+- **freak** — marginal at four notes; fine at one or two.
+- **Everything else** — no.
+
+With parallel render on, add **nusaw** at four notes (marginal), and everything
+above moves further clear. obxd and hera fit all twelve *movy* chains at full
+polyphony but not a full 16.
+
+---
+
+## 4. Silence masquerading as efficiency
+
+Four modules measured as *cheap and flat across polyphony*. They were rendering
+**nothing**. A cost table cannot tell "this synth renders its voices regardless"
+from "the notes never arrived", which is why the engine now reports a per-chain
+output peak and every row above carries a `sounding` count.
+
+| module | why it was silent |
+|---|---|
+| **noisemaker** | preset 1 is **monophonic** — a 4-note chord costs one voice. Preset 9 is polyphonic and costs 220 µs/track against the 91 µs first measured. |
+| **weird-dreams** | **kit-based**; the init kit has no voices. Responds to no note from 24 to 90 until a kit is loaded (`kit` 0-63). |
+| **forge** | same — `kit` 0-136. |
+| **mrdrums** | a **sampler**: a pad with no `pXX_sample_path` triggers nothing. |
+
+**Any "flat across polyphony" row deserves suspicion before it is believed.**
+Of the five that originally looked flat, exactly one (moog) was genuinely a
+monophonic synth; the rest were artefacts.
+
+---
+
+## 5. Idle cost — loaded but silent
+
+A chain costs CPU whenever it is *loaded*, playing or not.
+
+| synth | idle / chain | playing | idle share |
+|---|---|---|---|
+| dexed | 3 µs | 11 | 27% |
+| **plaits** | 28 | 33 | **84%** |
+| noisemaker | 16 | 95 | 16% |
+| obxd | 44 | 234 | 18% |
+| surge | 135 | 382 | 35% |
+| helm | 195 | 716 | 27% |
+
+**Twelve idle helm chains cost ~2340 µs — more than the whole budget, with
+nothing playing.** This is now fixed: silent chains stop rendering (`chidle`, on
+by default), which took twelve mixed idle chains from 978 µs to 71 µs per block.
+See `chain-idle-cpu-optimization.md` — the table above is the BEFORE.
+
+---
+
+## 6. Note latency
+
+Two paths, and they were not equal.
+
+**Sequencer notes** have never differed: the engine emits a host track's note as
+MIDI (`midi_send_internal`) and hands a movy track's note straight to its chain
+in the same audio block, with zero IPC. Movy tracks are equal or better here.
+
+**Live pad notes** were the problem. A host track's pad note is one non-blocking
+shm write; a movy track had no shadow slot, so each note was a *blocking* engine
+param write.
+
+**Fixed** by having the engine answer pads itself on the audio thread. The shim
+already delivers pad notes to the overtake DSP's `on_midi`
+(`schwung_shim.c:6950`) — confirmed by probe from real presses; it cannot be
+confirmed by injection, because that path is the hardware MIDI scan and injection
+writes the UI ring. The pad→pitch map (scale, octave, layout, drum lane) stays in
+the UI and is pushed whenever it changes; the DSP looks up and forwards.
+
+The engine keeps its own note ledger, because the rule movy's UI learned the hard
+way applies here too: **a note-off is answered from what the note-ON recorded,
+never the current map** — otherwise an octave change while a pad is held strands
+the note forever.
+
+### Measured, after the fix
+
+`scripts/measure-pad-latency.sh`, plaits on movy chain 0, 4-note chords injected
+into a settled device:
+
+| track | idle IPC/tick | playing IPC/tick | blocking chain writes |
+|---|---|---|---|
+| host track 1 | 0.27 ms | 0.30 ms | — |
+| movy track 5 | 2.43 ms | 2.47 ms | **0.00 / tick** |
+
+Playing costs a movy track nothing over idle, and the blocking write per note is
+gone. Proved to have teeth by putting it back: with `engineOwnsPads()` forced to
+`false` and the same gesture, `msetb ch0:*` reappears in every chord window at
+~0.1 calls/tick and ~0.2 ms/tick — **≈2 ms of parked UI loop per note**,
+serialised across a chord.
+
+> **The earlier "host 0.30 ms vs movy 2.12 ms" pair was not the pad path.**
+> `perf_ipc` wrapped `host_module_set_param` but not
+> `host_module_set_param_blocking` — and every engine write movy makes is
+> blocking, so the pad writes were never in the number at all. The 2.12 ms was
+> the row below, standing next to them. The probe now wraps it (`msetb`), which
+> is what made the before/after above measurable.
+
+### What a movy track cost next: the chain page, not the pads
+
+The 2.4 ms/tick a movy track read at **idle** was one label: `mget ch<N>:*` —
+the knob page refreshing the chain's params, **one blocking round trip per
+tick**, against 0.3 ms for a host track (whose params come through schwung's own
+cache). That mattered more than the pad fix did: the UI loop polls MIDI once per
+iteration, so **the tick period _is_ the pad input sampling interval**
+(`pad-to-sound-latency.md` §1), and this was ~27% of it, paid whether or not
+anything was playing.
+
+**Fixed by batching it.** A movy chain's reads go through the bulk channel — one
+round trip for the whole visible page plus a sweep window, once every 8 ticks
+(`REFRESH_BULK_TICKS`), instead of one param per tick. Same round trip whatever
+the batch, so the page now converges in 8 ticks rather than 16 *and* costs an
+eighth of the IPC. Host slots deliberately keep the per-tick read: their reads
+are cheap, and the shim's bulk handler routes only to the overtake DSP, so a
+chain slot could not batch even if it wanted to.
+
+Measured on a movy track with plaits loaded, idle:
+
+| | before | after |
+|---|---|---|
+| movy's own IPC / tick | 2.4 ms (`mget ch0:*`) | **0.5 ms** (`bget` 0.2 + `mget status` 0.3) |
+| time inside `tick()` | 3.6 ms | **1.7 ms** |
+| tick period | 8.9 ms | **6.9 ms** |
+| tick rate | 110 Hz | **144-147 Hz** |
+
+The tick period is the pad sampling interval, so that is ~1 ms off the mean pad
+latency and ~2 ms off its worst case, on every movy track.
+
+### What is left is not movy's
+
+With the probe finally covering every entry point, the biggest label on the tick
+is **schwung's own**: `get synth_module` at 0.6 calls/tick and ~1.6 ms/tick, from
+`reconcileFeedbackHolds()` (`schwung/src/shadow/shadow_ui.js:2693`), which reads
+`synth_module` for every slot on every host-loop iteration for any overtake tool.
+It shows up in the window but not in `tick_ms`, because it runs in the host loop
+rather than inside movy's tick. Filed upstream — see
+`schwung-feedback-hold-poll-cost.md`.
+
+## 7. The frame itself — what MoveOriginal costs, and what standalone would buy
+
+Asked directly: if movy ran standalone like `dronage-tool` — owning
+`/dev/ablspi0.0`, no MoveOriginal underneath — how much would it gain, given that
+Move's transport is stopped anyway?
+
+**~15%.** Not the 66% MoveOriginal shows in `top`. Measured 2026-08-16 with movy
+closed and Move's transport stopped (`scripts/measure-core-contention.sh` for the
+last two tables).
+
+### The frame, accounted for
+
+The audio thread runs at 344.5 frames/s — 128 frames at 44.1 kHz, a **2902 µs**
+period. That is confirmed independently by the shim's `overruns=` counter, which
+increments 1722 times per 5 s window: 344/s, exactly once per frame.
+
+schwung's DSP runs *inside* MoveOriginal's audio thread, wrapped around the SPI
+ioctl, so `Frame(us)` accounts for everything except Move's own work:
+
+| | µs | where it comes from |
+|---|---|---|
+| frame period | 2902 | 128 / 44100 |
+| − irreducible ioctl | 470 | the ioctl floor once the wait is gone: §1's 8-chain row (2710 − 2236) and 12-chain row (3684 − 3213) both give ~472 |
+| = **work ceiling** | **2432** | everything anyone computes in one frame |
+| − MoveOriginal's own render | **239** | 2902 − `total avg` 2663, idle |
+| − schwung pre/post baseline | 111 | `pre` 88 + `post` 23, no overtake tool |
+| = available to movy | **~2082** | which is why §1's ramp measured a ~2000 µs ceiling |
+
+So **MoveOriginal costs the audio frame 239 µs — 8% of the period.** The rest of
+its CPU is not in the frame at all.
+
+### Where the other 66% lives
+
+Per-thread, sampled from `/proc/<tid>/stat` (busybox `top` has no `-H`):
+
+| thread | % of one core |
+|---|---|
+| MoveOriginal (UI) | 18.4 + 2.6 |
+| **Audio Main/SPI** | **15.8** — the only one inside the frame |
+| Link Main / Dispatcher | 11.0 + 1.8 |
+| Audio Worker ×3 | 7.8 + 7.4 + 7.4 |
+| **off-thread total** | **56.4%** |
+
+Move renders its own audio on **three worker threads**, even stopped. They are on
+other cores, so they do not spend the frame — but the four A72s share L2 and one
+memory controller, so they are not free either.
+
+### What the other cores cost the audio thread
+
+Ramping 0-3 aggressor cores (`dd` through 1 MiB buffers — deliberately harsher
+per core than Move's idle threads) and watching schwung's own per-frame work:
+
+| busy cores | work | vs idle |
+|---|---|---|
+| 0 | 111 µs | — |
+| 1 | 124 µs | +12% |
+| 2 | 138 µs | +24% |
+| 3 | 138 µs | saturated |
+
+Move's off-thread load is 0.56 core, so interpolating the first segment puts
+contention at **~7%** — about 135 µs at a 2000 µs budget, and an over-estimate,
+because `dd` is a bandwidth hog and Move's stopped workers are not.
+
+### The verdict
+
+| | µs |
+|---|---|
+| Move's in-frame render | 239 |
+| contention relief (upper bound) | ~135 |
+| **total** | **~374 on a ~2000 µs budget** |
+
+**+12% (frame only) to +19% (frame + all contention), centre ~15%.** Against §2's
+table that is one to two extra medium-weight tracks: obxd at 2 notes across 12
+chains already fits at 1835 µs, and obxd at 3 (2406 µs) still would not. It does
+not unlock surge or helm, which are 2-4× over budget.
+
+The price is the whole 768-byte mailbox (audio + 6-pass display + USB-MIDI in and
+out), Move's instruments, sampler, sets and Link, and a rewrite of the ~9k-line
+TypeScript UI, because `shadow_ui` dies with MoveOriginal. The one expensive part
+already built is module hosting — `chain_host.rs` and `load_queue.rs` dlopen and
+drive modules without schwung's help today.
+
+### The bigger number is not standalone
+
+`chain_slots.rs:render()` walks all twelve chains **serially, on one thread**,
+while ~3.4 cores idle — next to a Move that uses three workers for exactly this.
+Fanning the chain render out is worth multiples, not percent, and needs no
+standalone rewrite. Design and risks:
+`plans/2026-08-16-parallel-chain-render.md`.
+
+**Built, and it is.** The `chparallel` tables in §1 and §2 are that fan-out
+measured on real sets: **2.15× on the twelve-chain obxd ramp, 2.0-2.2× across
+the mid-weight fleet** — multiples, as predicted, against the ~15% standalone
+would buy. **It is on by default as of 2026-08-24** and lives on the Global
+Params page, where it can still be turned off for an A/B.
+
+## 8. Standalone (movy-host) against overtake — WP7
+
+Measured 2026-10-10, `scripts/compare-flavours.mjs`, the same fixture Set on
+both flavours, one after the other on the same box, **with the fixture's clips
+playing** and 20 pad trials each. Four runs; the spread is in the brackets.
+
+| | overtake (shim + shadow_ui) | standalone (movy-host) | |
+|---|---|---|---|
+| UI tick rate | 175 Hz (174–177) | **382 Hz** (382–420) | better |
+| UI IPC per tick (`perf_ipc ipc_ms`) | 1.9 ms | **0.7 ms** | better |
+| UI tick work (`tick_ms`) | 2.6 ms | **2.1 ms** | better |
+| tick period (`period_ms`) — the MIDI sampling interval | 5.7 ms | **2.6 ms** | better |
+| `perf_refresh_ms` median | 0 (sub-ms) | 0 (sub-ms) | equal |
+| chain render wall, chains only (`chwall` − `mfxcost`) | 67 µs | **53 µs** | better |
+| per-chain cost, playing (`chcost`, chain 0 / 1) | 44 / 16 µs | **36 / 11 µs** | better |
+| pad to sound (`padlat`, blocks; 1 = the next render) | 1 (max 1) | 1 (max 1) | equal |
+| whole audio-thread frame work, avg / max of 1024-frame windows | not observable | 260 / 408 µs of 2902 | 86 % headroom at worst |
+
+How to read three of these:
+
+- **The master stage moved; it did not grow.** `chwall` on movy-host is 209 µs,
+  of which 156 µs is `mfxcost`: the Set's master FX (here `4k-eq`, imported
+  from schwung's master by WP3) now runs inside movy's render. Under the shim
+  the same EQ runs in schwung's master slot, outside `chwall`, so only the
+  chains-only figure is like for like. On an idle Set the difference is the
+  master stage alone (≈ 7 µs mean, 30 µs peak): overtake shows 0, because
+  every chain sleeps and its master is not movy's to count.
+- **The held render peak is per instance.** Measured without a reset it read
+  186–254 µs standalone against 101–117: a movy-host open is a fresh process,
+  so its first blocks after the chain loads run on cold caches, while the shim
+  keeps `dsp.so` mapped. The script now resets the peak (`cpurst`) after
+  settling, as the CPU page does when it opens.
+- **Pad latency was first measured from outside, and that measured the
+  poll.** Polling `chpeak` once a frame read 10–13 frames standalone against
+  8–11: movy-host answers a `GET_PARAM` at the next frame boundary and the shim
+  sooner, so each poll cost movy-host an extra frame. The engine now times it
+  itself (`padlat`, `pad_latency.rs`): from the block a pad note reaches
+  `on_midi` — both hosts call it before that frame's render — to the first
+  loud block on its chain. One block on both.
+
+**Chain-load slow frames** (movy-host logged any audio frame over 10 ms with the
+last param it serviced; since 2026-10-30 the glitch recorder logs every frame
+over budget instead, see `docs/standalone/movy-host.md`). Over a day of device runs: 157 slow frames, all at an
+open — three per movy-host start (`padmap`, `mfx`, `chains`, 35–40 ms each:
+the dlopen-ing chain loads released in those frames) and four `chain_host`
+loads (17 ms). None mid-session: a module swap did not produce one. The shim
+services the same loads on its SPI thread, so this is parity, and the 0.5 s
+output fade-in covers it. Moving loads off the audio thread is an engine change
+and is **WP11's**, not WP7's.
+
+### WP10: the status snapshot (2026-10-13)
+
+`scripts/measure-ui-ipc.mjs` (the same measurement, one host), the fixture
+playing, two runs each. The `status` poll became a snapshot movy-host
+publishes every third audio block, and engine writes stopped waiting
+(`plans/2026-10-13-wp10-direct-engine-channel.md`):
+
+| | before | after |
+|---|---|---|
+| UI tick rate | 380 Hz | **420 Hz** |
+| UI IPC per tick (`ipc_ms`) | 0.7 ms | **0.4 ms** |
+| `tick_ms` | 2.1 ms | **1.9 ms** |
+| `period_ms` | 2.6 ms | **2.4 ms** |
+| audio frame work avg / max | 108 / 250 µs | 122 / 267–284 µs |
+| pad to sound | 1 block | 1 block |
+
+The audio thread pays for the snapshot: formatting `status` costs ~49 µs, so
+publishing it every block took the frame average to 157 µs. Every third block
+(~115 Hz, still above the UI's parse rate) costs +14 µs on average.
+
+### WP11: four lanes, the audio core, and the edge (2026-10-13)
+
+`scripts/measure-render-pool.mjs` (replaces `measure-chain-balance.sh` and
+`measure-work-ceiling.sh`, which drove the shim), engine 0.94.0. Plan:
+`plans/2026-10-13-wp11-latency-cpu-retune.md`.
+
+**Lanes.** The engine's lane count can now be switched in a running engine
+(`chlanes`, a diagnostic), so each set is measured A/B/A/B while it sounds.
+Render wall, mean µs per block:
+
+| set (chords held in every chain) | 3 lanes | 4 lanes |
+|---|---|---|
+| 12 even chains (obxd, noisemaker) | 1030 | **805** |
+| 12 mixed chains (helm-bound: helm alone is 1216) | 1290 | **1250** |
+| the 12 even + osirus + minijv sounding | 1488 | **1247** |
+
+The serial cost barely moves with the fourth lane (2938 → 2985 µs): the
+contention that made a fourth lane lose under overtake was Move's own FIFO 70
+workers, which do not run beside movy-host. Default is now 4 (one per core).
+
+**The audio core.** A module that forks from a chain load inherits the audio
+thread's core pin and FIFO 70: osirus's DSP process sat on core 3 at the audio
+thread's own priority. One Virus playing cost ~200 late transfers per 3.2 s
+with the frame's own work under 1050 µs; moved to cores 0-2, 0-2. movy-host
+now does that move itself (`host/placement.c`); the set saver, which had the
+same inheritance, names itself and leaves the core.
+
+**What an overrun looks like.** Serial render of the even set (2963 µs of work
+per 2902 µs frame) never skips a frame: the transfer runs late and the block
+rate falls to 293.7 Hz, about 15 % of the audio missing. So movy-host counts a
+transfer as late when it comes more than 1/16 frame after the last one
+(`STATE late_frames`), and reports the slack it had (`pump_min_us`: boundary
+wait + ~400 µs DMA).
+
+**The edge.** Surge ramps, one chain per step, 4- and 6-note chords: clean up
+to a render wall of 0.65 of the block (frame work max 2388 µs), late from 0.76
+(work max 2822 µs, 1.9 % late; 5 % at 0.80). The CPU page's `USABLE_BLOCK`
+(0.70) sits inside that bracket and stays; its reason changed (see
+`cpu-page-vm.ts`).
+
+**Pad to sound and the UI** (`measure-ui-ipc.mjs`, fixture playing): pad 1
+block (max 1, 20/20); tick 422 Hz, IPC 0.4 ms/tick, chains wall 60 µs, frame
+work 125 / 303 µs. WP11's "audio-thread pad fast path" was already true: since
+WP6 the pads reach the engine before the frame's render.
+
+**Not done: chain loads still run on the audio thread.** The slow-frame log now
+splits render from params. At an open: the chain host 23 ms (param), a surge
+load **237 ms** (dlopen 120 + init 114, inside render), mrdrums 65 ms, a state
+restore 25 ms. A surge loaded mid-session stalls the audio for ~150 ms. Moving
+loads off the audio thread needs a lock-free hand-over of chain state and a
+rule for a module loading in one chain while the same module renders in
+another (the pin policy's hazard); it is its own design, not a retune.
+
+## 9. Caveats
+
+- **Preset and kit choice dominate.** Every figure is "this synth, this preset",
+  not "this synth". noisemaker moves 2.4× between presets.
+- **No audio FX.** Synth slot only; each FX adds its own cost.
+- **Loading costs far more than running.** A single module load blocks the audio
+  callback for ~1986 µs (`scripts/measure-load-blocking.sh`), which is why movy
+  releases at most one load per callback. Loading twelve chains is a burst of
+  twelve such stalls, not a steady-state cost.
+- **Host-track cost is one data point**, not a measurement (see §3).
+
+## Scripts
+
+```bash
+scripts/measure-render-pool.mjs    # movy-host: lane A/B and the late-frame edge (WP11)
+scripts/stress-16-tracks.sh        # all 12 chains, with sounding verification
+scripts/bench-chain-cpu.sh         # per-synth slope from 4 chains
+scripts/bench-all-tracks.sh        # host slots vs movy chains
+scripts/measure-load-blocking.sh   # what a module load costs
+scripts/measure-pad-latency.sh     # live pad cost, host track vs movy track
+scripts/measure-core-contention.sh # MoveOriginal's threads + the contention ramp
+scripts/compare-flavours.mjs       # §8: overtake against movy-host, same Set
+```
+
+> **Trust the instrument only as far as it reaches.** `perf_ipc` has twice
+> reported a clean number for a call it was not wrapping — first
+> `host_module_set_param_blocking` (every engine write movy makes), then
+> `shadow_get_params` (the bulk channel). Worse, a wrapper survives a tool
+> reopen while the module state behind it does not, so calls were recorded into
+> counters nothing reported — `shadow_ui` outlives even a Move stack restart, so
+> that state persisted for hours. Both are now asserted in `browser-test/perf.mjs`:
+> every host entry point is wrapped, wrappers report through a swappable global
+> sink, and a reopen takes the counting over without nesting.

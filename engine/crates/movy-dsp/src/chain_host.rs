@@ -1,0 +1,479 @@
+//! Loading schwung's chain host so movy can own private chain instances.
+//!
+//! `modules/chain/dsp.so` is already multi-instance — schwung runs four of them,
+//! one per shadow slot — and it implements the same `plugin_api_v2` movy itself
+//! is loaded through. A chain instance with a synth loaded IS a track: MIDI in,
+//! stereo out, params and presets included.
+//!
+//! **Why movy loads a COPY.** `move_plugin_init_v2` assigns a file-global
+//! `g_host` (chain_host.c:2082). dlopen'ing the same realpath twice shares one
+//! mapping, so initialising it from movy would overwrite the pointer schwung's
+//! own four instances share. A separate file gets a separate mapping and a
+//! separate `g_host`. A symlink does NOT work — dlopen resolves it to the same
+//! realpath. The copy is a cache of its source, never a fork: it is refreshed
+//! whenever the source differs. The source is the chain host movy ships, built
+//! from its pinned schwung tag, or with `chpinhost` off the installed one
+//! (`chain_copy::chain_host_source`).
+//!
+//! **The module_dir is deliberately NOT movy's own.** `create_instance` is
+//! passed schwung's chain module directory, because the chain host resolves FX
+//! as `<module_dir>/../audio_fx/<name>/<name>.so` (chain_host.c:245). Passing
+//! movy's directory would resolve against movy's parent and find no FX at all;
+//! passing schwung's gives movy every audio FX the user installed, with no
+//! movy-side registry.
+
+use crate::ffi::{host_api_v1_t, plugin_api_v2_t};
+use crate::host;
+use crate::host_vtable;
+use core::ffi::{c_char, c_int, c_void};
+use std::ffi::{CStr, CString};
+
+extern "C" {
+    fn dlopen(filename: *const c_char, flag: c_int) -> *mut c_void;
+    fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+    fn dlerror() -> *mut c_char;
+    fn dlclose(handle: *mut c_void) -> c_int;
+}
+
+const RTLD_NOW: c_int = 2;
+const RTLD_LOCAL: c_int = 0;
+const RTLD_LAZY: c_int = 1;
+#[cfg(target_os = "linux")]
+const RTLD_NOLOAD: c_int = 4;
+#[cfg(not(target_os = "linux"))]
+const RTLD_NOLOAD: c_int = 0x10;
+
+/// The chain host's audio FX positions (`MAX_AUDIO_FX`, chain_internal.h).
+const MAX_AUDIO_FX: usize = 8;
+
+/// Whether an audio FX the chain host has ALREADY loaded exports
+/// `move_audio_fx_on_midi` — the chain host's own test for an FX that hears
+/// MIDI (chain_fx_load.c), e.g. the Ducker. `RTLD_NOLOAD` finds the copy the
+/// chain host opened, at the path it opened it by, and never loads one: a
+/// module the chain host refused is simply not there, and answers no.
+pub fn fx_hears_midi(module_dir: &str, module: &str) -> bool {
+    let Ok(path) = CString::new(format!("{module_dir}/../audio_fx/{module}/{module}.so")) else { return false };
+    let sym = c"move_audio_fx_on_midi";
+    unsafe {
+        let h = dlopen(path.as_ptr(), RTLD_LAZY | RTLD_NOLOAD);
+        if h.is_null() {
+            return false;
+        }
+        let found = !dlsym(h, sym.as_ptr()).is_null();
+        dlclose(h);
+        found
+    }
+}
+
+/// The API version movy is compiled against. Asserted before ANY other field of
+/// the returned struct is touched — it is the first member of `plugin_api_v2`
+/// (plugin_api_v1.h:205), so it is readable even if everything after it moved.
+/// A silent reorder within the same version is caught at test time instead, by
+/// `browser-test/abi-parity.mjs`.
+const EXPECTED_API_VERSION: u32 = 2;
+
+type PluginInitFn = unsafe extern "C" fn(host: *const host_api_v1_t) -> *mut plugin_api_v2_t;
+
+pub struct ChainHost {
+    api: &'static plugin_api_v2_t,
+    fx: ChainFxApi,
+}
+
+/// Chain-host entry points that are plain exported symbols rather than members
+/// of `plugin_api_v2_t` — the shim resolves the same ones by name. A chain
+/// module without them is not an error: each capability degrades on its own.
+///
+/// The split-render trio is all three or none (`complete`); the MIDI-tick wake
+/// is independently optional, because it arrived two releases later and a host
+/// that never calls it costs at most one skipped tick.
+#[derive(Clone, Copy, Default)]
+pub struct ChainFxApi {
+    set_external_fx_mode: Option<FxModeFn>,
+    process_fx: Option<FxFn>,
+    requires_continuous: Option<FxContinuousFn>,
+    take_midi_tick_wake: Option<TickWakeFn>,
+    /// Per-pad sends (`voice_send.rs`). Independently optional: a chain host
+    /// older than 1.3.0 has no voice pool to drain, and its modules no sends.
+    drain_sends: Option<DrainFn>,
+}
+
+impl ChainFxApi {
+    fn complete(&self) -> bool {
+        self.set_external_fx_mode.is_some()
+            && self.process_fx.is_some()
+            && self.requires_continuous.is_some()
+    }
+}
+
+fn last_dlerror() -> String {
+    unsafe {
+        let e = dlerror();
+        if e.is_null() {
+            "unknown".to_string()
+        } else {
+            CStr::from_ptr(e).to_string_lossy().into_owned()
+        }
+    }
+}
+
+impl ChainHost {
+    /// dlopen movy's private copy and initialise it against movy's own host API.
+    ///
+    /// Every failure returns `Err` rather than panicking: movy must keep
+    /// sequencing its four host tracks even when chain hosting is unavailable,
+    /// and an unavailable chain host is a degraded feature, not a broken tool.
+    pub fn load(so_path: &str) -> Result<Self, String> {
+        let path = CString::new(so_path).map_err(|_| "so path has an interior NUL".to_string())?;
+
+        let handle = unsafe { dlopen(path.as_ptr(), RTLD_NOW | RTLD_LOCAL) };
+        if handle.is_null() {
+            return Err(format!("dlopen {} failed: {}", so_path, last_dlerror()));
+        }
+
+        let sym = CString::new("move_plugin_init_v2").unwrap();
+        let init_ptr = unsafe { dlsym(handle, sym.as_ptr()) };
+        if init_ptr.is_null() {
+            return Err(format!("{} exports no move_plugin_init_v2", so_path));
+        }
+        let init: PluginInitFn = unsafe { core::mem::transmute(init_ptr) };
+
+        // Movy's vtable, not the host's own — see `host_vtable`. Every module
+        // in every movy chain is handed this, which is what makes the "one
+        // producer behind midi_send_*" promise movy's to keep, and what makes a
+        // synced LFO follow movy's transport.
+        let api_ptr = unsafe { init(host_vtable::get()) };
+        if api_ptr.is_null() {
+            return Err("move_plugin_init_v2 returned NULL".to_string());
+        }
+
+        // Read api_version FIRST. Anything else is only meaningful once the
+        // layout is confirmed.
+        let version = unsafe { (*api_ptr).api_version };
+        if version != EXPECTED_API_VERSION {
+            return Err(format!(
+                "chain host reports plugin API v{}, movy speaks v{} — refusing to host chains",
+                version, EXPECTED_API_VERSION
+            ));
+        }
+
+        let api: &'static plugin_api_v2_t = unsafe { &*api_ptr };
+
+        // Every entry point movy actually calls. A NULL here means the host was
+        // built without something movy needs; degrade with a message rather than
+        // discovering it as a null-pointer call on the audio thread.
+        for (name, present) in [
+            ("create_instance", api.create_instance.is_some()),
+            ("destroy_instance", api.destroy_instance.is_some()),
+            ("set_param", api.set_param.is_some()),
+            ("get_param", api.get_param.is_some()),
+            ("on_midi", api.on_midi.is_some()),
+            ("render_block", api.render_block.is_some()),
+        ] {
+            if !present {
+                return Err(format!("chain host is missing {}", name));
+            }
+        }
+
+        // Resolved by name from the handle that is already open, because these
+        // are exported symbols rather than vtable entries. Missing symbols mean
+        // an older chain module: movy degrades to one render_block call rather
+        // than refusing to host chains at all.
+        let mut fx = ChainFxApi::default();
+        unsafe {
+            let mode = CString::new("chain_set_external_fx_mode").unwrap();
+            let proc_fx = CString::new("chain_process_fx").unwrap();
+            let cont = CString::new("chain_fx_requires_continuous").unwrap();
+            let wake = CString::new("chain_take_midi_tick_wake").unwrap();
+            let drain = CString::new("chain_drain_sends").unwrap();
+            let m = dlsym(handle, mode.as_ptr());
+            let p = dlsym(handle, proc_fx.as_ptr());
+            let c = dlsym(handle, cont.as_ptr());
+            let w = dlsym(handle, wake.as_ptr());
+            let d = dlsym(handle, drain.as_ptr());
+            if !d.is_null() {
+                fx.drain_sends = Some(core::mem::transmute::<*mut c_void, DrainFn>(d));
+            }
+            if !m.is_null() {
+                fx.set_external_fx_mode = Some(core::mem::transmute::<*mut c_void, FxModeFn>(m));
+            }
+            if !p.is_null() {
+                fx.process_fx = Some(core::mem::transmute::<*mut c_void, FxFn>(p));
+            }
+            if !c.is_null() {
+                fx.requires_continuous =
+                    Some(core::mem::transmute::<*mut c_void, FxContinuousFn>(c));
+            }
+            if !w.is_null() {
+                fx.take_midi_tick_wake =
+                    Some(core::mem::transmute::<*mut c_void, TickWakeFn>(w));
+            }
+        }
+        if !fx.complete() {
+            host::log("chain host exports no split render — idle skip limited to whole chains");
+        }
+        if fx.drain_sends.is_none() {
+            host::log("chain host exports no chain_drain_sends — per-pad sends are off");
+        }
+        if fx.take_midi_tick_wake.is_none() {
+            host::log("chain host exports no midi tick wake — a sleeping chain's MIDI FX \
+                       can lose up to ~0.5s of notes");
+        }
+
+        host::log(&format!("chain host loaded from {} (api v{})", so_path, version));
+        Ok(Self { api, fx })
+    }
+
+    /// Create one chain instance. `module_dir` must be SCHWUNG's chain module
+    /// directory — see the note at the top of this file.
+    pub fn create_instance(&self, module_dir: &str) -> Option<ChainInstance> {
+        let dir = CString::new(module_dir).ok()?;
+        let f = self.api.create_instance?;
+        let inst = unsafe { f(dir.as_ptr(), core::ptr::null()) };
+        if inst.is_null() {
+            host::log(&format!("chain create_instance failed for {}", module_dir));
+            return None;
+        }
+        Some(ChainInstance { inst, api: self.api, fx: self.fx, scratch: vec![0u8; PARAM_BUF], ears: false })
+    }
+}
+
+/// Largest value the param channel can carry (SHADOW_PARAM_VALUE_LEN), so a
+/// value that does not fit here could not cross to the UI anyway.
+///
+/// It has to be this big: a module's `chain_params` / `ui_hierarchy` JSON is the
+/// UI's entire description of itself, and dexed's is ~13.5 KB. Reading it into a
+/// 4 KB buffer truncated it mid-JSON — the module loaded (its id is short) but
+/// every page came out wrong, which is exactly how it looked on device.
+///
+/// TRACK SHADOW_PARAM_VALUE_LEN, do not pick a number. Schwung doubled it to
+/// 128 KB in 1.3.0 because 64 KB was not enough for a real synth — a Waldorf
+/// microQ reaches 79% of 64 KB at 286 of its 449 parameters, and only after
+/// dropping half of both modulation matrices. Modules are written against the
+/// new ceiling from 1.3.0 on, and the two hosts fail differently: schwung
+/// REJECTS an over-long contract with a visible "UI buffer overflow", movy
+/// truncates and plans a page set from half a JSON document. Per
+/// `ChainInstance`, so twelve chains is 1.5 MB of heap — not stack, and fine.
+const PARAM_BUF: usize = 128 * 1024;
+
+/// One movy-owned chain: a track's MIDI FX, synth and audio FX.
+pub struct ChainInstance {
+    inst: *mut c_void,
+    api: &'static plugin_api_v2_t,
+    fx: ChainFxApi,
+    /// Reusable read buffer. Allocated once at load time — get_param is served
+    /// from the shim's param handler on the AUDIO thread, where a per-call
+    /// allocation of this size would be a real-time hazard.
+    scratch: Vec<u8>,
+    /// Whether an audio FX in this chain hears MIDI (`fx_hears_midi`), so a
+    /// sidechain note is worth handing it. Settled at load, never per note.
+    ears: bool,
+}
+
+impl ChainInstance {
+    /// Re-read which audio FX this chain holds and whether any of them hears
+    /// MIDI. Called after every module load into the instance — a load is
+    /// the only thing that changes the answer, and it already blocks.
+    pub fn refresh_ears(&mut self, module_dir: &str) {
+        self.ears = (1..=MAX_AUDIO_FX).any(|n| {
+            self.get_param(&format!("fx{n}_module"))
+                .is_some_and(|m| !m.is_empty() && fx_hears_midi(module_dir, &m))
+        });
+    }
+
+    pub fn hears_fx_midi(&self) -> bool {
+        self.ears
+    }
+
+    /// Set a param on the chain. **Loading keys (`synth:module`, `fx*:module`,
+    /// `load_file`) do blocking file I/O inside this call** — that is why they
+    /// are released one per audio callback (see `load_queue`).
+    pub fn set_param(&mut self, key: &str, val: &str) {
+        let (Ok(k), Ok(v)) = (CString::new(key), CString::new(val)) else { return };
+        if let Some(f) = self.api.set_param {
+            unsafe { f(self.inst, k.as_ptr(), v.as_ptr()) };
+        }
+    }
+
+    /// `set_param` for strings that are already NUL-terminated — the audio
+    /// thread's form, which must not allocate a `CString` per write.
+    pub fn set_param_c(&mut self, key: &CStr, val: &CStr) {
+        if let Some(f) = self.api.set_param {
+            unsafe { f(self.inst, key.as_ptr(), val.as_ptr()) };
+        }
+    }
+
+    pub fn get_param(&mut self, key: &str) -> Option<String> {
+        let k = CString::new(key).ok()?;
+        let f = self.api.get_param?;
+        let cap = self.scratch.len();
+        let n = unsafe { f(self.inst, k.as_ptr(), self.scratch.as_mut_ptr() as *mut c_char, cap as c_int) };
+        if n <= 0 {
+            return None;
+        }
+        let n = n as usize;
+        if n >= cap {
+            // Truncated: better to refuse than to hand the UI half a JSON
+            // document it will parse into a wrong page layout.
+            host::log(&format!("chain get_param {} truncated at {} bytes", key, cap));
+            return None;
+        }
+        Some(String::from_utf8_lossy(&self.scratch[..n]).into_owned())
+    }
+
+    pub fn on_midi(&mut self, msg: &[u8], source: c_int) {
+        if let Some(f) = self.api.on_midi {
+            unsafe { f(self.inst, msg.as_ptr(), msg.len() as c_int, source) };
+        }
+    }
+
+    /// Render one block. The chain OVERWRITES `out`, so callers render into a
+    /// scratch buffer and sum — it is not an accumulate.
+    pub fn render_block(&mut self, out: &mut [i16]) {
+        if let Some(f) = self.api.render_block {
+            unsafe { f(self.inst, out.as_mut_ptr(), (out.len() / 2) as c_int) };
+        }
+    }
+
+    /// The raw entry point, for the render pool to call from a helper thread.
+    ///
+    /// Handing out the function pointer and instance rather than a `&mut self`
+    /// keeps the pool free of any view into chain state, so its safety argument
+    /// is about a partition of pointers and nothing else. `&mut self` because
+    /// this is still an exclusive claim on the instance for the round.
+    pub fn raw_render(&mut self) -> Option<(RenderFn, *mut c_void)> {
+        self.api.render_block.map(|f| (f, self.inst))
+    }
+
+    /// Whether this chain can render its synth and FX as two calls.
+    pub fn supports_split(&self) -> bool {
+        self.fx.complete()
+    }
+
+    /// In external FX mode `render_block` returns straight after the synth
+    /// (`chain_host.c:1960`), and the caller owes `process_fx` a buffer.
+    pub fn set_external_fx_mode(&mut self, on: bool) {
+        if let Some(f) = self.fx.set_external_fx_mode {
+            unsafe { f(self.inst, on as c_int) };
+        }
+    }
+
+    pub fn process_fx(&mut self, buf: &mut [i16]) {
+        if let Some(f) = self.fx.process_fx {
+            unsafe { f(self.inst, buf.as_mut_ptr(), (buf.len() / 2) as c_int) };
+        }
+    }
+
+    /// 1 when any FX slot declared `capabilities.requires_continuous_processing`
+    /// — loopers and modulated delays, whose state stops advancing if skipped.
+    pub fn fx_requires_continuous(&mut self) -> bool {
+        match self.fx.requires_continuous {
+            Some(f) => (unsafe { f(self.inst) }) != 0,
+            None => false,
+        }
+    }
+
+    /// Advance the chain's LFOs without rendering audio.
+    ///
+    /// `lfo_tick` normally runs inside `render_block`, so a skipped block ran a
+    /// sleeping chain's LFOs 172x too slow and resumed them from a stale phase
+    /// at note-on. `chain_host.c:709` exists for exactly this.
+    ///
+    /// NOT `set_param`: that builds two `CString`s, and this runs on the audio
+    /// thread once per block for every sleeping chain. Byte literals carrying
+    /// their own NUL are `'static` and allocate nothing.
+    ///
+    /// Answers **true when this block must render after all**: the tick may have
+    /// run a MIDI FX's own timer — an arp, a euclidean generator, a strum — and
+    /// delivered a generated note to the synth. `ChainIdle::wake` cannot see
+    /// that, because it is driven by MIDI ARRIVING at the chain, and nothing
+    /// arrived. Leaving the chain parked hides the note until the next probe,
+    /// up to `PROBE_PERIOD` blocks (~0.5 s) away.
+    ///
+    /// One-shot, and it clears itself on a read — a host that never asks costs
+    /// at most one skipped tick, which is the state movy was in before the
+    /// symbol was resolved. `#[must_use]` because discarding the answer is
+    /// exactly the bug: it is what movy did, and it is silent.
+    #[must_use]
+    pub fn mod_tick(&mut self) -> bool {
+        const KEY: &[u8] = b"mod:tick\0";
+        const VAL: &[u8] = b"128\0";
+        if let Some(f) = self.api.set_param {
+            unsafe { f(self.inst, KEY.as_ptr() as *const c_char, VAL.as_ptr() as *const c_char) };
+        }
+        match self.fx.take_midi_tick_wake {
+            Some(f) => unsafe { f(self.inst) != 0 },
+            None => false,
+        }
+    }
+
+    /// Whether this chain's synth declares per-pad sends (`voice_send_params`).
+    ///
+    /// Asked on the audio thread, one chain per block, so no `CString`: the key
+    /// is a literal carrying its own NUL, and the answer lands in the
+    /// preallocated scratch.
+    pub fn declares_voice_sends(&mut self) -> bool {
+        const KEY: &[u8] = b"synth:voice_send_params\0";
+        let (Some(f), Some(_)) = (self.api.get_param, self.fx.drain_sends) else { return false };
+        let cap = self.scratch.len();
+        let n = unsafe {
+            f(self.inst, KEY.as_ptr() as *const c_char, self.scratch.as_mut_ptr() as *mut c_char, cap as c_int)
+        };
+        n > 0 && (n as usize) < cap && crate::voice_send::declares(&self.scratch[..n as usize])
+    }
+
+    /// `chain_drain_sends`, for the pool to call on the lane that rendered the
+    /// chain. `None` on a chain host without it.
+    pub fn drain_fn(&self) -> Option<DrainFn> {
+        self.fx.drain_sends
+    }
+
+    /// Instance pointer and both entry points, for the pool to call from a
+    /// helper thread. The instance comes back even when the synth is asleep:
+    /// the lane still owes it a zeroed buffer and possibly an FX pass.
+    pub fn raw_parts(&mut self) -> (*mut c_void, Option<RenderFn>, Option<FxFn>) {
+        (self.inst, self.api.render_block, self.fx.process_fx)
+    }
+}
+
+/// `plugin_api_v2_t::render_block`, unwrapped from its `Option`.
+pub type RenderFn = unsafe extern "C" fn(*mut c_void, *mut i16, c_int);
+
+/// `chain_process_fx`, and the two symbols that go with it.
+pub type FxFn = unsafe extern "C" fn(*mut c_void, *mut i16, c_int);
+type FxModeFn = unsafe extern "C" fn(*mut c_void, c_int);
+type FxContinuousFn = unsafe extern "C" fn(*mut c_void) -> c_int;
+
+/// `chain_drain_sends(inst, accum, n_sends, frames, slot_volume_0_127)` — sums
+/// every bus send and per-voice send of THIS frame's render into `accum`.
+pub type DrainFn = unsafe extern "C" fn(*mut c_void, *const *mut i16, c_int, c_int, c_int);
+
+/// `chain_take_midi_tick_wake` — one-shot, and reading it clears it.
+type TickWakeFn = unsafe extern "C" fn(*mut c_void) -> c_int;
+
+impl Drop for ChainInstance {
+    fn drop(&mut self) {
+        if let Some(f) = self.api.destroy_instance {
+            unsafe { f(self.inst) };
+        }
+    }
+}
+
+#[cfg(test)]
+impl ChainInstance {
+    /// Wires a fake vtable directly, skipping the real dlopen'd chain host.
+    /// Lets `chain_slots.rs` tests observe exactly which key string movy asks
+    /// for — the thing `lfo_report`'s bug actually was — without a device or a
+    /// real `.so`. `inst` stays null: the fake `get_param` never dereferences it.
+    pub(crate) fn for_test(api: &'static plugin_api_v2_t) -> Self {
+        Self { inst: core::ptr::null_mut(), api, fx: ChainFxApi::default(), scratch: vec![0u8; 256], ears: false }
+    }
+
+    /// A tag the fake vtable can tell instances apart by; never dereferenced.
+    pub(crate) fn set_inst_for_test(&mut self, inst: *mut core::ffi::c_void) {
+        self.inst = inst;
+    }
+
+    pub(crate) fn set_ears_for_test(&mut self, ears: bool) {
+        self.ears = ears;
+    }
+}

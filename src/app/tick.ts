@@ -1,0 +1,1235 @@
+import { paramGet } from '../host/param.js';
+import { portFor } from '../track/registry.js';
+import { appState, VIEW_KEYS, VIEW_KNOBS, VIEW_BROWSE, VIEW_CHAIN, VIEW_FILE_BROWSE, VIEW_MAIN_PARAMS, VIEW_CLIP_PARAMS, VIEW_FLAGS, VIEW_CPU, VIEW_VERSIONS, VIEW_SETS, VIEW_MIXER } from './state.js';
+import { mainPageActive } from '../seq/main-page.js';
+import { mixerHoldTick, mixerMeterDue, mixerPageActive } from '../seq/mixer-page.js';
+import { headerOnlyVM } from '../seq/header-vm.js';
+import { clipPageActive } from '../seq/clip-page.js';
+import { buildFlagsPageVM, flagsKnobLevel } from '../seq/flags-page-vm.js';
+import { buildVersionsPageVM } from '../seq/versions-page-vm.js';
+import { versionsPageState } from '../seq/versions-page.js';
+import { renderSetsView } from '../renderer/sets-view.js';
+import { buildSetsPageVM } from '../seq/sets-page-vm.js';
+import { setsPageState, setsPageTick } from '../seq/sets-page.js';
+import { libState } from '../seq/sets-lib.js';
+import { textEntry, textEntryActive } from '../renderer/text-entry-lib.js';
+import { renderVersionsView } from '../renderer/versions-view.js';
+import { renderCpuView, barPixels } from '../renderer/cpu-view.js';
+import { buildCpuPageVM } from '../seq/cpu-page-vm.js';
+import { cpuPageActive } from '../seq/cpu-page.js';
+import { keyboardState, baseNoteFor, padMapFor } from '../keyboard/state.js';
+import { isSounding } from '../keyboard/held-notes.js';
+import { browserState } from '../browser/state.js';
+import { CHAIN_SLOTS, isMixSlot, MASTER_FX_SLOTS, CLIP_PARAMS_COMPONENT, MIXER_COMPONENT, SET_PARAMS_COMPONENT, STEP_PARAMS_COMPONENT } from '../chain/config.js';
+import { drumPadLedColor } from '../keyboard/leds.js';
+import { drumNoteOfPhys } from '../keyboard/drum-grid.js';
+import { padVoiceSilent } from '../mixer/pad-mutes.js';
+import { WHITE_DIM } from '../seq/colors.js';
+import { padColor } from '../seq/pads.js';
+import { midiNoteName } from '../keyboard/notes.js';
+import { renderKnobsView } from '../renderer/knob-view.js';
+import { pageOwnerOf, type PageOwner } from './page-owner.js';
+import { pageOwnerForComponent } from './page-owner-virtual.js';
+import { moduleGridOnScreen, pollDrawnPage, drawnKnobLevels } from './page-poll.js';
+import { schwungEditorActive, renderSchwungEditor } from '../renderer/schwung-editor.js';
+import { canvasDiveActive, renderCanvasDive, tickCanvasDive } from '../renderer/schwung-canvas-dive.js';
+import { canvasDiveDeliverPads } from '../midi/canvas-dive-input.js';
+import { cancelFileBrowser } from '../browser/file-handler.js';
+import { previewTick } from '../browser/file-preview.js';
+import { renderKeysView }  from '../renderer/keys-view.js';
+import { renderBrowseView } from '../renderer/browse-view.js';
+import { renderChainView }    from '../renderer/chain-view.js';
+import type { PageChrome } from '../renderer/schwung-page-chrome.js';
+import { renderFileBrowseView } from '../renderer/file-browse-view.js';
+import { updateKnobLEDsFrom, updateSingleKnobLED } from '../renderer/knob-leds.js';
+import { seqEngineTick, takeLabelSync, requestLabelSync } from '../seq/engine.js';
+import { drumSyncTick, resetDrumSync } from '../seq/drum-sync.js';
+import { bindLanes } from '../seq/lane-mapping.js';
+import { laneRangeOf, anyLaneNeedsBase, validateTrackLane } from './automated-keys.js';
+import { seedFromEngine } from '../seq/automation-base.js';
+import { type LaneEntry, syncLabelsFromEngine, automationRegistry, laneKeysForTrack, automationDisplayDirty, liveTurnValues, poolIsFull } from '../seq/automation.js';
+import type { AutomationView, ViewModel } from '../types/viewmodel.js';
+import type { Model } from '../model/index.js';
+import { concreteKey } from '../model/pad-scope.js';
+import { fromLane7 } from '../seq/lane-value.js';
+import { noteRender } from '../test/probe.js';
+import { mlog } from '../log.js';
+import { paramBodyFor } from './param-body.js';
+import { currentSetUuid, sessionError, sessionFailScope, sessionPhase, sessionReady, sessionTick, settleProgress } from '../seq/set-session.js';
+import { loadingStage, loadingWaitMs, renderLoadingView, splashDue } from '../renderer/loading-view.js';
+import { migrationProgress } from '../seq/migrate-action.js';
+import { captureTick } from '../seq/capture.js';
+import { seqLedsTick, seqLedsInvalidate, displayHoldNotes } from '../seq/leds.js';
+import { ledBudgetTake, ledFrameReset } from '../seq/led-cache.js';
+import { seqSetLane } from '../seq/router.js';
+import { stepAutoTick, anyStepHeld } from '../seq/step-edit.js';
+import { stepRecTick } from '../seq/step-rec-view.js';
+import { holdTick, assignActive, assignToastText } from '../lfo/assign-mode.js';
+import { jogHintTick, jogHintVisible } from './jog-hint.js';
+import { drawJogToast } from '../renderer/overlay.js';
+import { volumeOverlay } from '../mixer/track-volume.js';
+import { masterVolumeOverlay } from '../mixer/master-volume.js';
+import { drawVolumeOverlay } from '../renderer/volume-overlay.js';
+import { aiTick } from '../ai/job.js';
+import { aiGestureTick } from '../ai/gestures.js';
+import { holdProgressTick } from '../ai/hold-render.js';
+import { aiPreviewActive, aiPreviewTick } from '../ai/preview.js';
+import { knobLevels } from '../ai/preview-knobs.js';
+import { previewStripTick } from '../ai/preview-render.js';
+import { leaveModalActive, leaveModalLabels, leaveModalSel, leaveModalTitle, leaveModalNote } from './leave-modal.js';
+import { drawLeaveModal } from '../renderer/leave-modal-view.js';
+import { captureOverlayActive } from '../seq/capture.js';
+import { buildCaptureVM } from '../seq/capture-vm.js';
+import { drawCaptureOverlay } from '../renderer/capture-overlay.js';
+import {
+    quantOverlayActive, quantOverlayTickAt, buildQuantOverlayVM,
+} from '../seq/quant-overlay.js';
+import { drawQuantOverlay } from '../renderer/quant-overlay.js';
+import { drawUndoOverlay } from '../renderer/undo-overlay.js';
+import { undoTick } from '../undo/group.js';
+import { moduleRestoreTick } from '../undo/module-apply.js';
+import { recPassTick } from '../undo/rec-pass.js';
+import { flushOrphanedSnaps, onEngineNoop, undoWatchContext } from '../undo/apply.js';
+import { undoToast, undoToastActive, undoToastTick } from '../undo/toast.js';
+import { takeNoopSnapId } from '../seq/engine.js';
+import { stepPageState, stepPageAvailable } from '../seq/step-page.js';
+import { buildStepPageVM } from '../seq/step-page-vm.js';
+import { activeHasNote, maxBarOffset, seqState } from '../seq/state.js';
+import { engineReady } from '../seq/engine.js';
+import { noteViewActive, noteViewTick } from '../seq/note-view.js';
+import { stepPianoVM, stepPianoKey } from '../seq/step-piano.js';
+import { drawStepPiano } from '../renderer/step-piano.js';
+import { perfProbeEnter, perfProbeTick, perfPhase, perfPhaseEnd } from './perf-probe.js';
+import {
+    drawLoopStrip, drawSeqToast, drawSeqHeader, songBandTick,
+    seqToastActive, seqToastTick, seqToastVersion,
+    seqHeaderActive, seqHeaderTick,
+} from '../seq/render.js';
+import { isFrozen, freezeBusy, freezeBusyToast, freezeCapturing, freezePeaksSeq } from '../seq/freeze.js';
+import { buildFrozenViewVM, buildFreezingViewVM, frozenPlayX, freezingPlayX, type FrozenViewVM } from '../seq/frozen-view-vm.js';
+import { frozenPlayheadTick } from '../seq/frozen-playhead.js';
+import { freezeScreenSig } from '../seq/freeze-screen.js';
+import { freezeToastTrack } from '../seq/freeze-toast.js';
+import { drawFreezeToast } from '../renderer/freeze-toast-view.js';
+import { trackMenuActive, trackMenuTrack, buildTrackMenuVM } from '../seq/track-menu.js';
+import { renderFlagsView } from '../renderer/flags-view.js';
+import { freezeBusyLeds, freezeBusyEnd } from '../seq/freeze-busy.js';
+import { renderFrozenView } from '../renderer/frozen-view.js';
+
+const PAD_MIN        = MovePads[0];
+const PAD_MAX        = MovePads[MovePads.length - 1];
+const LED_INIT_BATCH = 8;
+
+let lastPhase = '';
+let lastToastShowing = false;
+let lastToastVersion = 0;
+let lastHeaderShowing = false;
+let lastSessionMode = false;
+let viewCovered = false;     // a box overlay (volume, quantize, undo, leave) is over the view
+let noteViewInFrame = false; // this frame already painted the note view beneath its overlays
+let jogToastShown = false;   // a bottom jog/browse toast is on screen (strip yields to it)
+/* The views' own CLICK JOG hint; the generator preview names its option
+ * instead, since a jog click there keeps the option. */
+const moduleJogHint = (): boolean => jogHintVisible() && !aiPreviewActive();
+let pianoShown = '';         // stepPianoKey of the held-step piano on screen, '' = none
+
+/* Last-seen module name per "track:chainIdx", to detect a module swap on a
+ * focused component (its param set changed → re-validate that track's automation
+ * lanes). Keyed by component so navigating the chain view never false-triggers. */
+const lastModuleName = new Map<string, string>();
+
+/* Per-pad color cache for the chromatic layout: avoids resending unchanged
+ * LED colors every tick. Initialized to 0 (C_BLACK); first tick syncs all. */
+const chromaticCache = new Uint8Array(32);
+let wasFreezeBusy = false;
+let lastFreezeSig = '';
+let frozenVM: FrozenViewVM | null = null;   // the frozen screen last drawn, for its per-tick playhead
+let busySig = '';
+let busyToastVersion = -1;
+
+/* Assemble the automation snapshot for the param viewmodel from the seq mirror
+ * + the lane registry. Kept here (app layer) so model/ stays free of seq/. */
+export function buildAutomationView(track: number, model: Model): AutomationView {
+    const reg = automationRegistry()[track];
+    const heldValues = new Map<number, number>();
+    for (const [lane, v] of seqState.heldLocks) {
+        const e = reg[lane];
+        if (e) heldValues.set(lane, fromLane7(v, e));
+    }
+    const liveValues = new Map<number, number>();
+    for (const [lane, v] of liveTurnValues(track)) {
+        const e = reg[lane];
+        if (e) liveValues.set(lane, fromLane7(v, e));
+    }
+    // Resolve the dot/value lane through the focused pad's concrete key, so a
+    // lane belonging to a different pad matches no key on the current page (its
+    // dot vanishes) — switching the focused pad re-scopes the display for free.
+    const ps   = model.getDrumConfig()?.padScoping;
+    const pad  = model.getDrumCurrentPad();
+    const ck   = model.getComponentKey();
+    const laneForKey = (key: string): number => {
+        const tp = ck + ':' + concreteKey(ps, pad, key);
+        for (let l = 0; l < reg.length; l++) if (reg[l] && reg[l]!.targetParam === tp) return l;
+        return -1;
+    };
+    return {
+        assignedLanes: seqState.autoAssigned,
+        activeLanes:   seqState.autoActive,
+        held:          seqState.stepAutoMode,
+        poolFull:      poolIsFull(track),
+        heldValues, liveValues, laneForKey,
+    };
+}
+
+/* The automation view built for this frame, so the Schwung page can resolve
+ * lanes without building a second one. */
+let lastAutoView: any = undefined;
+/*
+ * The Schwung body for whichever module grid is being drawn.
+ *
+ * Returned as a CALLBACK the view calls for its body, because
+ * movy draws a module's knobs from more than one screen — renderKnobsView AND
+ * renderChainView — and routing only the first is what left the device drawing
+ * movy's widgets while every local check passed. One helper, both call sites.
+ *
+ * Body-only: each view keeps its own header and bank bar. The chain view's bar
+ * indexes CHAIN SLOTS, not param pages, so replacing it with Schwung's page
+ * indicator would be a lie about what the jog does there.
+ */
+export function schwungBodyFor(owner: PageOwner): (() => void) | undefined {
+    /* Says WHY it declined, once per distinct reason. Reporting only that the
+     * grid "is still movy's" cost two device round trips; the reason comes from
+     * the owner and none of them is visible from the screen. */
+    const why = (r: string) => {
+        if (r !== _schwungWhy) { _schwungWhy = r; mlog('schwung-body ' + r); }
+        return undefined;
+    };
+    /*
+     * A HELD STEP IS NOT A REASON TO DECLINE, AND SP-35 IS WHY IT WAS ONE.
+     *
+     * SP-18 kept the held-step BODY here: Schwung has no held-step filter, so its
+     * page draws eight knobs while only some of them will take a lock, and only
+     * movy's own drawer knows which (`hiddenDuringHold` in `renderer/label.ts`).
+     * It cost more than it bought. The gesture sites read OWNERSHIP, not the body,
+     * so the screen moved and the knobs did not — and the p-lock DECORATION, the
+     * whole of SP-18, is gated on `auto.held`, which IS the flag that made
+     * `owner.page` null here: the pass could not run in production at all
+     * (measured: `ctl.setDecorations` called ZERO times across a whole hold).
+     *
+     * The offer that cannot be taken is answered at the gesture instead, from
+     * movy's own chrome (`seq/automation.ts` consumes the turn and says why), so
+     * the body no longer has to move for it — and the parameters stop shifting
+     * under the hand at the exact moment the hand is choosing which to lock.
+     *
+     * THE STEP PAGE USED TO STILL DECLINE HERE, AND SP-54 IS WHY IT NO LONGER
+     * DOES. A step with an OCCURRENCE under it (`seq/step-page.ts`) opens the
+     * step page — five intrinsic trig properties, never chain automation —
+     * which is a DIFFERENT owner (`pageOwnerForComponent(STEP_PARAMS_COMPONENT)`,
+     * folded into `drawnPageOwner` in `app/tick.ts`'s caller) from the module's,
+     * so this function needs no special case for it: `owner` already IS the
+     * step-params owner on that frame, and the generic `!owner.claimed`/`!sp`
+     * fallthrough below declines correctly whenever the mode is `off` or the
+     * step-params contract has not resolved yet. The bank bar stays movy's
+     * regardless (`app/tick.ts` derives it from the MODULE's own owner, not
+     * whichever owner drew the body) — "step + the module's own bank count" is
+     * unaffected by who is drawing the step page's five cells.
+     *
+     * WHAT IS NOT LOST IS THE LOCK READING. Both renderers resolve it from the
+     * same `auto.heldValues` (`model/viewmodel.ts` for movy's body,
+     * `renderer/schwung-page-decorations.ts` for Schwung's decoration), so a held
+     * step shows the lock and the value that step will play either way. What
+     * only movy's body can still add is which knobs will take a lock in the first
+     * place — under `page` that is now the toast at the gesture, not a dimmed
+     * cell (SU-8; `docs/schwung-page-migration.md`).
+     */
+    /* The poll moved to `pollDrawnPage` (app/page-poll.ts), which runs once per
+     * tick rather than once per rendered frame. It had to: with movy's own
+     * refresh stopped for a delegated component, nothing dirties the model, so
+     * a poll that waits for a frame waits for a frame nothing will ask for. */
+    const sp = owner.page;
+    if (!sp) return why(owner.reason);
+    why(owner.reason);
+    /* The bands live with the page now, not with each call site: which chrome
+     * movy keeps is one decision about the embedding, and repeating it here
+     * would let the two disagree. */
+    return () => { sp.render('', lastAutoView, -1); };
+}
+
+/*
+ * WHAT THE BANK BAR SHOULD COUNT on the module page.
+ *
+ * movy draws the bar; Schwung only reports. Under the grid the jog pages
+ * SCHWUNG's page set, and its count differs from movy's banks, so movy's own
+ * index would sit still while the body paged. The owner is the same one every
+ * input site asks, so the bar cannot end up indexing a page set the jog is not
+ * moving.
+ *
+ * Undefined means "movy's own banks" — a movy-drawn body, and the step page,
+ * which IS movy's and so is its bar.
+ *
+ * IT IS DERIVED FROM THE BODY, not from the conditions that produced it. The
+ * bar must index whatever the jog is moving: two callers asking the same
+ * question twice is how a page indicator ends up counting a set the body is not
+ * showing, and this is the third condition to be added to it.
+ */
+export function schwungBankFor(owner: PageOwner, body: (() => void) | undefined):
+        { index: number; count: number } | undefined {
+    return body && owner.page ? { index: owner.pageIndex, count: owner.pageCount } : undefined;
+}
+
+/*
+ * WHAT MOVY'S HEADER AND FOOTER SAY while Schwung draws the body.
+ *
+ * Derived from the BODY like `schwungBankFor`, and for the same reason: the
+ * chrome belongs with the page it frames, so the answer cannot outlive the body
+ * it was composed for. It used to be its own set of conditions, and that is how
+ * a header ends up reading out a param from a page that is no longer on screen.
+ *
+ * `paging` says whether the JOG moves this page set. It does on the module page
+ * and it does NOT on the chain view, where the jog moves chain slots — so a
+ * `JOG PAGE` pill there would promise a thing the button does not do. The
+ * caller owns that because it is the only one that knows which view it is
+ * drawing.
+ */
+export function schwungChromeFor(owner: PageOwner, body: (() => void) | undefined,
+                                paging: boolean): PageChrome | undefined {
+    if (!body || !owner.page) return undefined;
+    const chrome = owner.page.chrome(paging);
+    /* A HELD STEP TAKES THE JOG CLICK before Schwung's ladder sees it (the
+     * router's held-step branch sits above the page's door), so a footer naming
+     * a click would describe a press that cannot happen. */
+    return chrome.footer && anyStepHeld() ? { ...chrome, footer: null } : chrome;
+}
+
+/*
+ * THE RING FOLLOWS THE BODY: whoever drew the eight cells supplies the eight
+ * values, so the LEDs cannot describe a page the screen is not showing (design
+ * §3, symptom 5). No body (a page still loading) is a dark row.
+ *
+ * The WRITER is movy's either way. The diff cache and the frame LED budget live
+ * in renderer/knob-leds.ts, and a second writer on these eight is how a knob
+ * strands itself on a colour it no longer shows.
+ */
+const NO_LEVELS: readonly null[] = new Array(8).fill(null);
+function lightKnobRow(body: (() => void) | undefined): void {
+    updateKnobLEDsFrom(body ? drawnKnobLevels() : NO_LEVELS);
+}
+let _schwungView = '';
+/* The splash words last drawn, so a change of stage repaints. */
+let lastSplashText = '';
+let _schwungWhy = '';
+let _autoLanesLog = '';
+/* Everything that must happen once per rendered frame, whatever drew it. Both
+ * render paths call this, so a third one added later cannot silently skip the
+ * probe's frame counter — which the device harness waits on instead of
+ * sleeping after a gesture. */
+function noteRendered(vm: ViewModel): void {
+    noteRender(vm);
+}
+
+let lastStepTrigSig = '';
+function stepTrigSig(): string {
+    return [seqState.holdVel, seqState.holdGate, seqState.holdGateMixed,
+        seqState.holdProb, seqState.holdCondA, seqState.holdCondB, seqState.holdInvert,
+        seqState.holdMaxGate, stepPageState.selected].join(',');
+}
+
+let lastMainSig = '';
+function mainSig(): string {
+    return [mainPageActive(), seqState.bpmX100, seqState.swingPct,
+        keyboardState.rootPc, keyboardState.scale,
+        keyboardState.mode, keyboardState.layout,
+        keyboardState.octave[appState.activeTrack.index]].join(',');
+}
+
+let lastCpuRaw = '';
+let lastCpuSig = '';
+/* The CPU page's repaint gate.
+ *
+ * TWO stages, unlike the other pages' signatures. The cheap one is the raw
+ * status strings: the tick runs at 60-200 Hz and the poll that can change them
+ * at ~24, so on most ticks nothing can possibly have moved and two string
+ * concatenations settle it. Only when a new poll has landed is the view model
+ * built — and then the signature is over the DRAWN PIXELS, not the microseconds
+ * behind them, so microsecond jitter under a pixel does not repaint anything.
+ *
+ * That second stage is the load-bearing one: movy's UI thread competes with the
+ * render lanes for Move's cores, so a meter that repaints on noise inflates the
+ * very number it is displaying.
+ *
+ * Called once per tick and it does its own storing — the other signature checks
+ * call their function twice per tick, which this one cannot afford. */
+function cpuRepaintTick(): void {
+    if (!cpuPageActive()) return;
+    const raw = seqState.cpuCost + '|' + seqState.cpuWall + '|' + seqState.cpuMask
+        + '|' + seqState.cpuSend + '|' + seqState.cpuMaster;
+    if (raw === lastCpuRaw) return;
+    lastCpuRaw = raw;
+    const vm = buildCpuPageVM();
+    const draw = (c: { kind: string; synthUs: number; totalUs: number; peakUs: number }) =>
+        c.kind[0] + barPixels(c.synthUs, vm.scaleUs)
+        + '.' + barPixels(c.totalUs, vm.scaleUs) + '.' + barPixels(c.peakUs, vm.scaleUs);
+    const cols = vm.columns.map(draw);
+    /* The send columns are in the signature for their heights AND for their
+     * count: going from none to some re-lays out every track column on the page,
+     * and that is the one change no individual number reports. */
+    const snd = vm.sends.map(draw);
+    // The scale itself is in the signature: it changes every column's height at
+    // once, and is the one change that moves no individual number.
+    const sig = Math.round(vm.load * 100) + '|' + Math.round(vm.peakLoad * 100) + '|'
+        + vm.scaleUs + '|' + cols.join(',') + '|' + snd.join(',');
+    if (sig === lastCpuSig) return;
+    lastCpuSig = sig;
+    appState.dirty = true;
+}
+
+let lastClipSig = '';
+function clipSig(): string {
+    return [clipPageActive(), seqState.clipScaleIdx, seqState.lenSteps,
+        seqState.clipTranspose].join(',');
+}
+
+/* Same idea for the 4×4 drum grid: the drum-pad colors update at poll rate
+ * (green follows the sequencer gate / held pads), so cache-diffing keeps the
+ * LED traffic to actual changes. */
+const drumCache = new Uint8Array(32);
+
+/* A track switch invalidates the drum grid cache once. It used to re-assert the
+ * whole grid for 40 ticks to outlast Move's native pad repaint on a track-button
+ * press — but movy now owns the pad LEDs outright (the host strips Move's
+ * cable-0 note LEDs unconditionally, and its RGB sysex via the suppression we
+ * claim at init), so there is no race left to win. The one-shot invalidation
+ * stays: it is what makes the grid overwrite colours left by the previous
+ * layout, which the per-pad cache would otherwise consider already correct. */
+let drumCacheStale = false;
+let lastActiveSlot   = -1;
+let lastShownKey     = '';   // identity of the on-screen param page (for touch reset)
+
+/* A restored lane whose module has not loaded yet cannot be bound (the bind
+ * carries the param's range), so the label sync is asked for again — backing off
+ * from ~0.5 s to ~10 s, because a lane whose module never comes back would
+ * otherwise cost an `alabels` read every half second for the rest of the
+ * session. A module swap on the focused component asks for a sync of its own. */
+const LABEL_RETRY_MIN = 64;
+const LABEL_RETRY_MAX = 2048;
+let labelRetryIn = 0;
+let labelRetryGap = LABEL_RETRY_MIN;
+
+
+export function tick(): void {
+    perfProbeEnter();
+    tickBody();
+    /* Over whatever the frame drew; nothing at all unless Step 16 is held. */
+    holdProgressTick(Date.now());
+    /* Outside tickBody so its early returns are still accounted for. */
+    perfProbeTick();
+}
+
+function tickBody(): void {
+    /* One LED frame per app tick. This used to live at the top of seqLedsTick,
+     * which was fine while that was the only budgeted writer — now the pad
+     * painters and the knob rings share the budget too, and any tick that did
+     * not reach seqLedsTick would leave it exhausted and silently stop every
+     * LED on the device. */
+    ledFrameReset();
+    perfPhase('seqengine');
+    // Keep the engine mirror synced first (flushes any queued command, polls
+    // status) — the mock/real engine reports transport + step state regardless
+    // of whether we are on screen.
+    seqEngineTick();
+    // Tell the engine which tracks are drum tracks (it suppresses clip transpose
+    // on those). Queued as a command, so it rides the same batch as everything
+    // else and is held through engine boot.
+    perfPhase('drumsync');
+    drumSyncTick();
+    perfPhase('tempocap');
+    captureTick();
+    /* A generator request runs alongside the frame: the header names it, and
+     * everything else (the power dialog included) draws as always. */
+    aiGestureTick(Date.now());   // a Shift + Step 16 hold reaching full
+    aiTick();
+    aiPreviewTick();   // a track/clip/view change commits the AI preview
+    perfPhase('rest');
+    stepAutoTick(); // promote a long single-step hold to step-automation mode
+    stepRecTick();  // keep the step-record header band alive while Rec is held
+    if (holdTick()) appState.dirty = true;    // knob-hold → LFO assign mode
+    if (jogHintTick()) appState.dirty = true; // jog rested without turning → CLICK JOG hint
+    if (appState.currentView === VIEW_SETS && setsPageTick()) appState.dirty = true;
+    /* The keyboard animates its own cursor, so it repaints every tick it is up. */
+    if (textEntryActive()) { textEntry()?.tickTextEntry(); appState.dirty = true; }
+    /* A module canvas animates and owns its own state: tick and redraw it
+     * every frame while it is up, as upstream's CANVAS view does. */
+    if (canvasDiveActive()) { canvasDiveDeliverPads(); tickCanvasDive(); appState.dirty = true; }
+    /* The browser previews once its cursor rests. Left any way but Back or a
+     * pick (a track button, a view change), it is CANCELLED here — a preview
+     * left standing would keep a file nobody chose. */
+    if (appState.fileBrowserState) {
+        if (appState.currentView !== VIEW_FILE_BROWSE) cancelFileBrowser();
+        else previewTick(appState.fileBrowserState, Date.now());
+    }
+    // The held-step value display is driven by stepAutoMode + heldLocks, which
+    // change via consumed knob turns and the status poll — both outside the
+    // param page's normal dirty path. Repaint when that display state changes.
+    if (automationDisplayDirty()) appState.dirty = true;
+    // Repaint when the step page's selection or mirrored trig values change.
+    if (stepTrigSig() !== lastStepTrigSig) { lastStepTrigSig = stepTrigSig(); appState.dirty = true; }
+    // Repaint when main params page values or touch/overlay state change.
+    if (mainSig() !== lastMainSig) { lastMainSig = mainSig(); appState.dirty = true; }
+    // Repaint when clip params page values or touch/overlay state change.
+    if (clipSig() !== lastClipSig) { lastClipSig = clipSig(); appState.dirty = true; }
+    cpuRepaintTick();   // repaint only when a pixel the CPU page draws would change
+    // Diagnostic (off unless debug_log_on): the UI lane registry mirrors the
+    // engine's assigned lanes. Empty here means automation display + read-back
+    // suppression are dead — the device automation test asserts it is populated.
+    const laneKeys = laneKeysForTrack(appState.activeTrack.index).join(',');
+    if (laneKeys !== _autoLanesLog) { _autoLanesLog = laneKeys; mlog('auto lanes t=' + appState.activeTrack.index + ' [' + laneKeys + ']'); }
+    if (labelRetryIn > 0 && --labelRetryIn === 0) requestLabelSync();
+    // Engine (re)booted, a Set applied, an undo: rebuild the automation registry
+    // from the engine's labels and bind each lane to its param in the engine.
+    if (engineReady() && takeLabelSync()) {
+        resetDrumSync();   // a rebooted engine has lost the drum flags too
+        const labels = paramGet('alabels');
+        if (labels) {
+            const binds = new Map<number, { lane: number, e: LaneEntry }[]>();
+            const pending = syncLabelsFromEngine(
+                labels,
+                (slot, lane, e) => {
+                    const l = binds.get(slot);
+                    if (l) l.push({ lane, e }); else binds.set(slot, [{ lane, e }]);
+                },
+                validateTrackLane,
+            );
+            /* The bases the UI never sent (SP-36). After the labels, so every
+             * lane that is staying already has the range that turns the wire's
+             * 7 bits back into the parameter's units — and ASKED FOR AT ALL only
+             * when some assigned lane is missing its base, because this read
+             * shares the single-slot param SHM with movy's own writes. */
+            if (anyLaneNeedsBase()) {
+                const bases = paramGet('abases');
+                if (bases) seedFromEngine(bases, laneRangeOf);
+            }
+            for (const [slot, lanes] of binds) {
+                const refused = bindLanes((k, v) => portFor(slot).setParam(k, v), lanes);
+                if (refused > 0) mlog('auto bind refused t=' + slot + ' n=' + refused);
+            }
+            if (pending) {
+                labelRetryIn = labelRetryGap;
+                labelRetryGap = Math.min(LABEL_RETRY_MAX, labelRetryGap * 2);
+            } else {
+                labelRetryIn = 0;
+                labelRetryGap = LABEL_RETRY_MIN;
+            }
+        }
+    }
+    sessionTick();
+    /* A phase change is a view change, and the render below is gated on
+     * something being dirty — neither entering the splash nor leaving it makes
+     * a model dirty on its own. Without this the previous Set's chain page
+     * stayed on screen through the load, and the first live frame waited on
+     * whatever happened to repaint next (the ~1 s module-name poll). */
+    if (sessionPhase() !== lastPhase) { lastPhase = sessionPhase(); appState.dirty = true; }
+    /* Undo housekeeping, after seqPersistTick so the set uuid it watches is the
+     * one this tick resolved. Order within: close timed-out groups, notice a
+     * set/engine change, drop snapshots the stacks have released, retract a
+     * group the engine reported as a no-op. */
+    recPassTick();
+    undoTick();
+    moduleRestoreTick();
+    undoWatchContext();
+    flushOrphanedSnaps();
+    const noop = takeNoopSnapId();
+    if (noop >= 0) onEngineNoop(noop);
+    if (undoToastTick()) appState.dirty = true;
+    /* A freeze being recorded owns the LEDs and the screen (seq/freeze-busy.ts).
+     * Its first tick still renders the view once, under the toast; after that
+     * only the toast is redrawn, when its text moves. */
+    if (freezeBusy(Date.now())) {
+        freezeBusyToast();
+        if (wasFreezeBusy) {
+            freezeBusyLeds();
+            updateKnobLEDsFrom(NO_LEVELS);
+            /* The track being frozen, its waveform growing as it records (a
+             * repaint per engine `frzp`, every 5 %), the capture's playhead per
+             * tick, the toast with the progress under it. */
+            const t = freezeCapturing();
+            const sig = t + ':' + freezePeaksSeq();
+            const repainted = t >= 0 && sig !== busySig;
+            if (repainted) {
+                busySig = sig;
+                frozenVM = buildFreezingViewVM(t, appState.trackChainIndex[t] ?? 0, CHAIN_SLOTS.length);
+                renderFrozenView(frozenVM);
+            }
+            if (t >= 0 && frozenVM) frozenPlayheadTick(frozenVM, repainted, freezingPlayX());
+            if (repainted || seqToastVersion() !== busyToastVersion) { busyToastVersion = seqToastVersion(); drawSeqToast(); }
+            return;
+        }
+        busySig = '';
+        wasFreezeBusy = true;
+        busyToastVersion = seqToastVersion();
+        appState.dirty = true;
+    } else if (wasFreezeBusy) {
+        wasFreezeBusy = false;
+        /* The capture wrote the pads through the seq cache; the pad painters
+         * keep their own. Marked unknown, each pad is repainted by its painter
+         * within the LED budget — no boot-style LED sweep, which would hold
+         * every other painter for its frames. */
+        freezeBusyEnd();
+        chromaticCache.fill(255); drumCache.fill(255);
+        appState.dirty = true;
+    }
+    /* A frozen track has no module pages: it stays on the chain level, where
+     * the jog moves slots and its MIX page is one of them. */
+    if (appState.currentView === VIEW_KNOBS && isFrozen(appState.activeTrack.index)
+        && !isMixSlot(appState.trackChainIndex[appState.activeTrack.index])) {
+        appState.currentView = VIEW_CHAIN;
+        appState.dirty = true;
+    }
+    {
+        const sig = freezeScreenSig(appState.activeTrack.index, Date.now());
+        if (sig !== lastFreezeSig) { lastFreezeSig = sig; appState.dirty = true; }
+    }
+    /* Session toggle changes pad ownership: invalidate the seq LED cache and
+     * re-init the instrument pad LEDs when returning to Note mode. */
+    if (seqState.sessionMode !== lastSessionMode) {
+        lastSessionMode = seqState.sessionMode;
+        seqLedsInvalidate();
+        if (!seqState.sessionMode) { appState.initLedsDone = false; appState.initLedIndex = 0; chromaticCache.fill(0); }
+        appState.dirty = true;
+    }
+    seqLedsTick(appState.shiftHeld, appState.currentView, seqState.barOffset, maxBarOffset());
+
+    /* Drum status comes from the synth slot (index 1) regardless of which
+     * chain module is currently selected — drum pads and step lane stay active
+     * even when the user is browsing FX parameters on the same track. */
+    const synthModel = appState.trackModels[appState.activeTrack.index]?.[1];
+    const isDrum     = (synthModel?.getDrumPadCount() ?? 0) > 0;
+
+    /* A track switch changes what the pads mean, so the grid must repaint even
+     * where the new colour matches the cached one. Detected here (before the
+     * chromatic-init early-return below) so it fires regardless of whether the
+     * new track is a drum or melodic track. */
+    if (appState.activeTrack.index !== lastActiveSlot) {
+        lastActiveSlot = appState.activeTrack.index;
+        drumCacheStale = true;
+    }
+    if (isDrum) {
+        const cfg = synthModel!.getDrumConfig();
+        seqSetLane(cfg ? cfg.padNoteStart + (synthModel!.getDrumCurrentPad() - 1) : -1);
+    } else {
+        seqSetLane(-1);
+    }
+
+    /* Chromatic instrument-pad init batch. Skipped for a drum track whose synth
+     * is already loaded: the drum-grid paint below owns those pads, so painting
+     * chromatic first would flash the chromatic layout on (re)select. */
+    if (!appState.initLedsDone && !seqState.sessionMode && !isDrum) {
+        const total = PAD_MAX - PAD_MIN + 1;
+        const end   = Math.min(appState.initLedIndex + LED_INIT_BATCH, total);
+        let i = appState.initLedIndex;
+        for (; i < end; i++) {
+            /* Stop at the frame budget rather than sending into a full output
+             * buffer — the overflow is dropped silently, and the cache write
+             * below would then claim the pad was painted. */
+            if (!ledBudgetTake()) break;
+            const p = PAD_MIN + i;
+            const color = padColor(p, PAD_MIN, appState.activeTrack.index, false);
+            chromaticCache[i] = color;
+            setLED(p, color, true);
+        }
+        appState.initLedIndex = i;
+        /* The octave arrows finish the layout, so they are part of it: if the
+         * budget cannot take them, do not mark the init done — retry next tick
+         * rather than leave them dark for good. */
+        if (appState.initLedIndex >= total && ledBudgetTake(2)) {
+            setButtonLED(MoveUp, WHITE_DIM, true);
+            setButtonLED(MoveDown, WHITE_DIM, true);
+            appState.initLedsDone = true; appState.dirty = true;
+        }
+        return;
+    }
+
+    const chainIdx    = appState.trackChainIndex[appState.activeTrack.index];
+    const activeModel = appState.trackModels[appState.activeTrack.index]?.[chainIdx];
+    /*
+     * WHO OWNS THIS COMPONENT'S PAGES — asked ONCE per tick, and the answer
+     * decides whether Schwung's page is drawn and what lights the eight knob
+     * LEDs. Asking it once is the point: answers derived separately is how the
+     * seam drifted apart in the first place (design §3).
+     */
+    const pageOwner = pageOwnerOf(activeModel);
+
+    /* movy's model never re-reads values (`tick(false)`): Schwung's page has
+     * its own read cursor, and a second reader was the per-tick cost the page
+     * migration went looking for (design §3, Cause F). */
+    perfPhase('modeltick');
+    const modelDirty  = activeModel?.tick() ?? false;
+    perfPhaseEnd();
+
+    /* A module swap on the focused component changes its param set → re-validate
+     * this track's automation lanes (the label sync drops lanes the new module
+     * no longer has). Skipped on the first sighting (boot sync covers it) and on
+     * empty transients during load. */
+    const mnKey = appState.activeTrack.index + ':' + chainIdx;
+    const mn    = activeModel?.getModuleName() ?? '';
+    if (mn && lastModuleName.get(mnKey) !== mn) {
+        if (lastModuleName.has(mnKey)) {
+            requestLabelSync();
+        }
+        lastModuleName.set(mnKey, mn);
+    }
+
+    const mIdx        = appState.masterChainIndex;
+    const masterModel = seqState.sessionMode ? appState.masterFxModels[mIdx] : null;
+    /* SP-52: the master slot's OWN owner, never `pageOwner` above — that one is
+     * built from the TRACK's `activeModel`. Only asked in session mode. */
+    const masterPageOwner = seqState.sessionMode ? pageOwnerOf(masterModel) : null;
+    const masterDirty = masterModel?.tick() ?? false;
+
+    /* SP-53: Clip Params/Set Params have no MODEL at all (they answer out of
+     * `seqState`/`keyboardState` directly), so neither is `pageOwner` above and
+     * only asked while its own page is actually on screen. */
+    const clipParamsOwner = appState.currentView === VIEW_CLIP_PARAMS
+        ? pageOwnerForComponent(CLIP_PARAMS_COMPONENT) : null;
+    const mainParamsOwner = appState.currentView === VIEW_MAIN_PARAMS
+        ? pageOwnerForComponent(SET_PARAMS_COMPONENT) : null;
+    /* The Session mixer opens from the tick, not the press: it is a HOLD. */
+    mixerHoldTick(Date.now());
+    if (mixerMeterDue(Date.now(), seqState.mixMeter)) appState.dirty = true;
+    const mixerOwner = mixerPageActive() ? pageOwnerForComponent(MIXER_COMPONENT) : null;
+
+    // Reset knob touch/hold state whenever the shown param page changes, so a
+    // held knob's highlight never persists after navigating away and back (e.g.
+    // after assigning an LFO from a held knob — the release lands on the LFO
+    // model, not the module, so the module's touch would otherwise stick).
+    const shownKey = seqState.sessionMode
+        ? 'M' + mIdx + (appState.masterDetail ? 'd' : '')
+        : appState.activeTrack.index + ':' + chainIdx;
+    if (shownKey !== lastShownKey) {
+        lastShownKey = shownKey;
+        (seqState.sessionMode ? masterModel : activeModel)?.clearTouch();
+    }
+
+    seqToastTick();
+    /* Wall-clock, unlike the toast's tick counter — see quant-overlay.ts. The
+     * expiry sets appState.dirty itself, so the view underneath repaints once. */
+    quantOverlayTickAt(Date.now());
+    seqHeaderTick();
+    const toastShowing = seqToastActive();
+    const toastVersion = seqToastVersion();
+    const headerShowing = seqHeaderActive();
+
+    /*
+     * THE DELEGATED PAGE'S OWN TICK, and the repaint it asks for.
+     *
+     * Computed here, once, and used by both render branches below — so the
+     * condition that decides whether Schwung is polled is literally the same
+     * expression that decides whether Schwung is drawn. Two of those would
+     * eventually disagree, and the failure is silent in both directions: a page
+     * polled but not drawn pays for reads nobody sees, and a page drawn but not
+     * polled shows values that stopped moving.
+     */
+    const stepSelected = stepPageAvailable() && stepPageState.selected;
+    /* SP-54: only asked while a step is actually held AND the step page is
+     * the one selected — an unheld tick never builds or polls it, which is
+     * what keeps the idle-cost bound this file's comment above cites
+     * unaffected BY CONSTRUCTION rather than by a separate measurement. */
+    const stepParamsOwner = stepSelected ? pageOwnerForComponent(STEP_PARAMS_COMPONENT) : null;
+    const gridOnScreen = moduleGridOnScreen();
+    /* WHICH OWNER THE GRID BEING ON SCREEN REFERS TO. `gridOnScreen` is true
+     * for the track's own module page, the master slot's DETAIL page, the step
+     * page (SP-54), or Set/Clip Params (SP-53) — never more than one at once,
+     * since they are mutually exclusive branches of the same ladder in
+     * `app/tick.ts` below — so the owner it polls and draws must follow the
+     * same branch. Step-params is checked FIRST: a held step's own page always
+     * outranks whatever the track's module or Set/Clip Params would otherwise
+     * answer, the same precedence the pre-SP-54 render branches already gave
+     * it by building `buildStepPageVM` ahead of the module view. */
+    /* Clip/Set Params outrank the master slot in session mode too: the ladder
+     * draws them AHEAD of the session branch, so while one is up it is the page
+     * on screen, and handing it the master's owner would draw a master FX body
+     * under the Clip Params header. */
+    const drawnPageOwner = seqState.sessionMode
+        ? mixerOwner ?? clipParamsOwner ?? mainParamsOwner ?? masterPageOwner!
+        : stepParamsOwner ?? clipParamsOwner ?? mainParamsOwner ?? pageOwner;
+    /* THE POLL COMES BEFORE THE BODY IS ASKED FOR, because the body is what
+     * readiness gates and the poll is what resolves readiness. Gating the poll
+     * on the body instead is a deadlock that looks exactly like the feature
+     * being off: the contract never resolves, every gesture stays movy's, and
+     * the burn-down goes green by never delegating at all.
+     *
+     * What `refreshOneParam` used to do by accident, this does on purpose: the
+     * drawn cells moving is what asks for the frame back. */
+    /* PHASED, because an unmeasured phase is where a cost hides. `perf_phase`
+     * reported minijv's delegated page as `rest=0.6 seqengine=0.5 ...` summing
+     * to ~1.3 ms against a `tick_ms` of 70 — so 69 ms sat outside every named
+     * phase and the probe could say only that the tick was slow. The delegated
+     * page's poll (which advances Schwung's controller tick) is one of the two
+     * places that time can be; the other is the render, phased below. */
+    perfPhase('pagepoll');
+    if (gridOnScreen && pollDrawnPage(drawnPageOwner)) appState.dirty = true;
+    const schwungBody = gridOnScreen ? schwungBodyFor(drawnPageOwner) : undefined;
+    perfPhaseEnd();
+
+    /* The splash is held back for its first moments (loading-view.ts says
+     * why); this is the one repaint that brings it up if the wait outlasts
+     * that. */
+    const loadingWaited = loadingWaitMs(sessionReady(), Date.now());
+    if (splashDue(loadingWaited)) appState.dirty = true;
+    /* The splash's words move while it is up (3/8 → 4/8 → LOADING SOUNDS), and
+     * nothing else marks the screen dirty mid-wait. */
+    const splashText = sessionReady() ? '' : loadingStage(sessionPhase(), settleProgress(), migrationProgress());
+    if (splashText !== lastSplashText) { lastSplashText = splashText; if (splashText) appState.dirty = true; }
+
+    /* Whether this tick repainted the view. The song band sits on top of it,
+     * so a repaint erases the band and it has to be drawn again. */
+    let viewRepainted = false;
+    if (modelDirty || masterDirty || appState.dirty || toastShowing !== lastToastShowing
+        || (toastShowing && toastVersion !== lastToastVersion)
+        || headerShowing !== lastHeaderShowing) {
+        viewRepainted = true;
+        /* A bottom jog/browse toast (drawn by the param/chain renderers) shares
+         * the bottom rows with the Loop strip; track it so the per-tick strip
+         * below doesn't paint over it. Recomputed each rendered frame; persists
+         * across non-dirty ticks since the on-screen toast persists too. */
+        jogToastShown = false;
+        noteViewInFrame = false;
+        /* Which branch of this chain is about to draw. Logged once per change:
+         * the Schwung delegation was put on VIEW_KNOBS, but `seqState.sessionMode`
+         * is tested EARLIER in the same else-if chain, so in session mode
+         * VIEW_KNOBS is unreachable and the delegation never ran on device. */
+        {
+            const vst = `view=${appState.currentView} session=${seqState.sessionMode}`
+                      + ` masterDetail=${appState.masterDetail} ready=${sessionReady()}`;
+            if (vst !== _schwungView) { _schwungView = vst; mlog('schwung-view ' + vst); }
+        }
+        if (appState.currentView === VIEW_BROWSE) {
+            // A browser opened from the master chain shows the master slot label.
+            const browseTitle = seqState.sessionMode
+                ? (MASTER_FX_SLOTS[mIdx]?.label ?? 'Module')
+                : (activeModel?.getModuleName() ?? 'Module');
+            renderBrowseView(browserState.modules, browserState.browseIndex, browseTitle);
+        } else if (appState.currentView === VIEW_FILE_BROWSE) {
+            if (appState.fileBrowserState) renderFileBrowseView(appState.fileBrowserState);
+        } else if (!sessionReady()) {
+            /* Ahead of every view: until the Set is in the engine there is
+             * nothing truthful to draw, and input is refused anyway. */
+            renderLoadingView(sessionPhase(), sessionError(), settleProgress(),
+                              sessionFailScope(), loadingWaited, migrationProgress());
+        } else if (appState.currentView === VIEW_FLAGS) {
+            renderFlagsView(buildFlagsPageVM());
+            /* Knob 1 edits the selected row; its LED is that row's value, dark
+             * on a row it cannot change. */
+            const nv = flagsKnobLevel();
+            updateSingleKnobLED(nv === null ? -1 : 0, nv ?? 0);
+        } else if (textEntryActive()) {
+            /* The Sets page's rename: Schwung's keyboard draws the whole screen. */
+            textEntry()?.drawTextEntry();
+        } else if (appState.currentView === VIEW_SETS) {
+            renderSetsView(buildSetsPageVM(libState()?.rows ?? null, currentSetUuid(),
+                                           setsPageState.selected, setsPageState.confirming));
+        } else if (appState.currentView === VIEW_VERSIONS) {
+            const vm = buildVersionsPageVM(Date.now());
+            vm.selected = versionsPageState.selected;
+            vm.confirming = versionsPageState.confirming;
+            renderVersionsView(vm);
+        } else if (canvasDiveActive()) {
+            /* The module draws the whole screen; modal, like the editor below. */
+            renderCanvasDive();
+            updateSingleKnobLED(-1, 0);
+        } else if (schwungEditorActive()) {
+            /* A divable parameter's list, drawn over whatever view opened it.
+             * Ahead of every view branch because it is modal — the page beneath
+             * is not what the gestures are addressing. */
+            clear_screen();
+            renderSchwungEditor();
+            updateSingleKnobLED(-1, 0);
+        } else if (appState.currentView === VIEW_MIXER) {
+            /* Schwung's custom page: its header, bank bar and held-knob toast,
+             * movy's sixteen strips in the body (mixer-contract.ts). */
+            const vm = headerOnlyVM('MIXER');
+            const chrome = schwungChromeFor(drawnPageOwner, schwungBody, false);
+            renderKnobsView(vm, false, appState.activeTrack.index,
+                            paramBodyFor(drawnPageOwner, schwungBody, lastAutoView),
+                            schwungBankFor(drawnPageOwner, schwungBody), chrome);
+            jogToastShown = !!(chrome && chrome.footer);
+            lightKnobRow(schwungBody);
+        } else if (appState.currentView === VIEW_MAIN_PARAMS) {
+            /* AFTER `schwungEditorActive()`, same reason as Clip Params below:
+             * KEY/MODE/LAYOUT's long-enum dive is Schwung's own list picker
+             * under delegation, which raises exactly that editor. */
+            const vm = headerOnlyVM('SET PARAMETERS');
+            const chrome = schwungChromeFor(drawnPageOwner, schwungBody, false);
+            renderKnobsView(vm, false, appState.activeTrack.index,
+                            paramBodyFor(drawnPageOwner, schwungBody, lastAutoView),
+                            schwungBankFor(drawnPageOwner, schwungBody), chrome);
+            jogToastShown = !!(chrome && chrome.footer);
+            lightKnobRow(schwungBody);
+        } else if (appState.currentView === VIEW_CLIP_PARAMS) {
+            /* AFTER `schwungEditorActive()` on purpose (SP-53): SCALE's
+             * long-enum dive is Schwung's own list picker under delegation
+             * (`owner.page.click()`), which raises exactly that editor — tested
+             * before this branch is, or the dive would never draw, the same way
+             * VIEW_KNOBS sits after it for a module's own divable params. */
+            const vm = headerOnlyVM('CLIP PARAMETERS');
+            const chrome = schwungChromeFor(drawnPageOwner, schwungBody, false);
+            renderKnobsView(vm, false, appState.activeTrack.index,
+                            paramBodyFor(drawnPageOwner, schwungBody, lastAutoView),
+                            schwungBankFor(drawnPageOwner, schwungBody), chrome);
+            jogToastShown = !!(chrome && chrome.footer);
+            lightKnobRow(schwungBody);
+        } else if (appState.currentView === VIEW_CPU) {
+            renderCpuView(buildCpuPageVM());
+            // Nothing on this page is editable, so every knob goes dark. A knob
+            // still lit from the page underneath would be inviting a turn this
+            // page consumes and ignores.
+            updateSingleKnobLED(-1, 0);
+        } else if (seqState.sessionMode) {
+            const vm = masterModel!.getViewModel();
+            if (appState.masterDetail) {
+                // Drilled into the focused master slot's module: show its knob
+                // detail page (param banks scroll via jog), same as a track
+                // slot — including Schwung's body/chrome when it is delegated
+                // (SP-52: `gridOnScreen` is true here for exactly this branch).
+                /* Every render path that can put params on screen must call this —
+                 * see the comment on noteRendered above. Without it the probe's
+                 * `page()` answer (and the frame counter `Probe.settled()` waits
+                 * on) never moves for a master-detail render: it keeps whatever a
+                 * track's VIEW_KNOBS last left in `lastVm`, so a check reading the
+                 * master slot's own params reads the wrong module's (measured:
+                 * `module=plaits` while the master slot held `4k-eq`). */
+                noteRendered(vm);
+                const chrome = schwungChromeFor(drawnPageOwner, schwungBody, true);
+                renderKnobsView(vm, moduleJogHint(), appState.activeTrack.index,
+                                paramBodyFor(drawnPageOwner, schwungBody, lastAutoView),
+                                schwungBankFor(drawnPageOwner, schwungBody), chrome);
+                jogToastShown = moduleJogHint() || !!(chrome && chrome.footer);
+            } else {
+                noteRendered(vm);
+                /* The slot grid draws the focused slot's body too, so it takes
+                 * Schwung's body and chrome exactly as a track's VIEW_CHAIN does
+                 * (SP-58) — `paging: false`, since the jog moves slots here. */
+                const chrome = schwungChromeFor(drawnPageOwner, schwungBody, false);
+                renderChainView(vm, mIdx, moduleJogHint(), 'MASTER', MASTER_FX_SLOTS[mIdx]?.label,
+                                MASTER_FX_SLOTS, paramBodyFor(drawnPageOwner, schwungBody, lastAutoView),
+                                chrome);
+                jogToastShown = moduleJogHint() || !!(chrome && chrome.footer);
+            }
+            lightKnobRow(schwungBody);
+        } else if (noteViewActive()) {
+            /* Loop mode: the note view owns everything above the strip and is
+             * painted on the per-tick schedule below; the knobs are idle —
+             * except in a generator preview, where they are the option's and
+             * light like a module's params (ai/preview-knobs.ts). */
+            clear_screen();
+            /* Painted here, not only on the per-tick schedule, so the overlays
+             * below land on top of it. */
+            noteViewTick(true);
+            noteViewInFrame = true;
+            const previewKnobs = knobLevels();
+            if (previewKnobs) updateKnobLEDsFrom(previewKnobs);
+            else updateSingleKnobLED(-1, 0);
+        } else if (appState.currentView === VIEW_KEYS) {
+            renderKeysView(activeModel?.getModuleName() ?? '—', baseNoteFor(appState.activeTrack.index), midiNoteName);
+        } else if (appState.currentView === VIEW_KNOBS) {
+            const stepAvail = stepPageAvailable();
+            let vm;
+            if (stepAvail && stepPageState.selected) {
+                vm = buildStepPageVM();
+            } else {
+                perfPhase('autoview');
+                const av = buildAutomationView(appState.activeTrack.index, activeModel!);
+                lastAutoView = av;
+                perfPhase('buildvm');
+                vm = activeModel!.getViewModel(av);
+                perfPhaseEnd();
+                if (stepAvail) { vm.stepPagePresent = true; vm.stepPageSelected = false; }
+            }
+            noteRendered(vm);
+            perfPhase('render');
+            /*
+             * SCHWUNG PAGINATION. Under mode 'page' Schwung plans the page set
+             * and draws the whole grid; movy's contribution is the automation
+             * view, which Schwung resolves BY PARAMETER KEY — so a lane keeps
+             * pointing at its parameter wherever Schwung puts it.
+             *
+             * Only the module view takes this path. VIEW_MAIN_PARAMS and
+             * VIEW_CLIP_PARAMS are movy's OWN pages (tempo, swing, clip
+             * settings); they are not a module's declared contract and there is
+             * nothing for a module planner to plan. Routing them here would
+             * have replaced the sequencer's own screens with an empty grid.
+             *
+             * The step page is movy's too (SP-54's virtual STEP_PARAMS_COMPONENT,
+             * not a module's declared contract either) — but under `page` it now
+             * gets Schwung's OWN body, chrome included, exactly like Clip/Set
+             * Params. `vm` is still built above regardless: the header fallback
+             * and the "step is a bank of its own" bar (`vm.stepPagePresent`)
+             * come from it either way, only its ROWS are skipped when
+             * `schwungBody` is set (`renderKnobsView`'s own `bodyOverride`).
+             */
+            /* The chrome's footer band overlaps the Loop strip's rows, so the
+             * frame that draws it has to claim them the way a bottom-row toast
+             * does — otherwise the strip's per-tick clear takes the bottoms off
+             * every pill a few milliseconds later. `chromeFor` decides WHEN it
+             * is drawn (a knob under the hand); this only has to make the strip
+             * yield on that frame.
+             *
+             * CHROME FOLLOWS `drawnPageOwner` (whichever owner supplied
+             * `schwungBody` this frame — the step-params owner while a step is
+             * held and selected, the module's own otherwise), so a touched step
+             * cell's toast reaches the header. THE BANK STAYS `pageOwner`'s
+             * (the MODULE's), because the bar must always read "step + the
+             * module's own bank count" (`step-page-vm.ts`) regardless of who is
+             * drawing the body this frame — the two questions are independent
+             * and always were, this just names which owner answers each. */
+            const chrome = schwungChromeFor(drawnPageOwner, schwungBody, !stepSelected);
+            const chromeFooter = !!(chrome && chrome.footer);
+            renderKnobsView(vm, moduleJogHint(), appState.activeTrack.index,
+                            paramBodyFor(drawnPageOwner, schwungBody, lastAutoView),
+                            schwungBankFor(pageOwner, schwungBody), chrome);
+            perfPhaseEnd();
+            // The pool-full toast shares the bottom rows with the Loop strip;
+            // claim them so the strip yields to it (like every other toast).
+            jogToastShown = (vm.automationHeld && vm.automationPoolFull)
+                || moduleJogHint() || chromeFooter;
+            perfPhase('leds');
+            lightKnobRow(schwungBody);
+            perfPhaseEnd();
+        } else if (appState.currentView === VIEW_CHAIN) {
+            const stepAvail = stepPageAvailable();
+            let vm;
+            if (stepAvail && stepPageState.selected) {
+                vm = buildStepPageVM();
+            } else {
+                /* KEPT, not discarded. `schwungBodyFor` renders Schwung from
+                 * `lastAutoView`, which is what carries the parameter locks —
+                 * and this branch used to build the view, hand it to
+                 * getViewModel and throw it away. So on THIS view, the one movy
+                 * opens on, Schwung was drawn with whatever a previous
+                 * VIEW_KNOBS frame had left behind, or with nothing at all.
+                 * Reported from the device as "i can't see p locks working". */
+                /* Phased to match the VIEW_KNOBS branch above. This is the view
+                 * movy OPENS on, so it is the one a user's first impression of
+                 * a slow page comes from, and it was the only module view whose
+                 * render was invisible to `perf_phase`. */
+                perfPhase('autoview');
+                const av = buildAutomationView(appState.activeTrack.index, activeModel!);
+                lastAutoView = av;
+                perfPhase('buildvm');
+                vm = activeModel!.getViewModel(av);
+                perfPhaseEnd();
+                if (stepAvail) { vm.stepPagePresent = true; vm.stepPageSelected = false; }
+            }
+            noteRendered(vm);
+            perfPhase('render');
+            /* `paging: false` — the jog moves CHAIN SLOTS here, so Schwung owes
+             * this view no hint band (see schwung-page-chrome.ts). CHROME follows
+             * `drawnPageOwner`, same reasoning as the VIEW_KNOBS branch above —
+             * so a touched step-page cell's toast reaches the header here too. */
+            const chrome = schwungChromeFor(drawnPageOwner, schwungBody, false);
+            /* A frozen track has no chain to show: its own screen instead
+             * (seq/freeze.ts), and no jog toast over it. */
+            const frozen = isFrozen(appState.activeTrack.index) && !isMixSlot(chainIdx);
+            if (frozen) {
+                frozenVM = buildFrozenViewVM(appState.activeTrack.index, chainIdx, CHAIN_SLOTS.length);
+                renderFrozenView(frozenVM);
+            } else {
+                renderChainView(vm, chainIdx, moduleJogHint(), 'T' + (appState.activeTrack.index + 1),
+                                undefined, undefined as any, paramBodyFor(drawnPageOwner, schwungBody, lastAutoView),
+                                chrome);
+            }
+            perfPhaseEnd();
+            /* Must match what renderChainView actually drew: the Loop strip
+             * clears rows 60-63 every tick and would erase a toast it was not
+             * told about. */
+            jogToastShown = !frozen && (moduleJogHint() || !!(chrome && chrome.footer));
+            perfPhase('leds');
+            lightKnobRow(schwungBody);
+            perfPhaseEnd();
+        }
+        /* Volume slider above the view it was invoked from: a held track's,
+         * else the master's. */
+        const vol = volumeOverlay() ?? masterVolumeOverlay();
+        if (vol) drawVolumeOverlay(vol);
+        const freezeToast = freezeToastTrack();
+        viewCovered = !!vol || quantOverlayActive() || undoToastActive() || leaveModalActive()
+            || trackMenuActive() || freezeToast >= 0;
+        if (assignActive()) { drawJogToast(assignToastText()); jogToastShown = true; }
+        if (toastShowing) drawSeqToast();
+        if (headerShowing) drawSeqHeader();
+        /* Quantize panel: a strip over the view, below every overlay that owns
+         * the screen — it is a confirmation, not a decision. */
+        if (quantOverlayActive()) drawQuantOverlay(buildQuantOverlayVM());
+        // The post-capture overlay owns the screen until it is dismissed.
+        if (captureOverlayActive()) drawCaptureOverlay(buildCaptureVM());
+        /* Undo toast sits above the views but below the capture overlay and the
+         * leave modal, both of which own the screen while they are up. */
+        if (undoToastActive()) drawUndoOverlay(undoToast()!);
+        // Leave-Movy modal draws on top of everything else.
+        /* A frozen track's big toast, then the track menu (it owns the screen
+         * while open), both under the leave dialog. */
+        if (freezeToast >= 0) drawFreezeToast('T' + (freezeToast + 1));
+        if (trackMenuActive()) renderFlagsView(buildTrackMenuVM(), 'T' + (trackMenuTrack() + 1));
+        if (leaveModalActive()) drawLeaveModal(leaveModalLabels(), leaveModalSel(), leaveModalTitle(), leaveModalNote());
+        lastToastShowing = toastShowing;
+        lastToastVersion = toastVersion;
+        lastHeaderShowing = headerShowing;
+        appState.dirty = false;
+    }
+
+    /* ── Drum pad LEDs ──────────────────────────────────────────────────────
+     * Painted every tick (not just on dirty frames) so a pad turns green the
+     * moment its note sounds — from the sequencer gate (activeHasNote) or from
+     * the user physically holding it (the live-note ledger) — and reverts when it
+     * stops. Green wins over the white "selected" pad and the resting track
+     * color (priority lives in drumPadLedColor). In Session mode the clip grid
+     * owns the pads (painted by seqLedsTick). synthModel/isDrum come
+     * from the synth slot regardless of the active chain index, so drum pads
+     * light up even on FX parameter pages. */
+    const drumNow = !seqState.sessionMode && isDrum;
+    if (drumNow) {
+        // isDrum was sampled before activeModel.tick() ran. If tick() called
+        // loadHierarchy (module just changed), getDrumConfig() returns null even
+        // though isDrum is true. Skip this one transition tick — next tick isDrum
+        // will be false and the else-if branch cleans up normally.
+        const drumCfg = synthModel!.getDrumConfig();
+        if (drumCfg) {
+            // On entry from a non-drum track, force a full repaint so non-grid pads
+            // (past the rack's width → Black) overwrite any stale chromatic colors left behind.
+            // On entry from a non-drum view (e.g. Session clip grid → Note), open
+            // a repaint window too, so the grid fully overwrites whatever owned the
+            // pads. (A track switch already opened one above.)
+            if (!appState.drumActive) {
+                drumCacheStale = true;
+                setButtonLED(MoveUp, Black, true);
+                setButtonLED(MoveDown, Black, true);
+            }
+            // Invalidate once so non-grid pads (past the rack's width → Black) and every grid
+            // pad overwrite colours left by the previous layout, which the
+            // per-pad cache would otherwise treat as already correct.
+            if (drumCacheStale) {
+                drumCache.fill(0xFF);
+                drumCacheStale = false;
+            }
+            const track = appState.activeTrack.index;
+            const sel   = synthModel!.getDrumCurrentPhysPad();
+            for (let i = 0; i <= PAD_MAX - PAD_MIN; i++) {
+                const p = PAD_MIN + i;
+                // The note this pad plays — the same lookup drumPadLedColor and
+                // the engine's pad map use, so "is it sounding" cannot disagree
+                // with what a press sends. -1 = not part of the rack.
+                const note = drumNoteOfPhys(p, PAD_MIN, drumCfg);
+                const playing = note >= 0 && (activeHasNote(track, note) || isSounding(p));
+                /* A frozen track plays no notes: its pads are dark. */
+                const color = isFrozen(track) ? 0
+                    : drumPadLedColor(p, PAD_MIN, drumCfg, sel, track, playing,
+                                      note >= 0 && padVoiceSilent(note));
+                if (drumCache[i] !== color) {
+                    if (!ledBudgetTake()) continue;   // cache left stale: retries next tick
+                    drumCache[i] = color;
+                    setLED(p, color, true);
+                }
+            }
+            appState.drumActive = true;
+        }
+    } else if (appState.drumActive) {
+        appState.drumActive = false;
+        appState.initLedsDone = false;
+        appState.initLedIndex = 0;
+        chromaticCache.fill(0);
+        drumCache.fill(0);
+        if (!seqState.sessionMode) {
+            setButtonLED(MoveUp, WHITE_DIM, true);
+            setButtonLED(MoveDown, WHITE_DIM, true);
+        }
+    }
+
+    /* Per-tick chromatic pad update: green for sequencer-active or physically-
+     * held notes, white for lastHeld set or step-hold overlay (holdNotes),
+     * normal scale coloring otherwise. Runs outside the dirty-frame guard so
+     * the sequencer's active-note LEDs update at poll rate (~24 Hz) without
+     * requiring a full UI redraw. Cache diff prevents redundant LED sends. */
+    if (!seqState.sessionMode && !isDrum && appState.initLedsDone) {
+        const track     = appState.activeTrack.index;
+        const map       = padMapFor(track);
+        const holdNotes = seqState.holdStep >= 0 && seqState.holdNotes.length > 0
+            ? displayHoldNotes() : null;
+        for (let i = 0; i <= PAD_MAX - PAD_MIN; i++) {
+            const p     = PAD_MIN + i;
+            const pitch = map[i];
+            const isPlaying = isSounding(p) || (pitch >= 0 && activeHasNote(track, pitch));
+            const color = isFrozen(track) ? 0 : padColor(p, PAD_MIN, track, isPlaying, holdNotes);
+            if (chromaticCache[i] !== color) {
+                if (!ledBudgetTake()) continue;   // cache left stale: retries next tick
+                chromaticCache[i] = color;
+                setLED(p, color, true);
+            }
+        }
+    }
+
+    /* Loop Overview strip overlays the bottom of the param view whenever the
+     * sequencer is live; a toast temporarily covers it. Drawn every tick (not
+     * just on dirty frames) so the playhead sweeps continuously. Hidden on the
+     * master chain (Session mode) — it tracks the watched track's clip, which
+     * is irrelevant while editing master FX. */
+    const isBrowseView = appState.currentView === VIEW_BROWSE || appState.currentView === VIEW_FILE_BROWSE;
+    // The CPU meter owns the whole screen down to row 62, and the strip's
+    // per-tick clear would take its label row.
+    const isFullScreenView = isBrowseView || appState.currentView === VIEW_CPU
+        || appState.currentView === VIEW_SETS || textEntryActive();
+    // The strip repaints every tick, outside the dirty-frame block, so anything
+    // that owns the whole screen has to be excluded here or the strip draws back
+    // over it a few milliseconds later.
+    /* A Schwung page drawing into the bottom band (peek, picker, hint, a menu
+     * or preset page's footer) or movy's own Schwung list editor claims it —
+     * asked HERE, once, not taught to each branch above (SP-60). */
+    const schwungBottom = schwungEditorActive() || canvasDiveActive()
+        || (!!schwungBody && !!drawnPageOwner.page && drawnPageOwner.page.claimsBottomBand());
+    if (engineReady() && !seqToastActive() && !jogToastShown && !schwungBottom
+        && !seqState.sessionMode && !isFullScreenView && !captureOverlayActive()) {
+        /* The note view runs on the strip's per-tick schedule: both track state
+         * that moves without a dirty frame (bar navigation, the sweep, a take
+         * being recorded). */
+        /* A held step's piano takes the strip's band (seq/step-piano.ts).
+         * Unlike the strip it is static, so it repaints only when its keys or
+         * notes change or the view underneath was redrawn. */
+        const piano = stepPianoVM();
+        if (piano) {
+            const key = stepPianoKey(piano);
+            if (viewRepainted || key !== pianoShown) drawStepPiano(piano);
+            pianoShown = key;
+        } else {
+            leavePiano(viewRepainted);
+            /* A box over the view stops the note view's per-tick paint, or its
+             * notes and playhead draw through the box (the AI preview shows
+             * its candidates in the note view). */
+            if (noteViewActive() && !viewCovered) noteViewTick(viewRepainted && !noteViewInFrame);
+            if (aiPreviewActive()) previewStripTick(viewRepainted);
+            else drawLoopStrip();
+            /* A frozen track's playhead is the strip's, up through its wave. */
+            const ft = appState.activeTrack.index;
+            if (frozenVM && !viewCovered && !noteViewActive() && appState.currentView === VIEW_CHAIN
+                && isFrozen(ft) && !isMixSlot(appState.trackChainIndex[ft])) {
+                frozenPlayheadTick(frozenVM, viewRepainted, frozenPlayX(ft));
+            }
+        }
+    } else {
+        leavePiano(viewRepainted);
+    }
+
+    /* Song band: Session view only, and on its own schedule — on the frames the
+     * view underneath repainted over it, and otherwise only when the
+     * arrangement or the position in it changed. A running song must cost
+     * nothing per tick. */
+    if (engineReady() && !seqToastActive() && !jogToastShown && !schwungBottom && !isBrowseView
+        && !captureOverlayActive()) {
+        songBandTick(viewRepainted);
+    }
+}
+
+/* The piano is taller than the strip that replaces it, so its top rows would
+ * outlive it: repaint the view once. Not when this frame already repainted —
+ * a toast covering the piano would otherwise ask for a frame every tick. */
+function leavePiano(viewRepainted: boolean): void {
+    if (pianoShown && !viewRepainted) appState.dirty = true;
+    pianoShown = '';
+}

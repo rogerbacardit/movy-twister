@@ -1,0 +1,4341 @@
+//! The twelve movy-hosted chains: lifecycle, loading and rendering.
+//!
+//! Tracks 0-3 are schwung's own shadow slots and are driven by MIDI channel as
+//! before; tracks 4-15 live here, one chain instance each.
+//!
+//! **Empty chains must cost nothing.** The design's hard requirement. Slots are
+//! `None` until something is loaded into them, and `render()` walks only the
+//! ones that exist — an untouched movy track costs one `Option` check per block,
+//! not a silent chain render. This is enforced by `renders_nothing_when_empty`
+//! rather than by inspection.
+
+use crate::block_prof::{BlockProf, Stage};
+use crate::chain_cost::CostMeter;
+use crate::chain_doc;
+use crate::chain_load_check::{self, LoadErrors};
+use crate::chain_digest::{ChainDigest, STIMULUS};
+use crate::chain_host::{ChainHost, ChainInstance};
+use crate::chain_idle::{IdleGate, Work};
+use crate::chain_pin::PinPolicy;
+use crate::ffi::{MOVE_MIDI_SOURCE_EXTERNAL, MOVE_MIDI_SOURCE_FX_BROADCAST, MOVE_MIDI_SOURCE_INTERNAL};
+use crate::host;
+use crate::load_queue::{LoadQueue, LoadRequest};
+use crate::master_chain::{fx_position, key_allowed, MasterChain, IMPORT_MARK, MASTER_FX};
+use crate::auto_lane::{LaneTarget, ValBuf, AUTO_LANES};
+use crate::mixer::{mix_into, TrackMix};
+use crate::freeze::{Frozen, LoopAt};
+use crate::freeze_files::{ClipEntry, Entry as FreezeEntry, FrozenLoad, Wav};
+use crate::freeze_bank::{Cancel, ClipJob, FreezeBank, Outcome};
+use seq_core::engine::{LoopPos, RecWindow, TrackWindows};
+use seq_core::track::CLIPS_PER_TRACK;
+use crate::send_bus::{SendBuses, SEND_BUSES};
+use crate::track_meter::{stereo_peaks, TrackMeter};
+use crate::render_plan::{worth_fanning_out, Planner};
+use crate::render_pool::{drain_voices, Pre, RenderPool, Tap, Task, VoiceTask, MAX_TAPS, NO_TAPS};
+use crate::voice_send::{VoiceSends, VOICE_SENDS};
+
+/// Chains movy hosts itself: **one per track, and `ch<N>` IS track N.**
+///
+/// Twelve used to back tracks 4..15, numbered 0..11. The four that carry
+/// tracks 0..3 — schwung's shadow slots until the UI's one-time migration
+/// (src/track/migrate.ts) moved their contents here — could have been
+/// appended as 12..15 to leave the twelve where they were. They were not: a
+/// mapping with an offset in it is a mapping someone gets wrong, and nothing
+/// persisted holds a chain index anyway (movy's saved state records a TRACK,
+/// and every param goes through a port), so the renumbering cost no migration
+/// on this side.
+pub const MOVY_CHAINS: usize = 16;
+
+/// 128 frames stereo — schwung's block size. Preallocated: no allocation may
+/// happen on the audio thread.
+const SCRATCH_SAMPLES: usize = 128 * 2;
+
+/// Lanes including the audio thread's own, so `LANES - 1` helpers: one per
+/// core. The audio thread renders lane 0 on core 3, the helpers take 0-2.
+///
+/// Three was the overtake answer, where a fourth lane competed with Move's own
+/// FIFO 70 workers for the cores they needed right after movy's render. On
+/// movy-host those workers do not exist, and re-swept on the device (WP11,
+/// `scripts/measure-render-pool.mjs lanes`, A/B/A/B on one sounding set):
+/// twelve even chains 1030 -> 805 us of render wall, the serial cost unmoved
+/// (+1.6 %); a helm-bound mixed set 1290 -> 1250 (its largest chain is the
+/// floor); with osirus and minijv sounding beside them 1488 -> 1247. No late
+/// frames in any arm.
+const LANES: usize = 4;
+
+/// The most lanes `chlanes` may ask for: one per core.
+const MAX_LANES: usize = 4;
+
+/// Blocks between replans. The plan follows measured cost, which only exists
+/// after chains have rendered, so it cannot be fixed at load time — but
+/// repartitioning every block would move chains between lanes on noise. ~3 s.
+const REPLAN_BLOCKS: u32 = 1024;
+
+/// The chain host component a send bus loads its FX into. A send holds one
+/// audio FX, so the bus number lives in the engine key and the component
+/// underneath is always the same — the UI never has to know it exists.
+pub(crate) const SEND_COMPONENT: &str = "fx1";
+
+/// Every position the render pool can be given work for: the chains, then the
+/// send buses. ONE index space, so a task's `chain` field names exactly one
+/// cost slot, one MIDI queue and one pin key whichever phase built it.
+pub const RENDER_SLOTS: usize = MOVY_CHAINS + SEND_BUSES;
+
+/// Where send bus `n` sits in that space. Above every chain, so it can never
+/// collide with a track: the load queue is slot-generic and would not notice,
+/// but a reverb loaded into somebody's synth is not a subtle failure.
+///
+/// One formula, four users — the load queue, the pool's per-slot cost and MIDI
+/// attribution, and `chain_pin`. A second copy of it is a mapping somebody gets
+/// wrong in only one of them.
+pub fn send_index(bus: usize) -> usize {
+    MOVY_CHAINS + bus
+}
+
+/// The bus a document slot addresses, or `None` when it addresses a track.
+///
+/// The way back, for a reader holding a slot from a Set file — mirroring
+/// `busOfDocSlot` in `src/track/send-persist.ts`, which is the same question
+/// asked on the other side of the wire.
+pub fn bus_of_slot(slot: usize) -> Option<usize> {
+    let bus = slot.checked_sub(MOVY_CHAINS)?;
+    (bus < SEND_BUSES).then_some(bus)
+}
+
+/// The master chain's document slot: one past the last send. NOT a render pool
+/// position — the master runs once, serially, after everything else — so
+/// `RENDER_SLOTS` stays the pool's space and only the document and the load
+/// queue grow by one (`DOC_SLOTS`).
+pub const fn master_index() -> usize {
+    RENDER_SLOTS
+}
+
+/// Every slot a chain-set document may name: the pool's positions plus the master.
+pub const DOC_SLOTS: usize = RENDER_SLOTS + 1;
+
+pub struct ChainSlots {
+    host: Option<ChainHost>,
+    /// Host tests render fake chains with no chain host loaded.
+    #[cfg(test)]
+    render_without_host: bool,
+    /// `None` until something is loaded — this is the "empty costs nothing" rule.
+    slots: Vec<Option<ChainInstance>>,
+    mixes: Vec<TrackMix>,
+    queue: LoadQueue,
+    /// The chain set as last REQUESTED, per slot, as (component, module) in the
+    /// order it arrived. Not as last loaded: a load is queued and released one
+    /// per audio callback, so "what has finished dlopen-ing" is a moving target
+    /// that a save must never be allowed to see. Reporting the request instead
+    /// is what makes a partial set unrepresentable — see
+    /// plans/2026-08-29-chain-set-document.md.
+    ///
+    /// Indexed in the SHARED slot space, so it covers the send buses at
+    /// `send_index` as well as the tracks — a send the document does not name
+    /// is a send no save can record, which is how every send FX stayed out of
+    /// every Set file (plans/2026-09-15-send-persist-not-saved.md).
+    desired: Vec<Vec<(String, String)>>,
+    /// One output buffer per chain, not one shared buffer: two chains rendering
+    /// concurrently need somewhere disjoint to write, and the mix has to happen
+    /// after the join anyway. 12 x 512 bytes.
+    scratch: Vec<Vec<i16>>,
+    /// Which chains must share a lane. Modules are assumed thread-safe, so this
+    /// is empty unless a module is blacklisted — see
+    /// `chain_pin`.
+    pin: PinPolicy,
+    /// Set once the host has been tried and failed, so a broken install is not
+    /// retried on every block.
+    host_failed: bool,
+    module_dir: String,
+    /// Whether each slot has ever produced a non-silent block. Rendering without
+    /// crashing and actually making a sound are different claims, and only the
+    /// first is visible from a log line about loading — this makes the second
+    /// observable too. Logged on the silent -> audible TRANSITION only, so the
+    /// audio thread never logs per block.
+    audible: Vec<bool>,
+    /// Rolling count of chains that rendered in the last block, and the number
+    /// currently loaded. The CPU ceiling has to come from measurement on real
+    /// modules (design §5.3), and this is what a device test reads.
+    active_last_block: usize,
+    /// Output peak of each chain's LAST rendered block, 0-32767.
+    ///
+    /// A benchmark that cannot see this cannot tell "this synth costs the same
+    /// at 1 and 4 notes because it renders its voices anyway" from "the notes
+    /// never reached it and I measured silence" — and those look identical in a
+    /// cost table. Cheap: one abs-max over a block movy has already rendered.
+    peaks: Vec<i32>,
+    /// The mixer page's stereo, post-fader meters (`track_meter.rs`).
+    meter: TrackMeter,
+    /// Bumped whenever a chain's modules change. The UI watches this in `status`
+    /// and marks its per-set state dirty, so a chain change is persisted no
+    /// matter who made it — a browser load, a restore, an undo, or a remote
+    /// param write that the UI never saw. Tying the save to the UI gesture
+    /// instead meant anything else changed the chains without ever being saved.
+    generation: u32,
+    /// What each chain costs per block. The parallel-render design is bounded by
+    /// the largest single chain, and nothing else here can see a distribution —
+    /// `peaks` says a chain is audible, not what it cost.
+    cost: CostMeter,
+    /// The last block, stage by stage, for movy-host's glitch line.
+    pub prof: BlockProf,
+    /// The helper threads, spawned once by `configure` — off the audio thread,
+    /// which is the only place a spawn may happen. `None` until movy actually
+    /// hosts chains, and the render falls back to serial while it is (see
+    /// `parallel_ready`).
+    /// Ableton Link: the session snapshot and the Link Audio taps.
+    pub link: crate::link_bridge::LinkBridge,
+    pool: Option<RenderPool>,
+    planner: Planner,
+    /// Per-lane task lists, refilled in place each block — pushing into a `Vec`
+    /// within its capacity does not allocate, and nothing may allocate here.
+    lanes: Vec<Vec<Task>>,
+    blocks_since_plan: u32,
+    /// Chain-set generation the current plan was built for.
+    plan_generation: u32,
+    /// Which slots are loaded, as the planner wants it. A field rather than a
+    /// local because replanning happens on the audio thread.
+    loaded: Vec<bool>,
+    /// Which chains may skip work this block. See `chain_idle`.
+    idle: IdleGate,
+    /// This block's decision per chain, taken once before anything renders —
+    /// the parallel path builds its whole task list up front, so serial and
+    /// parallel have to be reading the same answer.
+    work: Vec<Work>,
+    /// Each chain's peak after its synth stage and before its FX. Written by
+    /// whichever lane rendered it; the parallel path copies it back after the
+    /// join, exactly as it already does for cost.
+    synth_peak: Vec<i32>,
+    /// The `idle` epoch the current lane plan was built for.
+    plan_idle_epoch: u32,
+    /// The equivalence oracle: what each chain rendered, not what it cost.
+    /// Idle until `chdigest` arms it.
+    digest: ChainDigest,
+    /// The two send buses. Deliberately NOT entries in `slots`: `ch<N>` IS
+    /// track N, and sixty-odd sites in this crate read `slots` as exactly
+    /// `MOVY_CHAINS` tracks. A separate field makes every one of them correct
+    /// by construction rather than by audit (design §4).
+    sends: SendBuses,
+    /// Whether the last send phase actually fanned out. The `sndlog` read-back
+    /// for it: from outside, a parallel send phase and a serial one produce
+    /// identical audio and identical per-bus costs, so without this a device
+    /// measurement cannot tell which one it just timed — and every number it
+    /// reports would be unfalsifiable.
+    send_fanned: bool,
+    /// Which buses owe their FX a call this block. Decided once, before the
+    /// phase runs, so the partition and the mix cannot disagree about it.
+    send_work: Vec<bool>,
+    /// The send phase's own partition. A second `Planner` rather than a reuse of
+    /// the chain one: the two phases run one after the other and hold different
+    /// assignments at the same time, and one instance cannot carry both.
+    send_planner: Planner,
+    send_lanes: Vec<Vec<Task>>,
+    /// Buses the planner accepted onto a chain lane, and the chains feeding
+    /// each. A replan-time snapshot: `plan_dirty` is what keeps it from going
+    /// stale, because a feeder appearing on another lane is a data race on the
+    /// bus buffer and not merely a worse partition. See `chain_colo` §4.
+    colo_bus: [bool; SEND_BUSES],
+    colo_feeders: [u16; SEND_BUSES],
+    /// Which co-located buses actually run THIS block — the per-block half of
+    /// the decision, since a tail can retire a bus between replans.
+    colo_ran: [bool; SEND_BUSES],
+    /// The combined index space the chain planner is handed: chains, then
+    /// buses. Preallocated with room for any pin key so that assembling it
+    /// cannot allocate — planning runs on the audio thread.
+    colo_keys: Vec<String>,
+    colo_loaded: Vec<bool>,
+    colo_cost: Vec<u64>,
+    /// A send gain crossed zero, so the feeder sets are wrong until the next
+    /// plan. Forces one, whatever the timer says.
+    plan_dirty: bool,
+    /// What each of a chain's automation lanes writes: a param inside the
+    /// chain, straight through `set_param`, or a field of movy's own mixer.
+    /// Bound by the UI (`ch<N>:lane`); a lane bound to nothing writes nothing.
+    auto_lanes: Vec<[LaneTarget; AUTO_LANES]>,
+    /// The FX instance behind each bus. One audio FX per send, so the chain
+    /// host's component underneath is always `fx1`.
+    send_slots: Vec<Option<ChainInstance>>,
+    /// Whether a bus actually holds a module.
+    ///
+    /// NOT `send_slots[n].is_some()`: clearing a send sets `fx1:module` to the
+    /// empty string and leaves the instance in place, so the slot stays `Some`
+    /// for a bus with nothing in it. The alternative read-back, `send_module`,
+    /// asks the chain host across FFI and needs `&mut self` — neither of which
+    /// belongs in a status line built 24 times a second.
+    send_loaded: Vec<bool>,
+    /// Per-pad sends: which chains drain, their drained blocks, and which of
+    /// them currently feed SEND 1 / SEND 2. See `voice_send`.
+    voice: VoiceSends,
+    /// The master chain movy owns (`master_chain`). Its own field for the
+    /// reason `sends` is one: `slots` is exactly the tracks.
+    master: MasterChain,
+    /// Frozen / capturing / thawing tracks (freeze_bank.rs).
+    freeze: FreezeBank,
+    /// The last freeze event, for the UI: (sequence, track, code).
+    freeze_last: (u32, usize, &'static str),
+    /// The last load the module refused (`chain_load_check`).
+    load_errors: LoadErrors,
+    /// A freeze or thaw the Set's files have not heard about yet, and the
+    /// tracks whose loops still have to be written (`take_freeze_files`), as
+    /// a bit mask: two tracks may finish their freeze in the same block.
+    freeze_dirty: bool,
+    freeze_new_wav: u32,
+    /// The fingerprint of the clip each loop was recorded from (seq-core
+    /// `clip_fingerprint`), and of the chain's settings, for the manifest.
+    freeze_prints: [[Option<u64>; CLIPS_PER_TRACK]; MOVY_CHAINS],
+    freeze_chain_prints: [u64; MOVY_CHAINS],
+    /// An open's loads for the tracks its manifest names frozen, held until
+    /// the loops are read (`freeze_hold`).
+    freeze_held: Vec<LoadRequest>,
+    /// Per track, this block's freeze event for lib.rs (`take_freeze_event`).
+    freeze_events: [Option<Outcome>; MOVY_CHAINS],
+    /// Where a frozen track's chain instance is destroyed: off the audio
+    /// thread (chain_reaper.rs). Started by `configure`.
+    reaper: crate::chain_reaper::Reaper,
+}
+
+impl ChainSlots {
+    pub fn new() -> Self {
+        let mut slots = Vec::with_capacity(MOVY_CHAINS);
+        for _ in 0..MOVY_CHAINS {
+            slots.push(None);
+        }
+        Self {
+            host: None,
+            #[cfg(test)]
+            render_without_host: false,
+            slots,
+            mixes: vec![TrackMix::default(); MOVY_CHAINS],
+            queue: LoadQueue::new(),
+            desired: vec![Vec::new(); DOC_SLOTS],
+            scratch: vec![vec![0i16; SCRATCH_SAMPLES]; MOVY_CHAINS],
+            pin: PinPolicy::new(RENDER_SLOTS),
+            host_failed: false,
+            module_dir: String::new(),
+            audible: vec![false; MOVY_CHAINS],
+            peaks: vec![0; MOVY_CHAINS],
+            meter: TrackMeter::new(),
+            generation: 0,
+            active_last_block: 0,
+            cost: CostMeter::new(MOVY_CHAINS),
+            prof: BlockProf::default(),
+            pool: None,
+            link: crate::link_bridge::LinkBridge::inert(),
+            planner: Planner::new(MOVY_CHAINS, LANES),
+            lanes: (0..LANES).map(|_| Vec::with_capacity(MOVY_CHAINS)).collect(),
+            blocks_since_plan: 0,
+            plan_generation: u32::MAX,
+            loaded: vec![false; MOVY_CHAINS],
+            digest: ChainDigest::new(MOVY_CHAINS),
+            idle: IdleGate::new(MOVY_CHAINS),
+            work: vec![Work::NONE; MOVY_CHAINS],
+            synth_peak: vec![0; MOVY_CHAINS],
+            plan_idle_epoch: u32::MAX,
+            sends: SendBuses::new(),
+            send_fanned: false,
+            send_work: vec![false; SEND_BUSES],
+            colo_bus: [false; SEND_BUSES],
+            colo_feeders: [0; SEND_BUSES],
+            colo_ran: [false; SEND_BUSES],
+            /* 128 bytes each, never grown after this: a pin key is
+             * `<namespace>/<module>` and the longest namespace is
+             * `sound_generators`, so a module name would have to run past 110
+             * characters to force a reallocation on the audio thread. */
+            colo_keys: (0..RENDER_SLOTS).map(|_| String::with_capacity(128)).collect(),
+            colo_loaded: vec![false; RENDER_SLOTS],
+            colo_cost: vec![0; RENDER_SLOTS],
+            plan_dirty: false,
+            send_planner: Planner::new(SEND_BUSES, LANES),
+            send_lanes: (0..LANES).map(|_| Vec::with_capacity(SEND_BUSES)).collect(),
+            auto_lanes: (0..MOVY_CHAINS).map(|_| core::array::from_fn(|_| LaneTarget::None)).collect(),
+            send_slots: (0..SEND_BUSES).map(|_| None).collect(),
+            send_loaded: vec![false; SEND_BUSES],
+            voice: VoiceSends::new(MOVY_CHAINS),
+            master: MasterChain::new(),
+            freeze: FreezeBank::new(MOVY_CHAINS),
+            freeze_last: (0, 0, "-"),
+            load_errors: LoadErrors::new(),
+            freeze_dirty: false,
+            freeze_new_wav: 0,
+            freeze_prints: [[None; CLIPS_PER_TRACK]; MOVY_CHAINS],
+            freeze_chain_prints: [0; MOVY_CHAINS],
+            freeze_held: Vec::new(),
+            freeze_events: [None; MOVY_CHAINS],
+            reaper: crate::chain_reaper::Reaper::new(),
+        }
+    }
+
+    /// Modules proven to race, whose instances all go back on one lane. Forces
+    /// a replan, because the keys it rewrites are only read when the plan is
+    /// rebuilt — without it the list changes while the assignment it governs
+    /// stays exactly as it was for up to `REPLAN_BLOCKS`.
+    pub fn set_blacklist(&mut self, csv: &str) {
+        self.pin.set_blacklist(csv);
+        self.plan_generation = u32::MAX;
+    }
+
+    /// `lanes=<n> blocked=<n> pinned=<n> yielded=<blocks> plan=<lane0>|<lane1>|...`
+    pub fn render_report(&self) -> String {
+        let plan = self
+            .planner
+            .lanes
+            .iter()
+            .map(|l| l.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(","))
+            .collect::<Vec<_>>()
+            .join("|");
+        // `blocked` and `pinned` are reported because the harness cannot infer
+        // either: a set with no duplicated module plans identically whatever
+        // the blacklist holds, so a blacklist that took looks exactly like one
+        // that did not. `pinned` is the count that separates "the module was
+        // listed" from "the listing had nothing to do".
+        format!(
+            "lanes={} blocked={} pinned={} yielded={} plan={}",
+            self.lanes.len(),
+            self.pin.blacklist_len(),
+            self.pin.pinned(),
+            self.pool.as_ref().map_or(0, |p| p.joins_yielded_blocks()),
+            plan
+        )
+    }
+
+    /// Point the slots at schwung's chain module directory and movy's private
+    /// copy of its `dsp.so`. Called once, from a param set — never from render.
+    pub fn configure(&mut self, module_dir: &str, so_path: &str) {
+        self.module_dir = module_dir.to_string();
+        if self.host.is_some() || self.host_failed {
+            return;
+        }
+        match ChainHost::load(so_path) {
+            Ok(h) => {
+                self.host = Some(h);
+                /* The one place the helpers are spawned (and `chlanes`, a
+                 * diagnostic): `configure` is a param set, called once and never
+                 * from a render. movy-host services params between blocks on its
+                 * audio thread, so this costs one slow frame at the open, under
+                 * the output's fade-in; until it has run, `parallel_ready` keeps
+                 * the render serial. */
+                self.pool = Some(RenderPool::new(self.lanes.len() - 1, RENDER_SLOTS));
+                self.reaper.start();
+                self.freeze.start();
+            }
+            Err(e) => {
+                // Degrade, never panic: movy must keep sequencing its four host
+                // tracks when chain hosting is unavailable.
+                host::log(&format!("chain hosting unavailable: {}", e));
+                self.host_failed = true;
+            }
+        }
+    }
+
+    /// `chlanes`, a diagnostic: change the lane count in a running engine, so
+    /// one movy-host session can A/B it on the same Set (WP11's sweep). The
+    /// frame that applies it joins and spawns the helpers, so it is a slow
+    /// frame; nothing in normal use sends it.
+    pub fn set_lane_count(&mut self, n: usize) {
+        let n = n.clamp(1, MAX_LANES);
+        if n == self.lanes.len() {
+            return;
+        }
+        self.planner = Planner::new(MOVY_CHAINS, n);
+        self.lanes = (0..n).map(|_| Vec::with_capacity(MOVY_CHAINS)).collect();
+        self.send_planner = Planner::new(SEND_BUSES, n);
+        self.send_lanes = (0..n).map(|_| Vec::with_capacity(SEND_BUSES)).collect();
+        if self.pool.take().is_some() {
+            self.pool = Some(RenderPool::new(n - 1, RENDER_SLOTS));
+        }
+        // An empty plan would leave every chain unrendered until the next
+        // scheduled replan, ~3 s away.
+        self.plan_dirty = true;
+    }
+
+    pub fn is_available(&self) -> bool {
+        self.host.is_some()
+    }
+
+    /// Queue a module load. Never loads inline — see `load_queue` for why.
+    ///
+    /// Accepts a send bus's slot too: a send is part of the set (see `desired`),
+    /// so applying a document has to be able to queue one, and `service_loads`
+    /// sends anything above `MOVY_CHAINS` down the send path.
+    pub fn request_load(&mut self, slot: usize, component: &str, module: &str) {
+        if slot >= DOC_SLOTS {
+            return;
+        }
+        /* The master holds four audio FX and nothing else — a synth there would
+         * never render, and a fifth position is one no page shows. */
+        if slot == master_index() && fx_position(component).is_none() {
+            return;
+        }
+        /* The one place the set is updated, for the same reason `generation`
+         * lives on this path: a module can arrive from a browser load, an undo,
+         * or a remote param write the UI never saw, and all of them have to be
+         * in the set the next save writes down. */
+        let at = self.desired[slot].iter().position(|(c, _)| c == component);
+        match (at, module.is_empty()) {
+            // The empty string is schwung's teardown value: not a module.
+            (Some(i), true) => { self.desired[slot].remove(i); }
+            (Some(i), false) => self.desired[slot][i].1 = module.to_string(),
+            (None, false) => self.desired[slot]
+                .push((component.to_string(), module.to_string())),
+            (None, true) => {}
+        }
+        self.queue.push(LoadRequest {
+            slot,
+            component: component.to_string(),
+            module: module.to_string(),
+            state: None,
+        });
+    }
+
+    /// Queue a module load into send bus `n`.
+    ///
+    /// Rides the shared `LoadQueue` under a slot number above every chain, so
+    /// the one-load-per-audio-callback bound covers a send exactly as it covers
+    /// a track — a set that opens with two sends and twelve chains must not
+    /// stack fourteen blocking `dlopen`s into one callback.
+    pub fn request_send_load(&mut self, bus: usize, module: &str) {
+        if bus >= SEND_BUSES {
+            return;
+        }
+        /* Through the chain path rather than straight onto the queue, so the
+         * bus lands in `desired` with everything else: it is the document a
+         * save reads, and a send missing from it is a send that never comes
+         * back. */
+        self.request_load(send_index(bus), SEND_COMPONENT, module);
+    }
+
+    /// Apply a module-preset blob to a send. Rides a pending load when there is
+    /// one, for the same reason `set_state` does: the blob cannot be written
+    /// before its module exists.
+    pub fn set_send_state(&mut self, bus: usize, state: &str) {
+        if bus >= SEND_BUSES {
+            return;
+        }
+        if self.queue.attach_state(send_index(bus), SEND_COMPONENT, state) {
+            return;
+        }
+        if let Some(inst) = self.send_slots[bus].as_mut() {
+            inst.set_param(&format!("{SEND_COMPONENT}:state"), state);
+        }
+    }
+
+    /* A bus holds ONE audio FX, so every key it is given belongs to the chain
+     * host's `fx1` component. Translating here rather than at the caller is what
+     * lets the UI address a bus and nothing else: the send's param page is an
+     * ordinary module page whose component key happens to be `snd0`. */
+    pub fn send_param(&mut self, bus: usize, key: &str, val: &str) {
+        if bus >= SEND_BUSES {
+            return;
+        }
+        if let Some(inst) = self.send_slots[bus].as_mut() {
+            inst.set_param(&format!("{SEND_COMPONENT}:{key}"), val);
+        }
+    }
+
+    pub fn send_get_param(&mut self, bus: usize, key: &str) -> Option<String> {
+        let k = format!("{SEND_COMPONENT}:{key}");
+        self.send_slots.get_mut(bus)?.as_mut()?.get_param(&k)
+    }
+
+    /// The module a bus has loaded.
+    ///
+    /// Its own accessor because the chain host publishes a loaded module under
+    /// an UNDERSCORE alias (`fx1_module`), not the colon key it was set with.
+    /// Reading back the key we wrote answers "absent", and the UI then draws a
+    /// loaded send as "click jog to add".
+    pub fn send_module(&mut self, bus: usize) -> Option<String> {
+        let k = format!("{SEND_COMPONENT}_module");
+        self.send_slots.get_mut(bus)?.as_mut()?.get_param(&k)
+    }
+
+    /// Whether any bus is holding audio a track fed it. The zero-cost claim
+    /// (design §5) is about this staying false when nothing sends.
+    pub fn sends_dirty(&self) -> bool {
+        self.sends.any_dirty()
+    }
+
+    /// What each send bus's FX pass costs per block, and a fresh window after.
+    pub fn send_cost_report(&mut self) -> String {
+        let r = self.sends.cost_report();
+        self.sends.cost_reset();
+        r
+    }
+
+    /// What each send bus was fed and what came out of it, plus the module in
+    /// it. The only read-back a device test has — see `SendBuses::report`.
+    pub fn send_report(&mut self) -> String {
+        let mut out = String::new();
+        for bus in 0..SEND_BUSES {
+            let module = self.send_module(bus).unwrap_or_default();
+            out.push_str(&format!(" {}:mod={}", bus, if module.is_empty() { "-" } else { &module }));
+        }
+        /* `par` is the arm, `plan` is the partition it ran. Both, because a
+         * fanned-out phase whose buses all landed on lane 0 is a serial phase
+         * wearing the flag, and a measurement that read only `par` would call
+         * it parallel. */
+        let plan: Vec<String> = self
+            .send_planner
+            .lanes
+            .iter()
+            .map(|l| l.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(","))
+            .collect();
+        /* `colo` is the third arm, and it has to be reported for the same
+         * reason `par` does: a bus riding a chain lane sounds exactly like one
+         * in the send phase and reports the same cost. Without this, a run whose
+         * co-location was silently refused — an unmeasured bus, a pinned feeder,
+         * a group that would not fit — prints as a measurement of a path it
+         * never took. `ran` is the per-block half: `colo` is what the planner
+         * accepted, `ran` is what actually rendered on a lane this block. */
+        let mut ran = 0u16;
+        for n in 0..SEND_BUSES {
+            if self.colo_ran[n] {
+                ran |= 1 << n;
+            }
+        }
+        format!(
+            "{}{} par={} plan={} colo={:x} ran={:x} vsnd={:x}/{:x},{:x}",
+            self.sends.report(),
+            out,
+            u8::from(self.send_fanned),
+            plan.join("|"),
+            self.colocated_mask(),
+            ran,
+            /* Per-pad sends: chains whose module declares them / chains whose
+             * pads are feeding SEND 1, SEND 2. Separates "the module was never
+             * recognised" from "recognised, but nothing was drained". */
+            self.voice.declares_mask(),
+            self.voice.feeds(0),
+            self.voice.feeds(1)
+        )
+    }
+
+    /// The chain set, as the document `set_chain_set` accepts.
+    pub fn chain_set(&self) -> String {
+        let mut entries = Vec::new();
+        for (slot, comps) in self.desired.iter().enumerate() {
+            for (component, module) in comps {
+                entries.push(chain_doc::Entry {
+                    slot,
+                    component: component.clone(),
+                    module: module.clone(),
+                });
+            }
+        }
+        if self.master.imported() {
+            entries.push(chain_doc::Entry {
+                slot: master_index(),
+                component: IMPORT_MARK.to_string(),
+                module: "1".to_string(),
+            });
+        }
+        chain_doc::encode(&entries)
+    }
+
+    /// Apply a whole chain set at once: unload what it does not name, queue what
+    /// it does. `false` when the document is malformed, in which case NOTHING
+    /// changes — a torn write decoding as "no chains" would unload the set.
+    ///
+    /// A component both sets want at the same module is left alone rather than
+    /// cleared and reloaded: a teardown dlcloses and dlopens to arrive back
+    /// where we started, and schwung's own note on that (`shadow_slot_clear_all_modules`)
+    /// is that it has caused audio dropouts.
+    pub fn set_chain_set(&mut self, doc: &str) -> bool {
+        let Some(wanted) = chain_doc::decode(doc) else {
+            return false;
+        };
+        /* A whole-set replace: nothing frozen carries into another Set. A
+         * frozen track's chain was retired, but `desired` still names it: left
+         * there, the diff below would find a Set with the same synth on that
+         * track "already loaded", queue nothing, and leave it silent. */
+        for t in 0..MOVY_CHAINS {
+            if self.freeze.silences_chain(t) {
+                self.queue.remove_slot(t);
+                self.retire_chain(t);
+                self.desired[t].clear();
+            }
+        }
+        for t in self.freeze.clear_all() {
+            self.note_freeze(t, Outcome::Cancelled(Cancel::SetChanged));
+        }
+        /* A bus is loaded into ONE component and the engine hard-codes which
+         * (`SEND_COMPONENT`), so a document naming anything else at a bus slot
+         * is malformed. Loading it would put a module where no reader looks —
+         * the UI's `sendsFromDoc` and this file's own `restore` both key a bus
+         * on that component — and the send would disappear again on the next
+         * save. Dropped here so both halves agree on what a bus entry IS. */
+        /* The master's import mark rides the document so both save paths
+         * carry it, and is taken out here: it is a fact about the Set, not a
+         * component to load. Absent means never imported — a whole-set
+         * replace, like everything else here. */
+        let mi = master_index();
+        self.master.set_imported(
+            wanted.iter().any(|w| w.slot == mi && w.component == IMPORT_MARK),
+        );
+        /* Writes held for the previous Set's master would land on this one's.
+         * The mark and any non-FX master component are refused by
+         * `request_load` below, so neither is ever loaded. */
+        self.master.drop_held();
+        let wanted: Vec<_> = wanted
+            .into_iter()
+            .filter(|w| bus_of_slot(w.slot).is_none() || w.component == SEND_COMPONENT)
+            .collect();
+        /* A set document is a whole-set replace, and the mix belongs to the set
+         * that named the chain. Left alone, the level you set in one Set went on
+         * applying to whatever the next Set loaded into that chain. The restore
+         * writes the saved mixes immediately after this, so the only slots that
+         * stay at default are the ones the new set says nothing about. */
+        for m in self.mixes.iter_mut() {
+            *m = TrackMix::default();
+        }
+        /* And the lane bindings. A lane left bound from the previous Set would
+         * go on writing a key the new Set's module may also have — the same
+         * name on a different param. The new Set's lanes are re-bound by the
+         * UI's label sync, which follows the applied Set. */
+        for l in self.auto_lanes.iter_mut() {
+            l.iter_mut().for_each(|t| *t = LaneTarget::None);
+        }
+        let mut gone: Vec<(usize, String)> = Vec::new();
+        for (slot, comps) in self.desired.iter().enumerate() {
+            for (component, _) in comps {
+                if !wanted.iter().any(|w| w.slot == slot && &w.component == component) {
+                    gone.push((slot, component.clone()));
+                }
+            }
+        }
+        for (slot, component) in gone {
+            self.request_load(slot, &component, "");
+        }
+        for w in &wanted {
+            let loaded = self
+                .desired
+                .get(w.slot)
+                .and_then(|c| c.iter().find(|(c, _)| c == &w.component))
+                .map(|(_, m)| m.as_str());
+            if loaded == Some(w.module.as_str()) {
+                continue;
+            }
+            self.request_load(w.slot, &w.component, &w.module);
+        }
+        true
+    }
+
+    /// What each chain actually HOLDS — `<slot>:<component>=<module>` per
+    /// entry, with a trailing `?` on one that is still only a request.
+    ///
+    /// This is the only read-back a device test has for a movy-hosted chain.
+    /// The remote-UI socket can WRITE an engine param but has no get verb, and
+    /// the per-load line in `service_load` is not a substitute: a set that
+    /// already holds the right module is deliberately left alone
+    /// (`set_chain_set`), so it logs nothing at all and a second run against
+    /// the same fixture would read as a failed load.
+    ///
+    /// The value comes off the live instance rather than out of `desired`,
+    /// which is what makes it evidence — `desired` is what was asked for, and
+    /// echoing the request back would confirm nothing. Diagnostic only: it
+    /// allocates and queries every instance, so it belongs on the param write a
+    /// test pokes and never on the render path.
+    pub fn loaded_report(&mut self) -> String {
+        let wanted: Vec<(usize, String, String)> = self
+            .desired
+            .iter()
+            .enumerate()
+            .flat_map(|(s, cs)| cs.iter().map(move |(c, m)| (s, c.clone(), m.clone())))
+            .collect();
+        let mut out = String::new();
+        for (slot, component, module) in wanted {
+            if !out.is_empty() {
+                out.push(' ');
+            }
+            /* The underscore alias, which is the readable form for a track
+             * component — the colon key is write-only (see module-slot.mjs). A
+             * bus is read off the send's own instances: `slots` holds nothing
+             * above `MOVY_CHAINS`, so asking it would mark every loaded send
+             * with the `?` that means "asked for, never instantiated". */
+            let live = if slot == master_index() {
+                self.master_get(&format!("{component}:module"))
+            } else if slot >= MOVY_CHAINS {
+                self.send_module(slot - MOVY_CHAINS)
+            } else {
+                self.get_param(slot, &format!("{component}_module"))
+            };
+            match live.filter(|v| !v.is_empty()) {
+                Some(live) => out.push_str(&format!("{slot}:{component}={live}")),
+                None => out.push_str(&format!("{slot}:{component}={module}?")),
+            }
+        }
+        if out.is_empty() {
+            out.push('-');
+        }
+        out
+    }
+
+    /// One chain's output peak of the last block (0 for a chain out of range).
+    pub fn peak(&self, i: usize) -> i32 {
+        self.peaks.get(i).copied().unwrap_or(0)
+    }
+
+    /// The mixer page's meters and faders as a `status` field (`track_meter.rs`).
+    pub fn meter_status(&self) -> String {
+        self.meter.status(&self.mixes)
+    }
+
+    /// Per-chain output peak of the last block, comma separated.
+    pub fn peaks_csv(&self) -> String {
+        let mut out = String::with_capacity(MOVY_CHAINS * 6);
+        for (i, p) in self.peaks.iter().enumerate() {
+            if i > 0 { out.push(','); }
+            out.push_str(&p.to_string());
+        }
+        out
+    }
+
+    /// One chain's LFO assignments, and the LIVE value of each driven param.
+    ///
+    /// The value is the point. Target fields prove only that a write landed;
+    /// sampling the driven param twice is the one external way to see that the
+    /// LFO is actually moving the sound — which is what "the mapping does
+    /// nothing" was really about. Diagnostic only, never on the render path.
+    pub fn lfo_report(&mut self, slot: usize) -> String {
+        let mut out = String::new();
+        for i in 1..=2 {
+            let g = |s: &mut Self, k: &str| s.get_param(slot, k).unwrap_or_default();
+            let target = g(self, &format!("lfo{i}:target"));
+            let param = g(self, &format!("lfo{i}:target_param"));
+            let active = g(self, &format!("lfo{i}:active"));
+            let value = if target.is_empty() || param.is_empty() {
+                "-".to_string()
+            } else {
+                // The plain "<target>:<param>" key is intercepted by the chain
+                // host to answer with the BASE value on purpose (schwung's
+                // chain_mod_get_base_for_plain_key, guarding #276: a mod-unaware
+                // reader must not see the value the overlay keeps writing into
+                // the plugin). That made every LFO diagnostic read back frozen
+                // at its base forever, modulation live or not. ":effective" is
+                // the key that asks for the driven value instead
+                // (chain_mod_get_effective_for_subkey).
+                g(self, &format!("{target}:{param}:effective"))
+            };
+            if i > 1 { out.push(' '); }
+            out.push_str(&format!("lfo{i}=[{target}:{param} active={active} value={value}]"));
+        }
+        out
+    }
+
+    /// Monotonic count of serviced chain-module changes.
+    pub fn generation(&self) -> u32 {
+        self.generation
+    }
+
+    /// Chains whose synth is asleep. Read by `diag` and `status`.
+    pub fn asleep_count(&self) -> usize {
+        self.idle.asleep_count()
+    }
+
+    /// The gate's state, for `chidlelog`.
+    ///
+    /// The socket a device script drives can WRITE an engine param but has no
+    /// read verb, so `diag` and `status` — where these numbers also live — are
+    /// unreachable from a benchmark. Same write-to-read trick as `chcostlog`.
+    pub fn idle_report(&self) -> String {
+        let mut deep = 0;
+        for i in 0..MOVY_CHAINS {
+            if self.idle.deep_asleep(i) {
+                deep += 1;
+            }
+        }
+        // The counts alone cannot answer "is THIS chain asleep?", which is the
+        // question any check aimed at one chain has to ask — a global count of
+        // ten lets a test pass while the chain it is watching stays awake.
+        let mut sleeping = String::new();
+        for i in 0..MOVY_CHAINS {
+            if self.idle.deep_asleep(i) {
+                if !sleeping.is_empty() {
+                    sleeping.push(',');
+                }
+                sleeping.push_str(&i.to_string());
+            }
+        }
+        format!(
+            "asleep={} deep={} loaded={} sleeping=[{}]",
+            self.idle.asleep_count(),
+            deep,
+            self.slots.iter().filter(|s| s.is_some()).count(),
+            sleeping
+        )
+    }
+
+    /// Held loads count: the UI delivers the chains' saved state once this
+    /// drains, and a held load still takes its state (`set_state`).
+    pub fn pending_loads(&self) -> usize {
+        self.queue.len() + self.freeze_held.len()
+    }
+
+    /// Release at most ONE queued load. Call once per audio callback: this is
+    /// where the blocking dlopen actually happens, and the one-per-callback rule
+    /// is what stops a twelve-chain restore stacking into a single block.
+    pub fn service_loads(&mut self) {
+        let Some(req) = self.queue.take_one() else { return };
+        if req.slot == master_index() {
+            self.service_master_load(req);
+            return;
+        }
+        /* Ahead of everything: `slots` holds MOVY_CHAINS entries, so a send's
+         * synthetic slot number would index past the end of it. */
+        if req.slot >= MOVY_CHAINS {
+            self.service_send_load(req);
+            return;
+        }
+        let Some(hostref) = self.host.as_ref() else { return };
+
+        if self.slots[req.slot].is_none() {
+            // First load into this slot materialises the chain. An empty slot
+            // never gets here, which is what keeps empty chains free.
+            match hostref.create_instance(&self.module_dir) {
+                Some(inst) => self.slots[req.slot] = Some(inst),
+                None => {
+                    self.load_errors.record(req.slot, &req.component, &req.module);
+                    return;
+                }
+            }
+        }
+        self.pin.on_load(req.slot, &req.component, &req.module);
+        let t_set = std::time::Instant::now();
+        if let Some(inst) = self.slots[req.slot].as_mut() {
+            inst.set_param(&format!("{}:module", req.component), &req.module);
+            /* Immediately after the module exists, and before anything else can
+             * run — a restore's state would otherwise land on an empty slot. */
+            if let Some(state) = req.state.as_deref() {
+                inst.set_param(&format!("{}:state", req.component), state);
+            }
+        }
+        self.check_load(req.slot, &req.component, &req.module);
+        if let Some(inst) = self.slots[req.slot].as_mut() {
+            inst.refresh_ears(&self.module_dir);
+        }
+        /* Load events are rare (never the hot path) and this is the only
+         * externally observable evidence that a chain load happened: schwung's
+         * remote-UI socket can WRITE an engine param but has no read verb, so a
+         * device test has nothing else to assert on. */
+        self.generation = self.generation.wrapping_add(1);
+        self.idle.wake(req.slot);
+        /* A freshly created instance is in whatever FX mode the module defaults
+         * to. Claim it here, once, rather than per block. */
+        if let Some(inst) = self.slots[req.slot].as_mut() {
+            inst.set_external_fx_mode(inst.supports_split());
+        }
+        /* The load path IS the audio thread, so every millisecond here is a
+         * dropped frame — and this one is a blocking dlopen, which is the
+         * expensive half of opening a set. Logged rather than assumed, because
+         * a dropout nobody recorded is indistinguishable from a threading bug
+         * in whatever measurement follows it. */
+        let set_ms = t_set.elapsed().as_millis();
+        if set_ms >= 20 {
+            host::log(&format!("chain {}: load blocked {} ms", req.slot, set_ms));
+        }
+        host::log(&format!(
+            "chain {}: {} = {} ({} us)",
+            req.slot,
+            req.component,
+            if req.module.is_empty() { "(cleared)" } else { req.module.as_str() },
+            t_set.elapsed().as_micros()
+        ));
+    }
+
+    /// Load one send bus's FX. The chain-slot path's shape, minus everything a
+    /// bus does not have: no pin policy (a send is one instance, never a
+    /// duplicate group), no idle wake (the bus's own tail rule decides that),
+    /// and no synth.
+    fn service_send_load(&mut self, req: LoadRequest) {
+        let bus = req.slot - MOVY_CHAINS;
+        if bus >= SEND_BUSES {
+            return;
+        }
+        let Some(hostref) = self.host.as_ref() else { return };
+        if self.send_slots[bus].is_none() {
+            match hostref.create_instance(&self.module_dir) {
+                Some(inst) => self.send_slots[bus] = Some(inst),
+                None => return,
+            }
+        }
+        /* Registered for the same reason a chain's module is: two buses holding
+         * ONE module through one file share its whole `.data`, and the send
+         * phase now renders them on different lanes. Without this the
+         * blacklist — the containment for a module that turns out to race —
+         * reaches every chain in the set and neither of the two sends. */
+        self.pin.on_load(req.slot, &req.component, &req.module);
+        /* Whatever the outgoing FX was still ringing belongs to the outgoing
+         * FX. Without this its tail plays on through its replacement — and its
+         * cost goes on being drawn as the incoming module's, which is the same
+         * mistake one page further out. */
+        self.sends.discard(bus);
+        self.sends.ui_clear(bus);
+        self.send_loaded[bus] = !req.module.is_empty();
+        let t_set = std::time::Instant::now();
+        if let Some(inst) = self.send_slots[bus].as_mut() {
+            inst.set_param(&format!("{SEND_COMPONENT}:module"), &req.module);
+            if let Some(state) = req.state.as_deref() {
+                inst.set_param(&format!("{SEND_COMPONENT}:state"), state);
+            }
+            /* A send has no synth: `render_block` could only ever hand back
+             * silence, and the FX has to run over the bus's own buffer. */
+            inst.set_external_fx_mode(true);
+            let continuous = inst.fx_requires_continuous();
+            self.sends.set_continuous(bus, continuous);
+            inst.refresh_ears(&self.module_dir);
+        }
+        self.generation = self.generation.wrapping_add(1);
+        let set_ms = t_set.elapsed().as_millis();
+        if set_ms >= 20 {
+            host::log(&format!("send {}: load blocked {} ms", bus, set_ms));
+        }
+        host::log(&format!(
+            "send {}: {}",
+            bus,
+            if req.module.is_empty() { "(cleared)" } else { req.module.as_str() }
+        ));
+    }
+
+    /// Load one master FX position. The send path's shape: one instance, no
+    /// synth, external FX mode, no pin (nothing renders it on a lane).
+    fn service_master_load(&mut self, req: LoadRequest) {
+        let Some(pos) = fx_position(&req.component) else { return };
+        let Some(hostref) = self.host.as_ref() else { return };
+        if self.master.inst.is_none() {
+            match hostref.create_instance(&self.module_dir) {
+                Some(inst) => self.master.inst = Some(inst),
+                None => return,
+            }
+        }
+        let t_set = std::time::Instant::now();
+        if let Some(inst) = self.master.inst.as_mut() {
+            inst.set_param(&format!("{}:module", req.component), &req.module);
+            if let Some(state) = req.state.as_deref() {
+                inst.set_param(&format!("{}:state", req.component), state);
+            }
+            inst.set_external_fx_mode(true);
+            inst.refresh_ears(&self.module_dir);
+        }
+        self.master.note_loaded(pos, &req.module);
+        /* Params and LFO targets written while this load was queued were held
+         * (`master_param`): an LFO cannot bind to a position that is not
+         * loaded yet. Released once the LAST queued master load is in. */
+        if !self.queue.has_slot(master_index()) {
+            self.master.flush_held();
+        }
+        self.generation = self.generation.wrapping_add(1);
+        let set_ms = t_set.elapsed().as_millis();
+        if set_ms >= 20 {
+            host::log(&format!("master {}: load blocked {} ms", req.component, set_ms));
+        }
+        host::log(&format!(
+            "master {}: {}",
+            req.component,
+            if req.module.is_empty() { "(cleared)" } else { req.module.as_str() }
+        ));
+    }
+
+    /// `mfx:<rest>` writes (design §5.1). Module and state go through the
+    /// queue like a track's; everything else is forwarded, or held while the
+    /// instance or a queued master load does not exist yet.
+    pub fn master_param(&mut self, rest: &str, val: &str) {
+        match rest {
+            "vol" => return self.master.set_gain(val),
+            "imported" => return self.master.set_imported(val == "1"),
+            _ => {}
+        }
+        if !key_allowed(rest) {
+            return;
+        }
+        if let Some(comp) = rest.strip_suffix(":module") {
+            return self.request_load(master_index(), comp, val);
+        }
+        if let Some(comp) = rest.strip_suffix(":state") {
+            if fx_position(comp).is_none() {
+                return;
+            }
+            if self.queue.attach_state(master_index(), comp, val) {
+                return;
+            }
+            if let Some(inst) = self.master.inst.as_mut() {
+                inst.set_param(rest, val);
+            }
+            return;
+        }
+        if self.master.inst.is_none() || self.queue.has_slot(master_index()) {
+            return self.master.hold(rest, val);
+        }
+        if let Some(inst) = self.master.inst.as_mut() {
+            inst.set_param(rest, val);
+        }
+    }
+
+    /// `mfx:<rest>` reads. A module reads off the chain host's underscore
+    /// alias, as a send's does, because the colon key is write-only.
+    pub fn master_get(&mut self, rest: &str) -> Option<String> {
+        match rest {
+            "vol" => return Some(format!("{:.4}", self.master.gain())),
+            "imported" => return Some(u8::from(self.master.imported()).to_string()),
+            _ => {}
+        }
+        if !key_allowed(rest) {
+            return None;
+        }
+        let inst = self.master.inst.as_mut()?;
+        match rest.strip_suffix(":module") {
+            Some(comp) => inst.get_param(&format!("{comp}_module")),
+            None => inst.get_param(rest),
+        }
+    }
+
+    /// `mfxlog` — the master's only read-back for a device test.
+    pub fn master_report(&mut self) -> String {
+        let mods: Vec<String> = (1..=MASTER_FX)
+            .map(|n| self.master_get(&format!("fx{n}:module")).unwrap_or_default())
+            .collect();
+        self.master.report(&mods)
+    }
+
+    /// Apply a module-preset blob. Rides a pending load when there is one so it
+    /// cannot be written before its module exists; applied directly otherwise.
+    pub fn set_state(&mut self, slot: usize, component: &str, state: &str) {
+        if slot >= MOVY_CHAINS {
+            return;
+        }
+        self.idle.wake(slot);
+        if self.queue.attach_state(slot, component, state) {
+            return;
+        }
+        if let Some(r) = self.freeze_held.iter_mut().find(|r| r.slot == slot && r.component == component) {
+            r.state = Some(state.to_string());
+            return;
+        }
+        if let Some(inst) = self.slots[slot].as_mut() {
+            inst.set_param(&format!("{}:state", component), state);
+        }
+    }
+
+    /// Forward a param to a chain. Loading keys are NOT accepted here — they go
+    /// through `request_load` so they cannot bypass the queue.
+    pub fn set_param(&mut self, slot: usize, key: &str, val: &str) {
+        if slot >= MOVY_CHAINS {
+            return;
+        }
+        self.idle.wake(slot);
+        if let Some(inst) = self.slots[slot].as_mut() {
+            inst.set_param(key, val);
+        }
+    }
+
+    pub fn get_param(&mut self, slot: usize, key: &str) -> Option<String> {
+        /* A frozen chain is unloaded; what it WAS answers instead, so a save
+         * taken while it is frozen still writes its preset and LFOs. */
+        if let Some(v) = self.freeze.snapshot_get(slot, key) {
+            return Some(v);
+        }
+        /* Held for an open's frozen read: the state the load will carry, so a
+         * save in between still writes the preset. */
+        if let Some(comp) = key.strip_suffix(":state") {
+            if let Some(v) = self.freeze_held.iter().find(|r| r.slot == slot && r.component == comp)
+                .and_then(|r| r.state.clone()) {
+                return Some(v);
+            }
+        }
+        self.slots.get_mut(slot)?.as_mut()?.get_param(key)
+    }
+
+    /// Bind (or, with `LaneTarget::None`, release) one automation lane.
+    pub fn bind_lane(&mut self, slot: usize, lane: usize, target: LaneTarget) {
+        if let Some(l) = self.auto_lanes.get_mut(slot).and_then(|m| m.get_mut(lane)) {
+            *l = target;
+        }
+    }
+
+    // --- Freeze (freeze_bank.rs, plans/2026-11-08-freeze-all-clips-design.md) ---
+
+    /// Once per block, before `render`: every track's loop position, where
+    /// each freezing track's heard loop is, the mutes and the tempo; also
+    /// hands a thawed chain back once its loads are through.
+    pub fn freeze_frame(&mut self, pos: impl Fn(usize) -> Option<LoopPos>,
+                        heard_at: impl Fn(usize) -> Option<LoopAt>, muted: u32, bpm_x100: u32) {
+        self.freeze.set_frame(pos, heard_at, muted, bpm_x100);
+        self.reaper.flush();
+        self.service_thaw();
+    }
+
+    /// Start freezing track `t`: every clip of `clips`, `heard` first, whose
+    /// fingerprints are `prints` (see `FreezeBank::begin_track` for the
+    /// refusals).
+    pub fn freeze_begin(&mut self, t: usize, heard: Option<usize>, clips: &[ClipJob],
+                        prints: [Option<u64>; CLIPS_PER_TRACK]) -> Result<(), &'static str> {
+        if t >= MOVY_CHAINS || self.slots[t].is_none() || self.desired[t].is_empty() {
+            return Err("nochain");
+        }
+        self.freeze.begin_track(t, heard, clips)?;
+        self.freeze_prints[t] = prints;
+        self.freeze_events[t] = None;
+        Ok(())
+    }
+
+    /// Whether live input `m` may reach chain `t`. A freezing chain takes
+    /// nothing but note-offs — a pad or key played into it would be recorded
+    /// into a loop — and a frozen one has no chain to play.
+    pub fn freeze_admits(&self, t: usize, m: &[u8; 3]) -> bool {
+        m[0] & 0xF0 == 0x80 || self.freeze.windows(t).is_none()
+    }
+
+    /// The clip windows track `t` is locked to (freezing, frozen or
+    /// thawing): what the sequencer's freeze lock follows.
+    pub fn freeze_windows(&self, t: usize) -> Option<TrackWindows> {
+        self.freeze.windows(t)
+    }
+
+    /// What happened to track `t`'s freeze this block (a clip done, the
+    /// whole track, or a cancel), taken once: lib.rs moves the playhead.
+    pub fn take_freeze_event(&mut self, t: usize) -> Option<Outcome> {
+        self.freeze_events.get_mut(t)?.take()
+    }
+
+    /// A freezing or frozen clip's waveform (see `FreezeBank::wave`).
+    pub fn freeze_wave(&self, t: usize, slot: usize) -> Option<[u8; crate::freeze::LIVE_COLS]> {
+        self.freeze.wave(t, slot)
+    }
+
+    /// The first freezing track's progress, for lib.rs's `frzp` pacing.
+    /// The capturing track, clips done, and where in its loop it writes (‰).
+    pub fn freeze_progress(&self) -> Option<(usize, u8, u16)> {
+        (0..MOVY_CHAINS).find_map(|t| self.freeze.progress(t).map(|(d, _, _, _, at)| (t, d, at)))
+    }
+
+    /// Drop track `t`'s freeze. `true` if one was running.
+    pub fn freeze_cancel(&mut self, t: usize) -> bool {
+        let was = self.freeze.cancel(t);
+        if was {
+            self.note_freeze(t, Outcome::Cancelled(Cancel::Asked));
+        }
+        was
+    }
+
+    pub fn freeze_capturing(&self, t: usize) -> bool {
+        self.freeze.capturing(t)
+    }
+
+    /// A refused freeze, so the UI can say why.
+    pub fn freeze_refused(&mut self, t: usize, code: &'static str) {
+        self.freeze_last = (self.freeze_last.0.wrapping_add(1), t, code);
+    }
+
+    /// Unfreeze: reload the chain's modules with the presets it froze with.
+    /// The loops keep playing until every load for the track is through.
+    pub fn freeze_thaw(&mut self, t: usize) -> bool {
+        if t >= MOVY_CHAINS || !self.freeze.thaw(t) {
+            return false;
+        }
+        for (component, module) in self.desired[t].clone() {
+            let key = format!("{component}:state");
+            let state = self.freeze.snapshot(t).iter().find(|(k, _)| *k == key).map(|(_, v)| v.clone());
+            self.queue.push(LoadRequest { slot: t, component, module, state });
+        }
+        true
+    }
+
+    /// A thawing track whose loads are all through gets its chain back: the
+    /// LFOs (plain params, applied now that their targets exist), a wake, and
+    /// the next block renders the chain instead of the loops.
+    fn service_thaw(&mut self) {
+        for t in 0..MOVY_CHAINS {
+            if !self.freeze.thawing(t) || self.queue.has_slot(t) {
+                continue;
+            }
+            let lfos: Vec<(String, String)> = self.freeze.snapshot(t).iter()
+                .filter(|(k, v)| k.starts_with("lfo") && !v.is_empty())
+                .cloned()
+                .collect();
+            if let Some(inst) = self.slots[t].as_mut() {
+                for (k, v) in &lfos {
+                    inst.set_param(k, v);
+                }
+            }
+            self.freeze.thawed(t);
+            self.freeze_dirty = true;
+            self.idle.wake(t);
+            self.plan_dirty = true;
+            self.freeze_last = (self.freeze_last.0.wrapping_add(1), t, "thawed");
+        }
+    }
+
+    /// After render, before the mix: feed every freezing track. A chain the
+    /// idle gate skipped was silent and its scratch is stale, so silence is
+    /// recorded for it instead.
+    fn freeze_tap(&mut self, frames: usize) {
+        for t in 0..MOVY_CHAINS {
+            if !self.freeze.capturing(t) {
+                continue;
+            }
+            let rendered = self.slots[t].is_some() && !self.work[t].none();
+            let block = if rendered { Some(&self.scratch[t][..frames]) } else { None };
+            match self.freeze.tap(t, block, frames / 2) {
+                Some(Outcome::Captured) => self.freeze_finish(t),
+                Some(o @ Outcome::ClipDone { .. }) => self.freeze_events[t] = Some(o),
+                Some(o) => self.note_freeze(t, o),
+                None => {}
+            }
+        }
+    }
+
+    /// Every clip is in. Snapshot what a save and a thaw need from the live
+    /// chain, then unload its modules — WITHOUT touching `desired`: the Set
+    /// still names the chain, and the next save writes it from the snapshot.
+    fn freeze_finish(&mut self, t: usize) {
+        let comps: Vec<String> = self.desired[t].iter().map(|(c, _)| c.clone()).collect();
+        let t_snap = std::time::Instant::now();
+        let mut snap = Vec::new();
+        if let Some(inst) = self.slots[t].as_mut() {
+            for c in &comps {
+                let k = format!("{c}:state");
+                if let Some(v) = inst.get_param(&k) {
+                    snap.push((k, v));
+                }
+            }
+            for i in 1..=2 {
+                for k in crate::chain_state::LFO_KEYS {
+                    let key = format!("lfo{i}:{k}");
+                    if let Some(v) = inst.get_param(&key) {
+                        snap.push((key, v));
+                    }
+                }
+            }
+        }
+        host::log(&format!("freeze: track {} snapshot {} us", t + 1, t_snap.elapsed().as_micros()));
+        self.freeze.set_snapshot(t, snap);
+        self.retire_chain(t);
+        self.freeze_dirty = true;
+        self.freeze_new_wav |= 1 << t;
+        self.note_freeze(t, Outcome::Captured);
+    }
+
+    /// The chain's `component=module` list, comma-joined: what the manifest
+    /// records and an open checks against (freeze_files.rs).
+    fn freeze_modules(&self, t: usize) -> String {
+        self.desired[t].iter().map(|(c, m)| format!("{c}={m}")).collect::<Vec<_>>().join(",")
+    }
+
+    /// Every Frozen track as a manifest (a thawing one is no longer saved as
+    /// frozen: an open would find its chain the way the user left it).
+    pub fn freeze_manifest(&self) -> String {
+        let entries: Vec<FreezeEntry> = (0..MOVY_CHAINS).filter_map(|t| {
+            let loops = self.freeze.frozen_loops(t);
+            let (_, m0, _, _) = loops.first()?;
+            let clips = loops.iter().map(|(slot, m, _, win)| ClipEntry {
+                slot: *slot, len_ticks: m.len_ticks(), frames: m.frames(), win: *win,
+                print: self.freeze_prints[t][*slot].unwrap_or(0),
+            }).collect();
+            Some(FreezeEntry { track: t, bpm_x100: m0.bpm_x100(), rate: m0.sample_rate(),
+                               chain_print: self.freeze_chain_prints[t], modules: self.freeze_modules(t), clips })
+        }).collect();
+        crate::freeze_files::encode_manifest(&entries)
+    }
+
+    /// Once per freeze or thaw: the manifest the Set's files must now hold,
+    /// and the loops to write when a track has just frozen — for the saver's
+    /// `Freeze` job. The samples are the players' own, shared, not copied.
+    pub fn take_freeze_files(&mut self) -> Option<(String, Vec<Wav>)> {
+        if !std::mem::take(&mut self.freeze_dirty) {
+            return None;
+        }
+        /* Each frozen chain's print over what the save writes and an open
+         * reads back (chain_state: an idle LFO is saved as ""), never over the
+         * raw snapshot: the two differ, and every frozen track would reopen
+         * live. Once per freeze or thaw, like a save's serialize. */
+        let doc = crate::chain_state::serialize(self);
+        for t in 0..MOVY_CHAINS {
+            if self.freeze.frozen(t) {
+                self.freeze_chain_prints[t] =
+                    crate::freeze_files::chain_print(&crate::chain_state::slot_params(&doc, t));
+            }
+        }
+        let new = std::mem::take(&mut self.freeze_new_wav);
+        let wavs = (0..MOVY_CHAINS).filter(|t| new & (1 << t) != 0).flat_map(|t| {
+            self.freeze.frozen_loops(t).into_iter().map(move |(slot, m, s, _)| (t, slot, s, m.sample_rate()))
+        }).collect();
+        Some((self.freeze_manifest(), wavs))
+    }
+
+    /// An open's tracks named frozen by its manifest (`mask`) keep their
+    /// chains' loads aside until the loops are read (lib.rs `frozen_due`):
+    /// a frozen track's synth must not load only to be retired, and the loops
+    /// are read only once the previous Set's are freed. Replaces any earlier
+    /// hold: the open that made it queued everything again.
+    pub fn freeze_hold(&mut self, mask: u32) {
+        self.freeze_held.clear();
+        for t in (0..MOVY_CHAINS).filter(|t| mask & (1 << t) != 0) {
+            self.queue.take_slot(t, &mut self.freeze_held);
+        }
+    }
+
+    /// The loops are in, or are not coming: a track that came back frozen
+    /// drops its held loads, any other loads its chain as the open would have.
+    /// A load queued meanwhile for the same component is newer and wins.
+    pub fn freeze_unhold(&mut self) {
+        for r in std::mem::take(&mut self.freeze_held) {
+            if !self.freeze.silences_chain(r.slot) && !self.queue.has(r.slot, &r.component) {
+                self.queue.push(r);
+            }
+        }
+    }
+
+    /// Every loop let go of so far is freed (freeze_mem.rs `frees_done`).
+    pub fn freeze_frees_done(&self) -> bool {
+        self.freeze.frees_done()
+    }
+
+    /// Loops read for an open that will not play them, freed off the audio
+    /// thread like any other.
+    pub fn freeze_discard(&mut self, f: FrozenLoad) {
+        for c in f.clips {
+            self.freeze.discard(c.samples);
+        }
+    }
+
+    /// A Set opening with track `f.track` frozen: right after `restore`
+    /// queued its chain, take the loads back and play the saved loops instead
+    /// — but only when the chain still names exactly the modules it was
+    /// frozen from with the same settings (`chain_print` of the document's
+    /// pairs), and every clip now in the track (`clips`: fingerprint and
+    /// current window per slot) has its loop, recorded from that clip over a
+    /// window that contains its current one. Anything else opens live, with
+    /// its chain. The snapshot comes from the same chains document, so a
+    /// save writes the preset back as is.
+    pub fn freeze_install(&mut self, f: FrozenLoad, chains_doc: &str,
+                          clips: [Option<(u64, RecWindow)>; CLIPS_PER_TRACK]) -> bool {
+        let t = f.track;
+        let snap = crate::chain_state::slot_params(chains_doc, t);
+        let why = if t >= MOVY_CHAINS || self.desired[t].is_empty() || self.freeze_modules(t) != f.modules {
+            Some("its chain changed")
+        } else if crate::freeze_files::chain_print(&snap) != f.chain_print {
+            Some("its sound changed")
+        } else if !clips.iter().enumerate().all(|(slot, c)| match (c, f.clips.iter().find(|l| l.slot == slot)) {
+            (None, None) => true,
+            (Some((print, cur)), Some(l)) => *print == l.print && cur.start_ticks >= l.win.start_ticks
+                && cur.start_ticks + cur.len_ticks <= l.win.start_ticks + l.win.len_ticks,
+            _ => false,
+        }) {
+            Some("its clips changed")
+        } else {
+            None
+        };
+        if let Some(why) = why {
+            host::log(&format!("freeze: track {} opens live ({why})", t + 1));
+            self.freeze_discard(f);
+            return false;
+        }
+        let mut prints = [None; CLIPS_PER_TRACK];
+        let mut loops = Vec::with_capacity(f.clips.len());
+        for c in f.clips {
+            prints[c.slot.min(CLIPS_PER_TRACK - 1)] = Some(c.print);
+            match Frozen::from_samples(c.map, c.samples) {
+                Some(fr) => loops.push((c.slot, fr, c.win)),
+                None => return false,
+            }
+        }
+        if !self.freeze.install_track(t, loops, snap) {
+            return false;
+        }
+        self.freeze_prints[t] = prints;
+        self.freeze_chain_prints[t] = f.chain_print;
+        self.queue.remove_slot(t);
+        /* A chain the previous Set left loaded at the same modules was kept
+         * rather than reloaded (`set_chain_set`): it goes the frozen way. */
+        self.retire_chain(t);
+        true
+    }
+
+    /// A frozen track's chain leaves `slots` whole and is destroyed on the
+    /// reaper's thread, never here: a heavy synth's destroy is a dropout
+    /// (chain_reaper.rs). The Set still names it (`desired` is untouched), and
+    /// a thaw loads a fresh instance through the queue, as any first load.
+    fn retire_chain(&mut self, t: usize) {
+        for (component, _) in &self.desired[t] {
+            self.pin.on_load(t, component, "");
+        }
+        if let Some(inst) = self.slots[t].take() {
+            self.reaper.retire(inst);
+            self.generation = self.generation.wrapping_add(1);
+            host::log(&format!("chain {}: retired (frozen)", t));
+        }
+        self.plan_dirty = true;
+    }
+
+    fn note_freeze(&mut self, t: usize, o: Outcome) {
+        let code = match o {
+            Outcome::Captured => "frozen",
+            Outcome::ClipDone { .. } => return,
+            Outcome::Cancelled(c) => c.code(),
+        };
+        self.freeze_events[t] = Some(o);
+        self.freeze_last = (self.freeze_last.0.wrapping_add(1), t, code);
+        host::log(&format!("freeze: track {} {}", t + 1, code));
+    }
+
+    /// Read back what a load left in the position and record a refusal. Kept
+    /// out of `service_loads` so a test can reach it without a chain host. The
+    /// Set keeps the module (`desired` is untouched): a refusal can be passing
+    /// — a module mid-update, a pool another track frees — and the next open
+    /// retries it, where dropping it would lose the user's choice for good.
+    pub(crate) fn check_load(&mut self, slot: usize, component: &str, module: &str) {
+        let Some(key) = chain_load_check::readback_key(component) else { return };
+        let Some(inst) = self.slots.get_mut(slot).and_then(|s| s.as_mut()) else { return };
+        let got = inst.get_param(&key);
+        if chain_load_check::refused(module, got.as_deref()) {
+            host::log(&format!("chain {slot}: {component} = {module} REFUSED (reads back {:?})", got));
+            self.load_errors.record(slot, component, module);
+        }
+    }
+
+    /// `lde=<seq>:<slot>:<component>:<module>`, the last refused load.
+    pub fn load_status(&self) -> String {
+        self.load_errors.status()
+    }
+
+    /// The status line's freeze fields: frozen-or-thawing mask (hex), the
+    /// freeze in progress as `track:done/total:percent` (or `-`), and the last
+    /// event as `seq:track:code` — codes `frozen`, `thawed`, `stopped`,
+    /// `asked`, `set`, and the refusals `noclip`, `nochain`, `busy`, `muted`,
+    /// `rec`, `speed`, `long` (a clip over `MAX_LOOP_SECONDS`) and `mem` (the
+    /// loops would pass `MEM_BUDGET`).
+    pub fn freeze_status(&self) -> String {
+        let cap = (0..MOVY_CHAINS)
+            .find_map(|t| self.freeze.progress(t).map(|(d, n, p, s, a)| format!("{t}:{d}/{n}:{p}:{s}:{a}")))
+            .unwrap_or_else(|| "-".to_string());
+        let (seq, t, code) = self.freeze_last;
+        let mask = self.freeze.frozen_mask();
+        let mut s = format!(" frz={mask:x} frzc={cap} frze={seq}:{t}:{code}");
+        /* Which synth each frozen track was, so its screen can say so after a
+         * reboot too (the UI learnt the display name only at the freeze). */
+        if mask != 0 {
+            let names: Vec<String> = (0..MOVY_CHAINS).filter(|t| mask & (1 << t) != 0).map(|t| {
+                let m = self.desired[t].iter().find(|(c, _)| c == "synth").or(self.desired[t].first());
+                format!("{t}:{}", m.map_or("", |(_, m)| m.as_str()))
+            }).collect();
+            s.push_str(&format!(" frzm={}", names.join(",")));
+        }
+        s
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_for_test(&mut self, slot: usize, inst: ChainInstance) {
+        self.slots[slot] = Some(inst);
+    }
+
+    /// A loaded chain the Set names (`desired`), as a freeze needs one.
+    #[cfg(test)]
+    pub(crate) fn fake_chain_for_test(&mut self, slot: usize, inst: ChainInstance, module: &str) {
+        self.slots[slot] = Some(inst);
+        self.desired[slot] = vec![("synth".to_string(), module.to_string())];
+        self.plan_dirty = true;
+        self.render_without_host = true;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn peak_for_test(&self, slot: usize) -> i32 {
+        self.peaks[slot] as i32
+    }
+
+    /// `<lane>=<target>` for every bound lane, `;`-separated: a param lane
+    /// by its key, a mix lane as `mix:<field>`. Diagnostic read-back only.
+    pub fn lane_binds(&self, slot: usize) -> String {
+        let Some(lanes) = self.auto_lanes.get(slot) else { return String::new() };
+        let mut out = String::new();
+        for (i, t) in lanes.iter().enumerate() {
+            let name = match t {
+                LaneTarget::None => continue,
+                LaneTarget::Mix(f) => format!("mix:{f:?}").to_lowercase(),
+                LaneTarget::Param(p) => p.key.to_string_lossy().into_owned(),
+            };
+            if !out.is_empty() {
+                out.push(';');
+            }
+            out.push_str(&format!("{i}={name}"));
+        }
+        out
+    }
+
+    /// Write one automation value to whatever the lane is bound to. Returns
+    /// whether anything was written.
+    ///
+    /// Runs on the audio thread, in `drain_out`, in the same block the engine
+    /// produced the value — before the chains render, so it is heard in that
+    /// block, as the CC it replaces was. The key was built at bind time and
+    /// the value is formatted on the stack: nothing here allocates.
+    ///
+    /// A param write goes through the chain's own `set_param`, the path movy's
+    /// manual edits take. Unlike the old CC route (which called the plugin
+    /// directly), that updates the modulation BASE, so a lane and an LFO on the
+    /// same param compose instead of the LFO overwriting the lane.
+    pub fn apply_lane(&mut self, slot: usize, lane: u8, val: u8) -> bool {
+        let Some(target) = self.auto_lanes.get(slot).and_then(|m| m.get(lane as usize)) else {
+            return false;
+        };
+        match target {
+            LaneTarget::None => false,
+            LaneTarget::Mix(field) => {
+                let field = *field;
+                // Applied to a copy so the crossing can be seen:
+                // `note_feeder_change` compares against what is still stored,
+                // and a field mutated in place would leave nothing to compare.
+                if let Some(mix) = self.mixes.get(slot).copied() {
+                    let mut next = mix;
+                    field.apply(&mut next, val);
+                    self.note_feeder_change(slot, &next);
+                    self.mixes[slot] = next;
+                }
+                true
+            }
+            LaneTarget::Param(p) => {
+                let Some(inst) = self.slots[slot].as_mut() else { return false };
+                self.idle.wake(slot);
+                if let Some(name) = p.fmt.name(val) {
+                    inst.set_param_c(&p.key, name);
+                    return true;
+                }
+                let mut buf = ValBuf::new();
+                match p.fmt.format(val, &mut buf).then(|| buf.as_cstr()).flatten() {
+                    Some(v) => {
+                        inst.set_param_c(&p.key, v);
+                        true
+                    }
+                    None => false,
+                }
+            }
+        }
+    }
+
+    pub fn set_mix(&mut self, slot: usize, mix: TrackMix) {
+        if slot < MOVY_CHAINS {
+            self.idle.wake(slot);
+            self.note_feeder_change(slot, &mix);
+            self.mixes[slot] = mix;
+        }
+    }
+
+    /// A send gain crossing zero changes WHO FEEDS WHAT, so the co-location
+    /// plan built on the old answer is not merely unbalanced — it is unsafe.
+    ///
+    /// A bus is summed by the one lane that owns it. Let a track on another lane
+    /// start feeding it under a stale plan and two threads write one buffer.
+    /// So a crossing forces a replan before the next block rather than waiting
+    /// out `REPLAN_BLOCKS`.
+    ///
+    /// Only a CROSSING. A send ridden from 0.3 to 0.4 by an automation lane
+    /// changes a gain, not a feeder set, and must not replan every block — which
+    /// is the whole reason this compares against zero instead of for equality.
+    fn note_feeder_change(&mut self, slot: usize, next: &TrackMix) {
+        let prev = &self.mixes[slot];
+        for n in 0..SEND_BUSES {
+            let was = prev.send_gains(n) != (0.0, 0.0);
+            let now = next.send_gains(n) != (0.0, 0.0);
+            if was != now {
+                self.plan_dirty = true;
+                return;
+            }
+        }
+    }
+
+    /// One chain's mix in the same shape `set_mix` accepts.
+    ///
+    /// Movy owns this state — no chain-host param carries it — so without a
+    /// reader it was write-only: the volume gesture could not resume from the
+    /// level it last set, and the set file had no way to record it.
+    ///
+    /// **The SHORTEST shape that carries the truth**, because this string is
+    /// what lands in the set file. Trailing sends at zero are dropped down to
+    /// the two-send width, so a set that never touched send 3 still opens on a
+    /// build that has only two — where a six-field value would be refused whole
+    /// and the track would come back at unity, unmuted, at a level nobody
+    /// chose. Widths below two are never emitted: three fields is a shape only
+    /// older builds wrote, and re-emitting it would buy nothing.
+    pub fn mix_csv(&self, slot: usize) -> Option<String> {
+        let m = self.mixes.get(slot)?;
+        let mut n = m.send.len();
+        while n > 2 && m.send[n - 1] == 0.0 {
+            n -= 1;
+        }
+        let mut out = format!("{:.4},{:.4},{}", m.gain, m.pan, m.muted as u8);
+        for s in &m.send[..n] {
+            out.push_str(&format!(",{s:.4}"));
+        }
+        Some(out)
+    }
+
+    /// Deliver a MIDI message to one chain.
+    pub fn on_midi(&mut self, slot: usize, msg: &[u8], source: core::ffi::c_int) {
+        if slot >= MOVY_CHAINS {
+            return;
+        }
+        self.idle.wake(slot);
+        if let Some(inst) = self.slots[slot].as_mut() {
+            inst.on_midi(msg, source);
+        }
+        self.sidechain(slot, msg);
+    }
+
+    /// A track's note, on the track's own channel (track 1 = channel 1), to
+    /// every chain — tracks, send buses, master — holding an audio FX that
+    /// hears MIDI: the Ducker's sidechain. schwung's shim does the same for
+    /// its slots and Master FX (`shadow_midi.c`, `FX_BROADCAST`); without it
+    /// a Ducker heard only its own track's notes, always on channel 1.
+    ///
+    /// Only chains with ears: the chain host runs its LFO retrigger on a
+    /// broadcast note before handing it to the FX, so a note sent to every
+    /// chain would restart other tracks' LFOs. Not a wake either — a chain
+    /// asleep is silent, and silence ducked is silence.
+    fn sidechain(&mut self, track: usize, msg: &[u8]) {
+        if msg.len() < 3 || !matches!(msg[0] & 0xF0, 0x80 | 0x90) {
+            return;
+        }
+        let m = [(msg[0] & 0xF0) | track as u8, msg[1], msg[2]];
+        let chains = self.slots.iter_mut().chain(self.send_slots.iter_mut()).flatten();
+        for inst in chains.chain(self.master.inst.as_mut()) {
+            if inst.hears_fx_midi() {
+                inst.on_midi(&m, MOVE_MIDI_SOURCE_FX_BROADCAST);
+            }
+        }
+    }
+
+    /// One system realtime byte (0xFA / 0xFB / 0xF8 / 0xFC) to EVERY loaded
+    /// chain — tracks, send buses and the master — as schwung's shim does for
+    /// its slots (`shadow_chain_broadcast_realtime`). The chain host derives
+    /// each module's `get_clock_status` from these bytes, and clock-driven
+    /// modules (breakbeat's slicer, arps, synced MIDI FX) step on the 0xF8
+    /// itself, so without them a module free-runs or never starts.
+    ///
+    /// A clock tick does NOT wake a sleeping chain: at 24 PPQN that would hold
+    /// every chain awake for as long as the transport runs and undo the idle
+    /// skip. The probe render still finds a module that started sounding.
+    /// Start and Continue do wake, once, so a clock-driven module is rendering
+    /// on its downbeat rather than up to a probe period late.
+    pub fn broadcast_realtime(&mut self, status: u8) {
+        let msg = [status];
+        let wake = status == 0xFA || status == 0xFB;
+        for slot in 0..MOVY_CHAINS {
+            if let Some(inst) = self.slots[slot].as_mut() {
+                inst.on_midi(&msg, MOVE_MIDI_SOURCE_EXTERNAL);
+                if wake {
+                    self.idle.wake(slot);
+                }
+            }
+        }
+        for inst in self.send_slots.iter_mut().flatten() {
+            inst.on_midi(&msg, MOVE_MIDI_SOURCE_EXTERNAL);
+        }
+        if let Some(inst) = self.master.inst.as_mut() {
+            inst.on_midi(&msg, MOVE_MIDI_SOURCE_EXTERNAL);
+        }
+    }
+
+    /// Render every loaded chain and sum into `out`.
+    ///
+    /// `out` already holds movy's own contribution (the metronome click), so
+    /// this ADDS. The chain host overwrites its output buffer, hence the
+    /// scratch buffer and the separate mix step.
+    pub fn render(&mut self, out: &mut [i16]) {
+        #[cfg(test)]
+        let no_host = self.host.is_none() && !self.render_without_host;
+        #[cfg(not(test))]
+        let no_host = self.host.is_none();
+        if no_host {
+            return;
+        }
+        let frames = out.len().min(SCRATCH_SAMPLES);
+        self.cost.begin_block();
+        let mut lap = std::time::Instant::now();
+
+        // Struck BEFORE the render, so the window's first block is the note-on's
+        // own block in both arms. Doing it from a socket write instead would put
+        // the note wherever the network happened to deliver it.
+        if self.digest.open_block() {
+            self.digest_stimulus(true);
+        }
+
+        // Render every chain into its own buffer, in parallel or not. The mix is
+        // deliberately NOT part of this: summing after the join keeps the output
+        // in slot order, so parallel and serial produce the same samples rather
+        // than the same samples in whatever order the lanes finished.
+        // Decide first, for every chain, before anything renders — the parallel
+        // path builds its whole task list up front, so a decision that depended
+        // on this block's own output could not be honoured there.
+        let digesting = self.digest.running();
+        for i in 0..MOVY_CHAINS {
+            /* A frozen or thawing track's loop stands in for its chain, which
+             * renders nothing: that is the CPU a freeze gives back. */
+            self.work[i] = if self.slots[i].is_none() || self.freeze.silences_chain(i) {
+                Work::NONE
+            } else if digesting {
+                // The oracle compares renders. A skipped block is not a
+                // difference in threading, which is the only thing it is
+                // allowed to report.
+                Work { synth: true, fx: true }
+            } else {
+                self.idle.plan(i)
+            };
+        }
+        // LFOs still have to advance for every chain whose synth did not render,
+        // and on the audio thread rather than a lane — see `ChainInstance::mod_tick`.
+        //
+        // The ANSWER matters as much as the call: the same tick advances a MIDI
+        // FX's timers, so an arp can put a note into the synth on a block no
+        // note arrived on. `idle.wake` cannot see that — it is driven by MIDI
+        // reaching the chain — so the wake has to come back from the chain host.
+        // Discarding it, which is what this loop used to do, left the note
+        // inaudible until the next probe.
+        for i in 0..MOVY_CHAINS {
+            if self.work[i].synth || self.freeze.silences_chain(i) {
+                continue;
+            }
+            let wake = self.slots[i].as_mut().is_some_and(|inst| inst.mod_tick());
+            if wake {
+                let mut w = self.work[i];
+                self.idle.midi_tick_wake(i, &mut w);
+                self.work[i] = w;
+            }
+        }
+        self.prof.lap(Stage::Mod, &mut lap);
+
+        /* One chain a block is asked whether its module declares per-pad sends
+         * — a synth swap is a plain param write, so there is no event to hang
+         * this on. Then, like `work`, the drain is decided before anything
+         * renders, and only for a synth that renders (`VoiceSends::plan`). */
+        let probe = self.voice.next_probe();
+        let declares = self.slots[probe].as_mut().is_some_and(|s| s.declares_voice_sends());
+        if self.voice.set_declares(probe, declares) {
+            self.plan_dirty = true;
+        }
+        for i in 0..MOVY_CHAINS {
+            self.voice.plan(i, self.slots[i].is_some() && self.work[i].synth);
+        }
+
+        /* Decided BEFORE anything renders, like `work` above and for the same
+         * reason: the parallel path builds its whole task list up front, and a
+         * bus that joined it later could not be given the taps that feed it.
+         * Serial render has no lanes to co-locate onto, so the send phase keeps
+         * every bus there. */
+        self.colo_ran = [false; SEND_BUSES];
+        if self.parallel_ready() {
+            self.maybe_replan();
+            self.arm_colocated();
+        }
+        self.prof.lap(Stage::Plan, &mut lap);
+        let t0 = self.cost.start();
+        let active = if self.parallel_ready() {
+            self.render_parallel(frames)
+        } else {
+            self.render_serial(frames)
+        };
+        /* Held rather than reported: the CPU meter tracks a per-CALL maximum,
+         * so the send phase has to arrive in the same `add_wall` as the render
+         * it follows. Two calls would report two smaller peaks and a capacity
+         * bar that never sees the real block. */
+        let render_ns = t0.elapsed().as_nanos() as u64;
+        self.prof.set(Stage::Render, render_ns);
+        lap = std::time::Instant::now();
+        // A chain that did no work this block cost nothing, and its mean has to
+        // say so. Serial `continue`s past it and parallel skips it above, so
+        // without this the mean simply freezes — see the fold in
+        // `render_parallel` for what that was doing to the plan.
+        for i in 0..MOVY_CHAINS {
+            // A frozen track is timed below, where its loop is played: one
+            // sample per block, like every chain, or the mean is diluted.
+            if self.slots[i].is_some() && self.work[i].none() && !self.freeze.silences_chain(i) {
+                self.cost.add_ns(i, 0);
+                self.cost.add_synth_ns(i, 0);
+            }
+        }
+        // After the join, before anything else: every lane is idle, so schwung
+        // sees exactly one producer again, and slot order makes the emission
+        // deterministic. Costs nothing when no chain sent anything, which today
+        // is every chain in the fleet.
+        crate::midi_out::QUEUE.drain(crate::host_vtable::send_direct);
+        // What each capturing track's chain just rendered, before anything
+        // mixes it: the pre-fader tap a freeze records.
+        self.freeze_tap(frames);
+
+        // Every meter falls first, so a chain that did not run this block
+        // empties instead of freezing; the ones that did run fold in below.
+        self.meter.decay(frames / 2, host::sample_rate());
+        for i in 0..MOVY_CHAINS {
+            /* A frozen (or thawing) track: its loop stands in for the chain and
+             * goes through everything below exactly as a chain's block does —
+             * meter, fader, pan, mute, sends. */
+            /* Timed like a chain's render, so the CPU page shows what a frozen
+             * track really costs (a loop copy: a few microseconds), not 0. */
+            let frozen = self.freeze.stands_in(i) && {
+                let t_frz = self.cost.start();
+                let played = self.freeze.play(i, &mut self.scratch[i][..frames]);
+                let ns = t_frz.elapsed().as_nanos() as u64;
+                self.cost.add_ns(i, ns);
+                self.cost.add_synth_ns(i, ns);
+                played
+            };
+            if !frozen && self.slots[i].is_none() {
+                continue;
+            }
+            if !frozen && self.work[i].none() {
+                // Nothing ran, so the scratch holds a stale block. Not mixed,
+                // and its peak is the truth about this block: silence.
+                self.peaks[i] = 0;
+                continue;
+            }
+            let scratch = &self.scratch[i][..frames];
+            // One pass for both: the mono peak is the max of the two halves.
+            let (peak_l, peak_r) = stereo_peaks(scratch);
+            let peak = peak_l.max(peak_r);
+            self.peaks[i] = peak;
+            self.meter.fold(i, peak_l, peak_r, &self.mixes[i]);
+            // After the join and before the mix: this reads exactly what the
+            // lane that rendered the chain wrote, which is the thing under test.
+            if digesting {
+                self.digest.fold(i, scratch, peak);
+            }
+            if !self.audible[i] && peak > 0 {
+                self.audible[i] = true;
+                host::log(&format!("chain {}: audio active (peak {})", i, peak));
+            }
+            mix_into(&mut out[..frames], scratch, &self.mixes[i]);
+            if self.link.wants(i) {
+                let (gl, gr) = self.mixes[i].channel_gains();
+                self.link.tap_gains(i, scratch, gl, gr);
+            }
+            /* The same block, at the same gains, tapped into whichever buses
+             * this track feeds — post-fader and post-pan by construction, not
+             * by a second gain calculation that could drift from the mix's.
+             * Two float compares for a track that sends nothing. */
+            /* Skipping exactly the buses a lane already summed this chain
+             * into. The mask is `colo_ran`, not `colo_bus`: a co-located bus
+             * that did not arm this block built no task and no tap, so it takes
+             * the ordinary path here and in the send phase. */
+            let mut skip = 0u16;
+            for n in 0..SEND_BUSES {
+                // A frozen track has no lane task, so no lane summed it.
+                if !frozen && self.colo_ran[n] && self.colo_feeders[n] & (1 << i) != 0 {
+                    skip |= 1 << n;
+                }
+            }
+            self.sends.accumulate(scratch, &self.mixes[i], skip);
+        }
+        self.mix_voice_sends(frames);
+        // Folded back after the mix, so the borrow of `scratch` is done with.
+        for i in 0..MOVY_CHAINS {
+            let w = self.work[i];
+            if w.none() {
+                continue;
+            }
+            let keep_alive =
+                w.fx && self.slots[i].as_mut().is_some_and(|s| s.fx_requires_continuous());
+            self.idle.observe(i, w, self.synth_peak[i], self.peaks[i], keep_alive);
+        }
+        /* After every chain has rendered AND mixed: a bus is a sum of tracks,
+         * so it cannot exist until they are all in. Serial on the audio thread
+         * by construction — there is no join left to hide behind (design §5). */
+        self.prof.lap(Stage::Mix, &mut lap);
+        let t_send = self.cost.start();
+        let plan = self.sends.take_plan();
+        let mut send_ran = false;
+        for n in 0..SEND_BUSES {
+            self.send_work[n] = false;
+            /* Already rendered, on a lane, before the join. It still owes the
+             * output its block — `finish` below — but processing it a second
+             * time here would run the FX twice on one buffer. */
+            if self.colo_ran[n] {
+                continue;
+            }
+            if !plan[n] {
+                continue;
+            }
+            if self.send_slots[n].is_none() {
+                // Fed, but with nowhere to go. Dropped rather than left to ring
+                // into the block after its module was removed.
+                self.sends.discard(n);
+                continue;
+            }
+            self.send_work[n] = true;
+            send_ran = true;
+        }
+        /* A bus that skipped this block cost nothing, and the meter has to say
+         * so — see `SendBuses::ui_idle`. Unconditional, exactly like the chain
+         * loop above: a set gone entirely quiet is the case where a frozen mean
+         * is most visibly wrong. */
+        for n in 0..SEND_BUSES {
+            if !self.send_work[n] && !self.colo_ran[n] {
+                self.sends.ui_idle(n);
+            }
+        }
+        /* Assigned even when the phase does not run, so `sndlog` cannot report
+         * last block's fan-out as though it were this one's. Short-circuits
+         * before `plan_sends` when nothing is running. */
+        self.send_fanned = send_ran && self.parallel_ready() && self.plan_sends();
+        if send_ran {
+            if self.send_fanned {
+                self.render_sends_parallel(frames);
+            } else {
+                self.render_sends_serial(frames);
+            }
+            // Same rule as the chain phase, one phase later: every lane is idle
+            // again, so schwung sees one producer, and bus order makes the
+            // emission deterministic.
+            crate::midi_out::QUEUE.drain(crate::host_vtable::send_direct);
+        }
+        /* Summed into the output AFTER the whole phase, in bus order — never in
+         * the order the lanes happened to finish. That is what makes the
+         * parallel result the same samples as the serial one rather than merely
+         * the same samples somewhere.
+         *
+         * ONE loop over both paths, outside the `send_ran` branch: a co-located
+         * bus is summed in the same place and the same order as one from the
+         * phase, so which path a bus took cannot change the output. */
+        let colo_ran_any = self.colo_ran.iter().any(|&r| r);
+        for n in 0..SEND_BUSES {
+            if self.send_work[n] || self.colo_ran[n] {
+                let ch = crate::link_shm::CH_SEND0 + n;
+                if self.link.wants(ch) {
+                    self.link.tap(ch, self.sends.bus_out(n, frames));
+                }
+                self.sends.finish(n, &mut out[..frames], frames);
+            }
+        }
+        let send_ns =
+            if send_ran || colo_ran_any { t_send.elapsed().as_nanos() as u64 } else { 0 };
+        /* Last, over the finished sum — a master is everything, so it cannot
+         * start before the sends are in. Its time joins the same `add_wall`
+         * (see `close_block`), so the CPU bar sees one whole block. */
+        let t_master = self.cost.start();
+        /* Every block: its volume and limiter are on the output whether or not
+         * an FX is loaded, so the block always counts. */
+        /* Movy Master is tapped between the FX and the limiter, which is
+         * where the master volume lives: the knob is for monitoring and must
+         * not ride the recording. */
+        self.master.run_fx(&mut out[..frames]);
+        self.link.tap(crate::link_shm::CH_MASTER, &out[..frames]);
+        self.master.limit(&mut out[..frames]);
+        self.link.finish_block();
+        let master_ns = t_master.elapsed().as_nanos() as u64;
+        self.master.add_cost(master_ns);
+        // Elapsed, not `send_ns`: that one reads 0 when no bus ran, and a send
+        // phase that was slow at deciding so is still where the block went.
+        self.prof.set(Stage::Send, t_master.duration_since(t_send).as_nanos() as u64);
+        self.prof.set(Stage::Master, master_ns);
+        self.close_block(render_ns, send_ns + master_ns, active, true);
+        self.active_last_block = active;
+        // The run releases what it struck: a device must never be left holding
+        // 48 notes because a benchmark was interrupted between arms.
+        if self.digest.close_block() {
+            self.digest_stimulus(false);
+            host::log(&format!("chain digest: {}", self.digest.report()));
+        }
+    }
+
+    /// Strike or release the digest's fixed chord on every loaded chain.
+    ///
+    /// Straight into the instances rather than through `on_midi`: the pad
+    /// routing and held-note ledger belong to what the player is doing, and a
+    /// measurement must not leave entries in them.
+    fn digest_stimulus(&mut self, on: bool) {
+        for slot in self.slots.iter_mut().flatten() {
+            for &p in STIMULUS.iter() {
+                let m = if on { [0x90, p, 100] } else { [0x80, p, 0] };
+                slot.on_midi(&m, MOVE_MIDI_SOURCE_INTERNAL);
+            }
+        }
+    }
+
+    /// Arm an equivalence run: strike a fixed chord, digest `blocks` blocks of
+    /// every chain's output, release. See `chain_digest`.
+    pub fn digest_arm(&mut self, blocks: u32) {
+        // The oracle compares renders, and `digest_stimulus` strikes its chord
+        // straight into the instances — bypassing `on_midi`, so the gate would
+        // never see the notes that are about to arrive.
+        self.idle.wake_all();
+        self.digest.arm(blocks);
+        host::log(&format!("chain digest: armed window={blocks}"));
+    }
+
+    pub fn digest_report(&self) -> String {
+        self.digest.report()
+    }
+
+    /// Which buses are riding a chain lane, for `sndlog`.
+    pub fn colocated_mask(&self) -> u16 {
+        let mut m = 0u16;
+        for n in 0..SEND_BUSES {
+            if self.colo_bus[n] {
+                m |= 1 << n;
+            }
+        }
+        m
+    }
+
+    /// The lane half of chain `c`'s per-pad sends, or `None` when it does not
+    /// drain this block. Taps only the buses co-located WITH it — exactly the
+    /// predicate `mix_voice_sends` skips on, so a block is summed once.
+    fn voice_task(&mut self, c: usize, renders: bool, bus_buf: &[*mut i16; SEND_BUSES]) -> Option<VoiceTask> {
+        if !renders || !self.voice.drained(c) {
+            return None;
+        }
+        let drain = self.slots[c].as_ref()?.drain_fn()?;
+        let (gl, gr) = self.mixes[c].voice_send_gains();
+        let taps = core::array::from_fn(|k| {
+            let on_lane = self.colo_ran[k] && self.colo_feeders[k] & (1 << c) != 0;
+            (on_lane && (gl != 0.0 || gr != 0.0)).then_some(Tap { buf: bus_buf[k], gl, gr })
+        });
+        Some(VoiceTask { drain, scratch: self.voice.raw_ptrs(c), taps })
+    }
+
+    /// After the join: fold every chain's drained per-pad sends into the feed
+    /// state, and sum the ones no lane already summed into their bus.
+    ///
+    /// A pad sending into a co-located bus it is not yet a feeder of is DROPPED
+    /// for this block: that bus's FX already ran on its lane, so summing here
+    /// would add dry signal to its output — and before the join it would have
+    /// been two threads on one buffer. The replan puts the chain on the bus's
+    /// lane from the next block. One block, once, at onset.
+    fn mix_voice_sends(&mut self, frames: usize) {
+        for i in 0..MOVY_CHAINS {
+            let drained = self.voice.drained(i);
+            let mut peaks = [0i32; VOICE_SENDS];
+            if drained {
+                for (k, p) in peaks.iter_mut().enumerate() {
+                    *p = self.voice.buf(i, k)[..frames].iter().fold(0, |m, &s| m.max((s as i32).abs()));
+                }
+            }
+            if self.voice.observe(i, peaks) {
+                self.plan_dirty = true;
+            }
+            if !drained {
+                continue;
+            }
+            let (gl, gr) = self.mixes[i].voice_send_gains();
+            for k in 0..VOICE_SENDS {
+                if peaks[k] == 0 {
+                    continue;
+                }
+                if self.colo_ran[k] {
+                    if self.colo_feeders[k] & (1 << i) == 0 {
+                        self.plan_dirty = true;
+                    }
+                    continue;
+                }
+                self.sends.accumulate_bus(k, &self.voice.buf(i, k)[..frames], gl, gr);
+            }
+        }
+    }
+
+    /// Serial render is no longer a setting — it is the fallback for a pool
+    /// that has not been spawned yet (nothing hosts chains) or that poisoned
+    /// itself when a helper panicked. Deleting it would turn either into
+    /// silence.
+    fn parallel_ready(&self) -> bool {
+        self.pool.as_ref().is_some_and(|p| !p.is_poisoned())
+    }
+
+    fn render_serial(&mut self, frames: usize) -> usize {
+        let mut active = 0usize;
+        for i in 0..MOVY_CHAINS {
+            let w = self.work[i];
+            if w.none() {
+                continue;
+            }
+            let Some(inst) = self.slots[i].as_mut() else { continue };
+            active += 1;
+            let t0 = self.cost.start();
+            // Serial takes the same scope as a lane does, so a module's MIDI
+            // leaves in slot order after the block in BOTH modes. Two orderings
+            // would be a difference parallel introduced, which is the one thing
+            // it is not allowed to do.
+            let scope = crate::midi_out::Scope::enter(i);
+            if w.synth {
+                inst.render_block(&mut self.scratch[i][..frames]);
+                /* Straight after the render, as the lane does it. No taps:
+                 * nothing is co-located on the serial path, so every bus is
+                 * fed after the join by `mix_voice_sends`. */
+                if let (true, Some(drain)) = (self.voice.drained(i), inst.drain_fn()) {
+                    let v = VoiceTask { drain, scratch: self.voice.raw_ptrs(i), taps: [None; VOICE_SENDS] };
+                    let (ptr, _, _) = inst.raw_parts();
+                    // Safe: the audio thread owns this chain's scratch on the
+                    // serial path, and it holds a full block.
+                    unsafe { drain_voices(&v, ptr, (frames / 2) as i32) };
+                }
+            } else {
+                // The FX is owed silence to decay into, not the last block.
+                self.scratch[i][..frames].fill(0);
+            }
+            // Before the peak scan, exactly as the pool does it — the two paths
+            // have to mean the same thing, or the meter changes when a poisoned
+            // pool drops the render back here.
+            let synth_ns = if w.synth { t0.elapsed().as_nanos() as u64 } else { 0 };
+            self.synth_peak[i] = self.scratch[i][..frames]
+                .iter()
+                .fold(0i32, |m, &s| m.max((s as i32).abs()));
+            if w.fx {
+                inst.process_fx(&mut self.scratch[i][..frames]);
+            }
+            drop(scope);
+            self.cost.stop(t0, i);
+            self.cost.add_synth_ns(i, synth_ns);
+        }
+        active
+    }
+
+    fn render_parallel(&mut self, frames: usize) -> usize {
+        // Buffer pointers taken up front: a tap needs `&mut self.sends` while
+        // the loop below holds `&mut self.scratch`, and both live in `self`.
+        let mut bus_buf = [core::ptr::null_mut::<i16>(); SEND_BUSES];
+        for n in 0..SEND_BUSES {
+            if self.colo_ran[n] {
+                bus_buf[n] = self.sends.buf_ptr(n);
+            }
+        }
+        for l in self.lanes.iter_mut() {
+            l.clear();
+        }
+        let mut active = 0usize;
+        for lane in 0..self.planner.lanes.len() {
+            for idx in 0..self.planner.lanes[lane].len() {
+                let c = self.planner.lanes[lane][idx];
+                /* A co-located bus, at the tail of the shared index space. The
+                 * planner put it after its feeders on this same lane, so by the
+                 * time the lane reaches it their audio is already summed into
+                 * the buffer — which is the entire mechanism, and why this
+                 * needs no synchronisation of its own. */
+                if c >= MOVY_CHAINS {
+                    let n = c - MOVY_CHAINS;
+                    if !self.colo_ran[n] {
+                        continue;
+                    }
+                    let Some((inst, _, Some(fx))) =
+                        self.send_slots[n].as_mut().map(|s| s.raw_parts())
+                    else {
+                        // No `chain_process_fx`: the bus keeps its summed block
+                        // and `finish` passes it through at unity, exactly as
+                        // the send phase does for the same module.
+                        continue;
+                    };
+                    self.lanes[lane].push(Task {
+                        pre: Pre::Keep,
+                        taps: NO_TAPS,
+                        voice: None,
+                        process_fx: Some(fx),
+                        inst,
+                        buf: self.sends.buf_ptr(n),
+                        frames: (frames / 2) as i32,
+                        chain: c,
+                    });
+                    continue;
+                }
+                let w = self.work[c];
+                if w.none() {
+                    continue;
+                }
+                let Some((ptr, render, fx)) = self.slots[c].as_mut().map(|s| s.raw_parts()) else {
+                    continue;
+                };
+                let render = if w.synth { render } else { None };
+                let fx = if w.fx { fx } else { None };
+                if render.is_none() && fx.is_none() {
+                    // A module with no render_block and nothing to process: the
+                    // same slot the old code skipped outright.
+                    continue;
+                }
+                active += 1;
+                /* Post-fader and post-pan by construction: the lane runs the
+                 * tap after `process_fx`, at the same gains `mix_into` uses. */
+                let mut taps = NO_TAPS;
+                let mut t = 0usize;
+                for n in 0..SEND_BUSES {
+                    if !self.colo_ran[n] || self.colo_feeders[n] & (1 << c) == 0 {
+                        continue;
+                    }
+                    let (gl, gr) = self.mixes[c].send_gains(n);
+                    if gl == 0.0 && gr == 0.0 {
+                        continue;
+                    }
+                    if t < MAX_TAPS {
+                        taps[t] = Some(Tap { buf: bus_buf[n], gl, gr });
+                        t += 1;
+                    }
+                }
+                let voice = self.voice_task(c, render.is_some(), &bus_buf);
+                self.lanes[lane].push(Task {
+                    pre: render.map_or(Pre::Silence, Pre::Render),
+                    taps,
+                    voice,
+                    process_fx: fx,
+                    inst: ptr,
+                    buf: self.scratch[c].as_mut_ptr(),
+                    frames: (frames / 2) as i32,
+                    chain: c,
+                });
+            }
+        }
+
+        if let Some(pool) = self.pool.as_ref() {
+            pool.render_block(&self.lanes);
+            // Costs are timed on whichever lane ran the chain — the audio thread
+            // cannot bracket a call it did not make.
+            //
+            // Only for chains that HAD work: `cost_ns` is never cleared between
+            // rounds and a deep-asleep chain builds no task at all, so folding
+            // unconditionally re-added the cost the chain had while awake, every
+            // block, for as long as it slept. Its mean never decayed and the
+            // planner went on reserving a lane for a chain rendering nothing.
+            for c in 0..MOVY_CHAINS {
+                if self.slots[c].is_some() && !self.work[c].none() {
+                    self.cost.add_ns(c, pool.cost_ns(c));
+                    self.cost.add_synth_ns(c, pool.synth_ns(c));
+                    self.synth_peak[c] = pool.synth_peak(c);
+                }
+            }
+            /* A co-located bus is costed exactly like one in the send phase, so
+             * the CPU page and `sndcostlog` read the same number wherever it
+             * ran — and, more importantly, so does the planner that decided to
+             * put it here. A bus whose cost stopped being measured the moment
+             * it was co-located could never be re-evaluated. */
+            for n in 0..SEND_BUSES {
+                if self.colo_ran[n] {
+                    self.sends.add_cost(n, pool.cost_ns(send_index(n)));
+                    self.sends.note_colocated(n, pool.synth_peak(send_index(n)));
+                }
+            }
+        }
+        active
+    }
+
+    /// Partition the buses about to run, and say whether fanning them out is
+    /// worth its wake.
+    ///
+    /// Planned EVERY block rather than on the chain phase's `REPLAN_BLOCKS`
+    /// timer: which buses run is a per-block fact (a reverb tail ending retires
+    /// one), there are at most `SEND_BUSES` of them, and a stale plan here does
+    /// not merely cost balance — it would fan out for a bus that is no longer
+    /// running, which is the one outcome the threshold exists to prevent.
+    ///
+    /// `pin_keys` is sliced from `MOVY_CHAINS` on: send buses live at the tail
+    /// of the shared index space (`send_index`), so bus `n` is entry `n` of the
+    /// slice and two buses holding one blacklisted module stay on one lane —
+    /// the same containment a pair of chains gets.
+    fn plan_sends(&mut self) -> bool {
+        let costs = self.sends.plan_cost();
+        self.send_planner.plan(&self.pin.pin_keys()[MOVY_CHAINS..], costs, &self.send_work);
+        let serial: u64 =
+            (0..SEND_BUSES).filter(|&n| self.send_work[n]).map(|n| costs[n]).sum();
+        worth_fanning_out(serial, self.send_planner.makespan())
+    }
+
+    /// The send phase on the audio thread — one bus after another, exactly as
+    /// the phase has always run.
+    fn render_sends_serial(&mut self, frames: usize) {
+        for n in 0..SEND_BUSES {
+            if !self.send_work[n] {
+                continue;
+            }
+            let t_bus = self.cost.start();
+            // The same scope a lane takes, for the same reason the serial chain
+            // path takes one: a module's MIDI must leave in the same order
+            // whichever path ran it, or the ordering is something parallel
+            // introduced.
+            let scope = crate::midi_out::Scope::enter(send_index(n));
+            if let Some(inst) = self.send_slots[n].as_mut() {
+                inst.process_fx(&mut self.sends.buf_mut(n)[..frames]);
+            }
+            drop(scope);
+            self.sends.add_cost(n, t_bus.elapsed().as_nanos() as u64);
+        }
+    }
+
+    /// The send phase across the render pool.
+    ///
+    /// `Pre::Keep` is the whole difference from a chain task: the bus buffer
+    /// already holds the sum every track fed it, and a lane that zeroed it would
+    /// hand the FX 128 frames of silence.
+    fn render_sends_parallel(&mut self, frames: usize) {
+        for l in self.send_lanes.iter_mut() {
+            l.clear();
+        }
+        for lane in 0..self.send_planner.lanes.len().min(self.send_lanes.len()) {
+            for idx in 0..self.send_planner.lanes[lane].len() {
+                let n = self.send_planner.lanes[lane][idx];
+                if !self.send_work[n] {
+                    continue;
+                }
+                let Some((inst, _, Some(fx))) = self.send_slots[n].as_mut().map(|s| s.raw_parts())
+                else {
+                    // A module with no `chain_process_fx` cannot process the bus
+                    // at all. It keeps its accumulated block, which `finish`
+                    // then passes through at unity — the same audio the serial
+                    // path produced when `process_fx` found no symbol.
+                    continue;
+                };
+                self.send_lanes[lane].push(Task {
+                    pre: Pre::Keep,
+                    taps: NO_TAPS,
+                    voice: None,
+                    process_fx: Some(fx),
+                    inst,
+                    buf: self.sends.buf_ptr(n),
+                    frames: (frames / 2) as i32,
+                    chain: send_index(n),
+                });
+            }
+        }
+        if let Some(pool) = self.pool.as_ref() {
+            pool.render_block(&self.send_lanes);
+            // Timed on whichever lane ran the bus, for the same reason a chain's
+            // cost is: the audio thread cannot bracket a call it did not make.
+            for n in 0..SEND_BUSES {
+                if self.send_work[n] {
+                    self.sends.add_cost(n, pool.cost_ns(send_index(n)));
+                }
+            }
+        }
+    }
+
+    /// Partition the chains, then offer each bus a place beside its feeders and
+    /// keep the offers that shorten the block.
+    ///
+    /// Greedy, in descending bus cost, and each acceptance is measured against
+    /// the plan the previous acceptances produced — so every step strictly
+    /// improves the predicted block and the result can never be worse than the
+    /// chains-only partition it started from. At most `SEND_BUSES + 2` calls to
+    /// `plan`, every `REPLAN_BLOCKS` blocks.
+    ///
+    /// Overlapping groups are refused rather than merged: once a chain carries
+    /// a group key it is no longer free, so a second bus fed by the same track
+    /// fails `group_is_free` and keeps the send phase. Merging them would be a
+    /// bigger group with a longer lane, which is the thing the rule exists to
+    /// avoid.
+    fn plan_with_colocation(&mut self) {
+        self.colo_bus = [false; SEND_BUSES];
+        self.colo_feeders = [0; SEND_BUSES];
+        let keys = self.pin.pin_keys();
+        for i in 0..RENDER_SLOTS {
+            // `clear` + `push_str` rather than a clone: assignment would drop
+            // the preallocated buffer and allocate a new one every replan.
+            self.colo_keys[i].clear();
+            self.colo_keys[i].push_str(&keys[i]);
+            self.colo_loaded[i] = if i < MOVY_CHAINS { self.loaded[i] } else { false };
+            self.colo_cost[i] = if i < MOVY_CHAINS { self.cost.plan_ns()[i] } else { 0 };
+        }
+        self.planner.plan(&self.colo_keys, &self.colo_cost, &self.colo_loaded);
+        let mut best = self.planner.makespan();
+        let mut feeders = crate::chain_colo::feeders(&self.mixes, &self.loaded);
+        crate::chain_colo::add_voice_feeders(&mut feeders, &self.voice, &self.loaded);
+
+        // Heaviest bus first: it has the fewest lanes it can fit on, and a
+        // lighter one accepted before it could take the only place it had.
+        let costs = self.sends.plan_cost();
+        let mut order = [0usize; SEND_BUSES];
+        for (i, o) in order.iter_mut().enumerate() {
+            *o = i;
+        }
+        order.sort_unstable_by(|&a, &b| costs[b].cmp(&costs[a]).then(a.cmp(&b)));
+
+        for &n in order.iter() {
+            let slot = send_index(n);
+            let cost = self.sends.plan_cost()[n];
+            /* Cost alone gates a bus here — an unloaded one has never rendered,
+             * so its cost is zero and the bootstrap rule already refuses it.
+             * Whether an INSTANCE exists is `arm_colocated`'s question, asked
+             * per block, because that is what has to build a task out of it. */
+            if cost == 0 || feeders[n] == 0 {
+                continue;
+            }
+            if !crate::chain_colo::group_is_free(&self.colo_keys[slot], feeders[n], &self.colo_keys)
+            {
+                continue;
+            }
+            // The group tag. Written into the bus and every feeder, which is
+            // all `render_plan` needs to keep them on one lane — and because
+            // buses sit at the TAIL of the index space, the planner's
+            // index-ordered push puts the bus after its feeders for free.
+            for c in 0..MOVY_CHAINS {
+                if feeders[n] & (1 << c) != 0 {
+                    Self::write_tag(&mut self.colo_keys[c], n);
+                }
+            }
+            Self::write_tag(&mut self.colo_keys[slot], n);
+            self.colo_loaded[slot] = true;
+            self.colo_cost[slot] = cost;
+            self.planner.plan(&self.colo_keys, &self.colo_cost, &self.colo_loaded);
+            if crate::chain_colo::worth_colocating(self.planner.makespan(), best, cost) {
+                best = self.planner.makespan();
+                self.colo_bus[n] = true;
+                self.colo_feeders[n] = feeders[n];
+            } else {
+                // Undo. Every key in the group was empty — `group_is_free` said
+                // so — so clearing restores exactly what was there.
+                for c in 0..MOVY_CHAINS {
+                    if feeders[n] & (1 << c) != 0 {
+                        self.colo_keys[c].clear();
+                    }
+                }
+                self.colo_keys[slot].clear();
+                self.colo_loaded[slot] = false;
+            }
+        }
+        // The loop leaves the planner holding whatever the last ATTEMPT built,
+        // accepted or not. This is the plan that runs.
+        self.planner.plan(&self.colo_keys, &self.colo_cost, &self.colo_loaded);
+    }
+
+    /// `colo/<n>`, written in place so the audio thread never allocates.
+    fn write_tag(dst: &mut String, bus: usize) {
+        dst.clear();
+        dst.push_str("colo/");
+        dst.push((b'0' + bus as u8) as char);
+    }
+
+    /// Which co-located buses run this block.
+    ///
+    /// `should_process`, read one phase earlier than `take_plan` reads it. That
+    /// is exact rather than conservative: `dirty` means "a feeder rendered with
+    /// a non-zero send gain", and both halves are already known here.
+    fn arm_colocated(&mut self) {
+        for n in 0..SEND_BUSES {
+            self.colo_ran[n] = false;
+            if !self.colo_bus[n] || self.send_slots[n].is_none() {
+                continue;
+            }
+            let fed = (0..MOVY_CHAINS)
+                .any(|c| self.colo_feeders[n] & (1 << c) != 0 && !self.work[c].none());
+            if self.sends.should_run(n, fed) {
+                self.colo_ran[n] = true;
+            }
+        }
+    }
+
+    /// Rebuild the lane assignment when the chain set changes, and periodically
+    /// as measured costs settle. Allocation-free — see `render_plan::Planner`.
+    fn maybe_replan(&mut self) {
+        self.blocks_since_plan += 1;
+        if !self.plan_dirty
+            && self.plan_generation == self.generation
+            && self.plan_idle_epoch == self.idle.epoch()
+            && self.blocks_since_plan < REPLAN_BLOCKS
+        {
+            return;
+        }
+        self.plan_generation = self.generation;
+        self.plan_idle_epoch = self.idle.epoch();
+        self.blocks_since_plan = 0;
+        self.plan_dirty = false;
+        for (i, s) in self.slots.iter().enumerate() {
+            // A deep-asleep chain is not work, and a partition that counts it
+            // can put every SOUNDING chain on one lane.
+            self.loaded[i] = s.is_some() && !self.idle.deep_asleep(i);
+        }
+        self.plan_with_colocation();
+    }
+
+    /// The CPU page's numbers as `status` fields, each with its leading space.
+    ///
+    /// MICROSECONDS, not nanoseconds: this goes out 24 times a second, four
+    /// extra digits per chain buys nothing, and the page draws a 1000 us column
+    /// in 39 pixels.
+    ///
+    /// Emitted unconditionally rather than behind an "the page is open" flag —
+    /// that flag is a second copy of a fact the UI already owns, and it desyncs
+    /// the moment an engine is re-dlopened under an open page.
+    pub fn cost_status(&self) -> String {
+        let mut s = String::with_capacity(288);
+        s.push_str(" chcost=");
+        for i in 0..MOVY_CHAINS {
+            if i > 0 {
+                s.push(',');
+            }
+            let (total, synth, peak) = self.cost.ui_costs(i);
+            s.push_str(&format!("{}/{}/{}", total / 1000, synth / 1000, peak as u64 / 1000));
+        }
+        let (wall, wall_peak) = self.cost.ui_wall();
+        let block_us =
+            crate::ffi::MOVE_FRAMES_PER_BLOCK as u64 * 1_000_000 / host::sample_rate().max(1) as u64;
+        s.push_str(&format!(
+            " chwall={}/{}/{}",
+            wall / 1000,
+            wall_peak as u64 / 1000,
+            block_us
+        ));
+        let mut loaded = 0u32;
+        let mut asleep = 0u32;
+        for i in 0..MOVY_CHAINS {
+            /* A frozen track is playing its loop: never "empty", never
+             * "asleep", even with its chain unloaded (or never loaded, when
+             * the Set opened frozen). */
+            let frozen = self.freeze.silences_chain(i);
+            if self.slots[i].is_some() || frozen {
+                loaded |= 1 << i;
+            }
+            if !frozen && self.idle.deep_asleep(i) {
+                asleep |= 1 << i;
+            }
+        }
+        s.push_str(&format!(" chmask={loaded:04x}/{asleep:04x}"));
+        s.push_str(" sndcost=");
+        for n in 0..SEND_BUSES {
+            if n > 0 {
+                s.push(',');
+            }
+            /* `-`, not `0/0`. "There is no module here" and "the module here is
+             * costing nothing right now" are the two different answers a zero
+             * column has, and the page draws them differently. Carried in this
+             * field rather than a second mask, so a bus's occupancy and its cost
+             * cannot arrive out of step. */
+            if !self.send_loaded[n] {
+                s.push('-');
+                continue;
+            }
+            let (mean, peak) = self.sends.ui_costs(n);
+            s.push_str(&format!("{}/{}", mean / 1000, peak / 1000));
+        }
+        s.push_str(" mfxcost=");
+        s.push_str(&self.master.cost_field());
+        s
+    }
+
+    /// Fold one block's timings into the CPU meter.
+    ///
+    /// ONE `add_wall` for the chain render AND the send phase, deliberately:
+    /// the meter holds a per-CALL maximum, so two calls would report two smaller
+    /// peaks and a capacity bar that never sees a whole block.
+    ///
+    /// And the gate is an `or`, not `active > 0`. A set whose only cost this
+    /// block was a ringing reverb on a send still spent that time, and a meter
+    /// that skipped it would read zero while the block was half full.
+    ///
+    /// Its own method so both rules are reachable from a test: `render` returns
+    /// at the door on a host build, for want of a chain host.
+    fn close_block(&mut self, render_ns: u64, send_ns: u64, active: usize, send_ran: bool) {
+        if active == 0 && !send_ran {
+            return;
+        }
+        self.cost.add_wall(render_ns + send_ns);
+        self.cost.end_block();
+    }
+
+    /// Clear the meter's held peaks — the page's own reset, never `report()`.
+    /// The send buses' peaks go with them: `cpurst` means one fresh observation
+    /// of the whole page, not of the columns left of the gap.
+    pub fn cost_ui_reset(&mut self) {
+        self.cost.ui_reset();
+        self.sends.ui_reset();
+        self.master.ui_reset();
+    }
+
+    /// What the last block spent, for the glitch line (`block_prof`).
+    pub fn block_report(&self) -> String {
+        let costs = self.cost.last_ns();
+        let chains: Vec<(usize, &str, u64)> = (0..MOVY_CHAINS)
+            .map(|i| {
+                let synth = self.desired.get(i).into_iter().flatten().find(|(c, _)| c == "synth").map_or("", |(_, m)| m.as_str());
+                (i, synth, costs[i])
+            })
+            .collect();
+        self.prof.report(&chains)
+    }
+
+    /// Per-chain render cost since the last call — see `CostMeter::report`.
+    /// Reading closes the window.
+    pub fn cost_report(&mut self) -> String {
+        self.cost.report()
+    }
+
+    /// How many chains rendered in the last block. Zero for a set with no movy
+    /// instruments, which is the case the "empty chains cost nothing" rule is
+    /// about.
+    pub fn active_count(&self) -> usize {
+        self.active_last_block
+    }
+
+    /// Drop every chain. The engine is going away; a pending load refers to
+    /// slots that will not exist.
+    pub fn teardown(&mut self) {
+        self.queue.clear();
+        for d in self.desired.iter_mut() {
+            d.clear();
+        }
+        for i in 0..MOVY_CHAINS {
+            self.slots[i] = None;
+            self.idle.forget(i);
+        }
+        for a in self.audible.iter_mut() {
+            *a = false;
+        }
+        self.pin.clear();
+        for n in 0..SEND_BUSES {
+            self.send_slots[n] = None;
+            self.send_loaded[n] = false;
+            self.sends.ui_clear(n);
+        }
+        self.master.teardown();
+        // Costs belong to instances that no longer exist — including the ones
+        // the planner would otherwise reuse to assign lanes to a different set.
+        self.cost.reset_all();
+        self.plan_generation = u32::MAX;
+    }
+}
+
+impl Default for ChainSlots {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ffi::plugin_api_v2_t;
+    use crate::mixer::MixField;
+    use core::ffi::{c_char, c_int, c_void};
+    use std::ffi::CStr;
+
+    /* These run on the host, where no chain host exists — so they verify the
+     * DEGRADED path, which is the one that must never crash: movy has to keep
+     * sequencing its four schwung tracks when chain hosting is unavailable. */
+
+    /* Stands in for the real chain host's `get_param`: answers by exact key
+     * string, the same way schwung's dispatcher does — the plain key is the
+     * BASE value (chain_mod_get_base_for_plain_key), only ":effective" is the
+     * driven one (chain_mod_get_effective_for_subkey). Lets the test tell a
+     * `lfo_report` that asks for the wrong key apart from one that doesn't,
+     * with no device and no real `.so`. */
+    unsafe extern "C" fn fake_lfo_get_param(
+        _inst: *mut c_void, key: *const c_char, buf: *mut c_char, buf_len: c_int,
+    ) -> c_int {
+        let k = unsafe { CStr::from_ptr(key) }.to_str().unwrap_or("");
+        let v = match k {
+            "lfo1:target" => "synth",
+            "lfo1:target_param" => "morph",
+            "lfo1:active" => "1",
+            "lfo2:target" | "lfo2:target_param" => "",
+            "lfo2:active" => "0",
+            "synth:morph:effective" => "0.812345",
+            "synth:morph" => "0.500000", // the frozen BASE — what the bug read
+            _ => "",
+        };
+        let bytes = v.as_bytes();
+        if bytes.len() as c_int >= buf_len {
+            return -1;
+        }
+        unsafe {
+            core::ptr::copy_nonoverlapping(bytes.as_ptr() as *const c_char, buf, bytes.len());
+        }
+        bytes.len() as c_int
+    }
+
+    /* Pins the bug from
+     * `plans/2026-09-12-test-device-migration-followups.md` item 4: the driven
+     * param read back frozen at its base on every run, because the diagnostic
+     * asked for the plain "<target>:<param>" key — which the chain host
+     * deliberately shadows to the base value (#276) — instead of
+     * "<target>:<param>:effective". Revert the ":effective" suffix in
+     * `lfo_report` and this fails on "0.500000" instead of "0.812345". */
+    #[test]
+    fn lfo_report_reads_the_effective_value_not_the_base() {
+        let api: &'static plugin_api_v2_t = Box::leak(Box::new(plugin_api_v2_t {
+            api_version: 0,
+            create_instance: None,
+            destroy_instance: None,
+            on_midi: None,
+            set_param: None,
+            get_param: Some(fake_lfo_get_param),
+            get_error: None,
+            render_block: None,
+        }));
+
+        let mut slots = ChainSlots::new();
+        slots.slots[4] = Some(ChainInstance::for_test(api));
+
+        let report = slots.lfo_report(4);
+        assert_eq!(report, "lfo1=[synth:morph active=1 value=0.812345] lfo2=[: active=0 value=-]");
+    }
+
+    /* Freeze, end to end at the ChainSlots level (render needs a real chain
+     * host, so the vdev/device tiers cover the audio path; this pins the
+     * stages, the snapshot and the queue): capture -> frozen (snapshot taken,
+     * modules unloaded through the queue, `desired` untouched, saves read the
+     * snapshot) -> thaw (reloads WITH the preset, the loop plays until the
+     * loads are through, LFOs re-applied) -> live. */
+    unsafe extern "C" fn fake_freeze_get_param(
+        _inst: *mut c_void, key: *const c_char, buf: *mut c_char, buf_len: c_int,
+    ) -> c_int {
+        let k = unsafe { CStr::from_ptr(key) }.to_str().unwrap_or("");
+        let v = match k {
+            "synth:state" => "PRESET-BLOB",
+            "lfo1:target" => "synth",
+            "lfo1:rate_hz" => "2.5",
+            _ => "",
+        };
+        let bytes = v.as_bytes();
+        if bytes.len() as c_int >= buf_len {
+            return -1;
+        }
+        unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr() as *const c_char, buf, bytes.len()) };
+        bytes.len() as c_int
+    }
+
+    /* Amino keeps four instances in a static pool, so the fifth track's load
+     * fails inside schwung's chain host, which leaves the position empty and
+     * says nothing. The read-back is the only evidence; without this the UI
+     * showed a silent track and no reason. */
+    unsafe extern "C" fn fake_empty_get_param(
+        _inst: *mut c_void, _key: *const c_char, _buf: *mut c_char, _buf_len: c_int,
+    ) -> c_int {
+        0
+    }
+
+    unsafe extern "C" fn fake_amino_get_param(
+        _inst: *mut c_void, key: *const c_char, buf: *mut c_char, buf_len: c_int,
+    ) -> c_int {
+        let k = unsafe { CStr::from_ptr(key) }.to_str().unwrap_or("");
+        let v = if k == "synth_module" { "amino" } else { "" };
+        if v.len() as c_int >= buf_len {
+            return -1;
+        }
+        unsafe { core::ptr::copy_nonoverlapping(v.as_ptr() as *const c_char, buf, v.len()) };
+        v.len() as c_int
+    }
+
+    fn api_reading(get: unsafe extern "C" fn(*mut c_void, *const c_char, *mut c_char, c_int) -> c_int)
+        -> &'static plugin_api_v2_t {
+        Box::leak(Box::new(plugin_api_v2_t {
+            api_version: 0, create_instance: None, destroy_instance: None, on_midi: None,
+            set_param: None, get_param: Some(get), get_error: None, render_block: None,
+        }))
+    }
+
+    #[test]
+    fn a_refused_load_reaches_the_status() {
+        let mut slots = ChainSlots::new();
+        slots.install_for_test(3, ChainInstance::for_test(api_reading(fake_amino_get_param)));
+        slots.install_for_test(4, ChainInstance::for_test(api_reading(fake_empty_get_param)));
+        slots.check_load(3, "synth", "amino");
+        assert_eq!(slots.load_status(), " lde=0:0:-:-", "a load that took is not news");
+        slots.check_load(4, "synth", "amino");
+        assert_eq!(slots.load_status(), " lde=1:4:synth:amino");
+        slots.check_load(4, "synth", "");
+        assert_eq!(slots.load_status(), " lde=1:4:synth:amino", "a clear cannot be refused");
+    }
+
+    std::thread_local! {
+        static FREEZE_SETS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    unsafe extern "C" fn fake_freeze_set_param(_inst: *mut c_void, key: *const c_char, val: *const c_char) {
+        let k = unsafe { CStr::from_ptr(key) }.to_str().unwrap_or("").to_string();
+        let v = unsafe { CStr::from_ptr(val) }.to_str().unwrap_or("").to_string();
+        FREEZE_SETS.with(|s| s.borrow_mut().push(format!("{k}={v}")));
+    }
+
+    fn one_bar() -> crate::freeze::LoopMap {
+        crate::freeze::LoopMap::new(seq_core::TICKS_PER_BAR, 12_000, 44_100).unwrap()
+    }
+
+    fn bar_job(slot: usize) -> ClipJob {
+        ClipJob { slot, map: one_bar(), win: RecWindow { start_ticks: 0, len_ticks: seq_core::TICKS_PER_BAR } }
+    }
+
+    fn prints1() -> [Option<u64>; CLIPS_PER_TRACK] {
+        let mut p = [None; CLIPS_PER_TRACK];
+        p[0] = Some(1);
+        p
+    }
+
+    /// Render a freezing track's chain as a constant `level` until it is done.
+    fn capture_until_done(slots: &mut ChainSlots, t: usize, level: i16) {
+        let fpt = 44_100.0 * 60.0 / (120.0 * seq_core::PPQN as f64);
+        let len = seq_core::TICKS_PER_BAR as f64;
+        let mut n = 0usize;
+        while slots.freeze_capturing(t) {
+            n += 1;
+            let pos = ((n * 128) as f64 / fpt).rem_euclid(len);
+            slots.freeze_frame(|_| Some(LoopPos { slot: 0, pos, win_start: 0.0, win_len: len }), |_| None, 0, 12_000);
+            slots.work[t] = Work { synth: true, fx: true };
+            slots.scratch[t][..256].fill(level);
+            slots.freeze_tap(256);
+            assert!(n < 5_000, "never froze");
+        }
+    }
+
+    #[test]
+    fn freeze_snapshots_unloads_and_thaws_back_with_the_preset() {
+        let api: &'static plugin_api_v2_t = Box::leak(Box::new(plugin_api_v2_t {
+            api_version: 0,
+            create_instance: None,
+            destroy_instance: None,
+            on_midi: None,
+            set_param: Some(fake_freeze_set_param),
+            get_param: Some(fake_freeze_get_param),
+            get_error: None,
+            render_block: None,
+        }));
+        let mut slots = ChainSlots::new();
+        slots.slots[4] = Some(ChainInstance::for_test(api));
+        slots.desired[4] = vec![("synth".to_string(), "dexed".to_string())];
+        assert_eq!(slots.freeze_begin(5, Some(0), &[bar_job(0)], prints1()), Err("nochain"), "an empty track has nothing to freeze");
+        assert_eq!(slots.freeze_begin(4, Some(0), &[bar_job(0)], prints1()), Ok(()));
+        assert_eq!(slots.freeze_begin(4, Some(0), &[bar_job(0)], prints1()), Err("busy"));
+        let frames = 256; // samples (128 stereo frames), as render's `frames`
+        capture_until_done(&mut slots, 4, 1234);
+        assert!(slots.freeze_status().contains("frz=10 "), "{}", slots.freeze_status());
+        assert!(slots.freeze_status().contains(":4:frozen"));
+
+        // Frozen: the chain instance is gone (retired whole, nothing queued),
+        // the Set still names it, and a save reads the preset from the snapshot.
+        assert!(slots.slots[4].is_none());
+        assert!(!slots.queue.has_slot(4));
+        assert_eq!(slots.desired[4], vec![("synth".to_string(), "dexed".to_string())]);
+        assert_eq!(slots.get_param(4, "synth:state").as_deref(), Some("PRESET-BLOB"));
+        let mut out = vec![0i16; frames];
+        let len = seq_core::TICKS_PER_BAR as f64;
+        slots.freeze_frame(|_| Some(LoopPos { slot: 0, pos: 1.0, win_start: 0.0, win_len: len }), |_| None, 0, 12_000);
+        assert!(slots.freeze.play(4, &mut out));
+        assert!(out.iter().all(|&s| s == 1234), "the loop is what the chain rendered");
+
+        // Thaw: a load carrying the preset, into a fresh instance.
+        assert!(slots.freeze_thaw(4));
+        let req = slots.queue.take_one().expect("a reload is queued");
+        assert_eq!((req.slot, req.module.as_str(), req.state.as_deref()), (4, "dexed", Some("PRESET-BLOB")));
+        assert!(slots.queue.take_one().is_none());
+        slots.slots[4] = Some(ChainInstance::for_test(api)); // what service_loads' create does
+        assert!(slots.freeze.silences_chain(4), "still the loop until the next block's service");
+
+        FREEZE_SETS.with(|s| s.borrow_mut().clear());
+        slots.freeze_frame(|_| None, |_| None, 0, 12_000);
+        assert!(!slots.freeze.silences_chain(4), "the chain is back");
+        assert!(slots.freeze_status().contains(":4:thawed"));
+        let sets = FREEZE_SETS.with(|s| s.borrow().clone());
+        assert!(sets.contains(&"lfo1:target=synth".to_string()), "{sets:?}");
+        assert!(sets.contains(&"lfo1:rate_hz=2.5".to_string()));
+        assert!(!sets.iter().any(|s| s.ends_with('=')), "empty LFO fields are not written: {sets:?}");
+        assert_eq!(slots.get_param(4, "synth:state").as_deref(), Some("PRESET-BLOB"), "now from the live chain");
+        // The thaw also tells the Set's files: an empty manifest, no WAV.
+        let (m, wavs) = slots.take_freeze_files().expect("a thaw is a change");
+        assert!(crate::freeze_files::parse_manifest(&m).is_empty() && wavs.is_empty());
+        assert!(slots.take_freeze_files().is_none(), "once");
+    }
+
+    #[test]
+    fn a_freeze_hands_its_loop_and_manifest_to_the_saver() {
+        let api: &'static plugin_api_v2_t = Box::leak(Box::new(plugin_api_v2_t {
+            api_version: 0, create_instance: None, destroy_instance: None, on_midi: None,
+            set_param: Some(fake_freeze_set_param), get_param: Some(fake_freeze_get_param),
+            get_error: None, render_block: None,
+        }));
+        let mut slots = ChainSlots::new();
+        slots.slots[6] = Some(ChainInstance::for_test(api));
+        slots.desired[6] = vec![("synth".into(), "obxd".into()), ("fx1".into(), "mverb".into())];
+        let map = one_bar();
+        slots.freeze_begin(6, Some(0), &[bar_job(0)], prints1()).unwrap();
+        assert!(slots.take_freeze_files().is_none(), "a capture is not yet a change");
+        capture_until_done(&mut slots, 6, -77);
+        let (m, wavs) = slots.take_freeze_files().expect("frozen");
+        let e = crate::freeze_files::parse_manifest(&m);
+        assert_eq!(e.len(), 1);
+        assert_eq!((e[0].track, e[0].clips[0].frames, e[0].modules.as_str()), (6, map.frames(), "synth=obxd,fx1=mverb"));
+        /* Reviewed on device: the print taken from the live snapshot disagreed
+         * with the one an open reads back from chains.json, so every frozen
+         * track opened live after a reopen. It must be what a save writes. */
+        let doc = crate::chain_state::serialize(&mut slots);
+        assert_eq!(e[0].chain_print, crate::freeze_files::chain_print(&crate::chain_state::slot_params(&doc, 6)),
+                   "the manifest's print is the saved document's");
+        let (t, slot, samples, rate) = wavs[0].clone();
+        assert_eq!((wavs.len(), t, slot, samples.len(), rate), (1, 6, 0, map.frames() * 2, 44_100));
+        assert!(samples.iter().all(|&s| s == -77));
+        assert!(slots.freeze_status().contains("frzm=6:obxd"), "{}", slots.freeze_status());
+    }
+
+    #[test]
+    fn a_set_opens_frozen_only_when_its_chain_still_matches() {
+        let map = one_bar();
+        let win = RecWindow { start_ticks: 0, len_ticks: seq_core::TICKS_PER_BAR };
+        let clip0 = |print| crate::freeze_files::FrozenClip { slot: 0, map, samples: vec![5; map.frames() * 2], win, print, peaks: vec![] };
+        // A saved chains document: slot 2, synth obxd, with a preset and an LFO.
+        let lfo = crate::chain_state::pack(&{
+            let mut v = vec![String::new(); 22];
+            v[8] = "synth".into(); // lfo1:target
+            v
+        });
+        let doc = crate::chain_state::pack(&["2".into(), "synth".into(), "obxd".into(),
+                                              "BLOB".into(), String::new(), lfo]);
+        let print = crate::freeze_files::chain_print(&crate::chain_state::slot_params(&doc, 2));
+        let load = |modules: &str, chain_print: u64| FrozenLoad { track: 2, chain_print, modules: modules.into(),
+                                                                   clips: vec![clip0(0xabc)] };
+        let now = |print: Option<u64>, w: RecWindow| {
+            let mut c = [None; CLIPS_PER_TRACK];
+            c[0] = print.map(|p| (p, w));
+            c
+        };
+
+        let mut slots = ChainSlots::new();
+        assert!(crate::chain_state::restore(&mut slots, &doc));
+        assert!(slots.queue.has_slot(2), "the restore queued the chain");
+        assert!(!slots.freeze_install(load("synth=surge", print), &doc, now(Some(0xabc), win)), "another sound: opens live");
+        assert!(!slots.freeze_install(load("synth=obxd", print ^ 1), &doc, now(Some(0xabc), win)), "another preset: opens live");
+        assert!(slots.queue.has_slot(2));
+        assert!(!slots.freeze_install(load("synth=obxd", print), &doc, now(Some(0xdef), win)),
+                "another clip in the slot (a version from before the freeze): opens live");
+        assert!(!slots.freeze_install(load("synth=obxd", print), &doc, now(None, win)), "no clip at all");
+        let grown = RecWindow { start_ticks: 0, len_ticks: 2 * seq_core::TICKS_PER_BAR };
+        assert!(!slots.freeze_install(load("synth=obxd", print), &doc, now(Some(0xabc), grown)), "a window past the recording");
+        let mut extra = now(Some(0xabc), win);
+        extra[3] = Some((9, win));
+        assert!(!slots.freeze_install(load("synth=obxd", print), &doc, extra), "a clip added after the freeze");
+        assert!(slots.queue.has_slot(2));
+        let cut = RecWindow { start_ticks: seq_core::TICKS_PER_BAR / 2, len_ticks: seq_core::TICKS_PER_BAR / 2 };
+        assert!(slots.freeze_install(load("synth=obxd", print), &doc, now(Some(0xabc), cut)), "a shrunk window opens frozen");
+        assert!(slots.freeze_windows(2).is_some());
+        assert!(!slots.queue.has_slot(2), "its chain does not load");
+        assert_eq!(slots.freeze.frozen_mask(), 1 << 2);
+        assert_eq!(slots.get_param(2, "synth:state").as_deref(), Some("BLOB"), "a save writes the preset back");
+        assert_eq!(slots.get_param(2, "lfo1:target").as_deref(), Some("synth"));
+        // And the next thaw reloads it with that preset.
+        assert!(slots.freeze_thaw(2));
+        let r = slots.queue.take_one().unwrap();
+        assert_eq!((r.module.as_str(), r.state.as_deref()), ("obxd", Some("BLOB")));
+    }
+
+    /// An open's frozen tracks hold their loads until the loops are read
+    /// (lib.rs `frozen_due`): nothing loads meanwhile, yet the UI still sees
+    /// them pending, a preset sent for one rides it, and a save writes it.
+    #[test]
+    fn a_held_load_waits_for_the_frozen_read_and_keeps_its_preset() {
+        let doc = crate::chain_state::pack(&["2".into(), "synth".into(), "obxd".into(), "BLOB".into(), String::new(), String::new(),
+                                              "4".into(), "synth".into(), "plaits".into(), String::new(), String::new(), String::new()]);
+        let mut slots = ChainSlots::new();
+        assert!(crate::chain_state::restore(&mut slots, &doc));
+        let pending = slots.pending_loads();
+        slots.freeze_hold(1 << 2);
+        assert!(!slots.queue.has_slot(2) && slots.queue.has_slot(4), "only the manifest's track is held");
+        assert_eq!(slots.pending_loads(), pending, "held loads still count for the UI (chpend)");
+        assert_eq!(slots.get_param(2, "synth:state").as_deref(), Some("BLOB"), "a save meanwhile writes the preset");
+        slots.set_state(2, "synth", "NEWER");
+        assert_eq!(slots.get_param(2, "synth:state").as_deref(), Some("NEWER"), "a preset sent meanwhile rides the held load");
+
+        // The read did not bring the track back frozen: its chain loads, preset and all.
+        slots.freeze_unhold();
+        assert!(slots.queue.has_slot(2));
+        let r = std::iter::from_fn(|| slots.queue.take_one()).find(|r| r.slot == 2).unwrap();
+        assert_eq!((r.module.as_str(), r.state.as_deref()), ("obxd", Some("NEWER")));
+
+        // A load the UI asked for meanwhile is newer than the held one.
+        assert!(crate::chain_state::restore(&mut slots, &doc));
+        slots.freeze_hold(1 << 2);
+        slots.request_load(2, "synth", "surge");
+        slots.freeze_unhold();
+        let mods: Vec<String> = std::iter::from_fn(|| slots.queue.take_one()).filter(|r| r.slot == 2).map(|r| r.module).collect();
+        assert_eq!(mods, vec!["surge".to_string()]);
+    }
+
+    #[test]
+    fn a_capturing_or_frozen_chain_takes_only_note_offs_from_live_input() {
+        let mut slots = ChainSlots::new();
+        assert!(slots.freeze_admits(3, &[0x90, 60, 100]));
+        slots.freeze.begin_track(3, Some(0), &[bar_job(0)]).unwrap();
+        assert!(!slots.freeze_admits(3, &[0x90, 60, 100]), "a pad into the capture");
+        assert!(!slots.freeze_admits(3, &[0xB0, 1, 64]), "the mod wheel into the capture");
+        assert!(!slots.freeze_admits(3, &[0xE0, 0, 80]));
+        assert!(slots.freeze_admits(3, &[0x80, 60, 0]), "a release always passes");
+        assert!(slots.freeze_admits(4, &[0x90, 60, 100]), "other tracks play");
+    }
+
+    /// Reviewed on device: a frozen track's chain is retired but `desired`
+    /// still named it, so a Set with the same synth on that track looked
+    /// "already loaded", nothing was queued, and the track was silent.
+    #[test]
+    fn a_set_switch_reloads_a_frozen_tracks_chain_even_at_the_same_synth() {
+        let map = one_bar();
+        let win = RecWindow { start_ticks: 0, len_ticks: seq_core::TICKS_PER_BAR };
+        let doc = crate::chain_state::pack(&["2".into(), "synth".into(), "obxd".into(),
+                                              String::new(), String::new(), String::new()]);
+        let mut slots = ChainSlots::new();
+        assert!(crate::chain_state::restore(&mut slots, &doc));
+        let chain_print = crate::freeze_files::chain_print(&crate::chain_state::slot_params(&doc, 2));
+        let f = FrozenLoad { track: 2, chain_print, modules: "synth=obxd".into(), clips: vec![
+            crate::freeze_files::FrozenClip { slot: 0, map, samples: vec![5; map.frames() * 2], win, print: 1, peaks: vec![] }] };
+        let mut now = [None; CLIPS_PER_TRACK];
+        now[0] = Some((1, win));
+        assert!(slots.freeze_install(f, &doc, now));
+        assert!(!slots.queue.has_slot(2));
+        assert!(crate::chain_state::restore(&mut slots, &doc), "another Set, same synth on track 3");
+        assert!(slots.queue.has_slot(2), "the synth was not queued: the track would be silent");
+        assert_eq!(slots.freeze.frozen_mask(), 0);
+        assert!(slots.freeze_windows(2).is_none());
+    }
+
+    #[test]
+    fn a_set_replace_cancels_a_capture_and_says_so() {
+        let api: &'static plugin_api_v2_t = Box::leak(Box::new(plugin_api_v2_t {
+            api_version: 0, create_instance: None, destroy_instance: None, on_midi: None,
+            set_param: None, get_param: None, get_error: None, render_block: None,
+        }));
+        let mut slots = ChainSlots::new();
+        slots.slots[2] = Some(ChainInstance::for_test(api));
+        slots.desired[2] = vec![("synth".to_string(), "obxd".to_string())];
+        slots.freeze_begin(2, Some(0), &[bar_job(0)], prints1()).unwrap();
+        assert!(slots.set_chain_set(&crate::chain_doc::encode(&[])));
+        assert!(!slots.freeze_capturing(2));
+        assert!(slots.freeze_status().contains(":2:set"), "{}", slots.freeze_status());
+    }
+
+    /* The digest is compiled in permanently but must cost a set that never asks
+     * for it exactly one bool check per block — so "off until armed" is a
+     * property worth pinning, not an implementation detail. */
+    #[test]
+    fn the_digest_is_off_until_it_is_armed() {
+        let mut slots = ChainSlots::new();
+        assert!(slots.digest_report().starts_with("state=off "), "{}", slots.digest_report());
+        slots.digest_arm(64);
+        assert!(slots.digest_report().starts_with("state=armed window=64 "),
+            "{}", slots.digest_report());
+    }
+
+    /* Every on_midi a fake chain receives, as (instance tag, byte). The tag is
+     * the instance pointer, which the fake never dereferences. */
+    static RT_SEEN: std::sync::Mutex<Vec<(usize, u8)>> = std::sync::Mutex::new(Vec::new());
+
+    unsafe extern "C" fn fake_rt_on_midi(inst: *mut c_void, msg: *const u8, len: c_int, _src: c_int) {
+        if len == 1 {
+            RT_SEEN.lock().unwrap().push((inst as usize, unsafe { *msg }));
+        }
+    }
+
+    fn rt_chain(api: &'static plugin_api_v2_t, tag: usize) -> ChainInstance {
+        let mut c = ChainInstance::for_test(api);
+        c.set_inst_for_test(tag as *mut c_void);
+        c
+    }
+
+    /* The transport reached no chain at all (drain_out dropped Start/Clock/
+     * Stop), so a clock-driven module like breakbeat free-ran on the chain
+     * host's UNAVAILABLE status. Remove the broadcast and every chain hears
+     * nothing. */
+    #[test]
+    fn the_transport_reaches_every_chain_and_only_a_start_wakes() {
+        let api: &'static plugin_api_v2_t = Box::leak(Box::new(plugin_api_v2_t {
+            api_version: 2,
+            create_instance: None,
+            destroy_instance: None,
+            on_midi: Some(fake_rt_on_midi),
+            set_param: None,
+            get_param: None,
+            get_error: None,
+            render_block: None,
+        }));
+        let mut slots = ChainSlots::new();
+        slots.slots[2] = Some(rt_chain(api, 0x100));
+        slots.send_slots[1] = Some(rt_chain(api, 0x200));
+        slots.master.inst = Some(rt_chain(api, 0x300));
+
+        /* Put track 2 to sleep, then tick: a clock must reach it asleep. */
+        for _ in 0..crate::chain_idle::SLEEP_AFTER + 1 {
+            let w = slots.idle.plan(2);
+            slots.idle.observe(2, w, 0, 0, false);
+        }
+        assert!(slots.idle.deep_asleep(2), "precondition: the chain sleeps");
+
+        RT_SEEN.lock().unwrap().clear();
+        slots.broadcast_realtime(0xF8);
+        assert!(slots.idle.deep_asleep(2), "a clock tick must not wake a sleeping chain");
+        slots.broadcast_realtime(0xFA);
+        assert!(!slots.idle.deep_asleep(2), "a start wakes it for its downbeat");
+        slots.broadcast_realtime(0xFC);
+
+        let seen = RT_SEEN.lock().unwrap().clone();
+        for tag in [0x100, 0x200, 0x300] {
+            let bytes: Vec<u8> = seen.iter().filter(|(t, _)| *t == tag).map(|(_, b)| *b).collect();
+            assert_eq!(bytes, vec![0xF8, 0xFA, 0xFC], "chain {tag:#x} heard the whole transport");
+        }
+    }
+
+    /* Every three-byte on_midi a fake chain receives, as (tag, msg, source). */
+    static SC_SEEN: std::sync::Mutex<Vec<(usize, [u8; 3], c_int)>> = std::sync::Mutex::new(Vec::new());
+
+    unsafe extern "C" fn fake_sc_on_midi(inst: *mut c_void, msg: *const u8, len: c_int, src: c_int) {
+        if len == 3 {
+            let m = unsafe { std::slice::from_raw_parts(msg, 3) };
+            SC_SEEN.lock().unwrap().push((inst as usize, [m[0], m[1], m[2]], src));
+        }
+    }
+
+    /* A Ducker heard only its own track's notes, on channel 1, so it could
+     * never duck the bass to the kick. Remove the broadcast and the ducking
+     * chains below hear nothing from track 0. */
+    #[test]
+    fn a_tracks_notes_reach_every_ducker_on_the_tracks_channel() {
+        let api: &'static plugin_api_v2_t = Box::leak(Box::new(plugin_api_v2_t {
+            api_version: 2,
+            create_instance: None,
+            destroy_instance: None,
+            on_midi: Some(fake_sc_on_midi),
+            set_param: None,
+            get_param: None,
+            get_error: None,
+            render_block: None,
+        }));
+        let eared = |tag: usize| {
+            let mut c = rt_chain(api, tag);
+            c.set_ears_for_test(true);
+            c
+        };
+        let mut slots = ChainSlots::new();
+        slots.slots[0] = Some(rt_chain(api, 0x100));
+        slots.slots[5] = Some(eared(0x600));
+        slots.slots[7] = Some(rt_chain(api, 0x800));
+        slots.send_slots[0] = Some(eared(0x900));
+        slots.master.inst = Some(eared(0xA00));
+
+        SC_SEEN.lock().unwrap().clear();
+        slots.on_midi(0, &[0x90, 36, 100], MOVE_MIDI_SOURCE_INTERNAL);
+        slots.on_midi(0, &[0x80, 36, 0], MOVE_MIDI_SOURCE_INTERNAL);
+        slots.on_midi(0, &[0xB0, 1, 64], MOVE_MIDI_SOURCE_INTERNAL);
+        slots.on_midi(15, &[0x90, 40, 90], MOVE_MIDI_SOURCE_INTERNAL);
+
+        let seen = SC_SEEN.lock().unwrap().clone();
+        let heard = |tag: usize| -> Vec<([u8; 3], c_int)> {
+            seen.iter().filter(|(t, ..)| *t == tag).map(|(_, m, s)| (*m, *s)).collect()
+        };
+        let b = MOVE_MIDI_SOURCE_FX_BROADCAST;
+        for tag in [0x600, 0x900, 0xA00] {
+            assert_eq!(heard(tag), vec![([0x90, 36, 100], b), ([0x80, 36, 0], b), ([0x9F, 40, 90], b)],
+                "chain {tag:#x}: notes only, on the source track's channel");
+        }
+        assert_eq!(heard(0x800), vec![], "a chain without ears hears nothing (its LFOs would retrigger)");
+        assert_eq!(heard(0x100).len(), 3, "the track's own chain still gets its own MIDI, untouched");
+        assert!(heard(0x100).iter().all(|(_, s)| *s == MOVE_MIDI_SOURCE_INTERNAL));
+        assert!(!slots.idle.deep_asleep(0));
+    }
+
+    /// The whole point, stated as a property: nothing that skipped its render
+    /// may reach the mix, because its scratch buffer holds a stale block.
+    #[test]
+    fn a_chain_that_did_not_render_is_not_mixed() {
+        let mut slots = ChainSlots::new();
+        let mut out = vec![1234i16; SCRATCH_SAMPLES];
+        // No chain host on the host build, so nothing is loaded and nothing can
+        // render — every chain's work is NONE and the buffer must be untouched.
+        slots.render(&mut out);
+        assert!(out.iter().all(|&s| s == 1234));
+        assert_eq!(slots.active_count(), 0);
+    }
+
+    /* A mix param is not a chain-host param, so a mix lane writes the mixer
+     * directly. */
+    #[test]
+    fn a_mix_lane_writes_the_mixer_not_the_chain() {
+        let mut slots = ChainSlots::new();
+        slots.bind_lane(4, 2, LaneTarget::Mix(MixField::Pan));
+        assert!(slots.apply_lane(4, 2, 127), "lane 2 is a mix lane: consumed");
+        assert_eq!(slots.mix_csv(4).as_deref(), Some("1.0000,1.0000,0,0.0000,0.0000"));
+        assert!(slots.apply_lane(4, 2, 0));
+        assert_eq!(slots.mix_csv(4).as_deref(), Some("1.0000,-1.0000,0,0.0000,0.0000"),
+                   "pan spans -1..+1, so 0 is hard left");
+    }
+
+    #[test]
+    fn an_unbound_lane_writes_nothing() {
+        let mut slots = ChainSlots::new();
+        assert!(!slots.apply_lane(4, 0, 64));
+        assert!(!slots.apply_lane(4, AUTO_LANES as u8, 64), "past the last lane");
+        assert!(!slots.apply_lane(MOVY_CHAINS, 0, 64), "and an impossible chain never claims one");
+    }
+
+    #[test]
+    fn a_gain_lane_spans_the_full_fader() {
+        let mut slots = ChainSlots::new();
+        slots.bind_lane(4, 0, LaneTarget::Mix(MixField::Gain));
+        slots.apply_lane(4, 0, 127);
+        let m = slots.mix_csv(4).unwrap();
+        assert!(m.starts_with("4.0000,"), "127 is the top of the 0-4 fader, got {m}");
+    }
+
+    #[test]
+    fn a_send_lane_spans_zero_to_unity() {
+        let mut slots = ChainSlots::new();
+        slots.bind_lane(4, 1, LaneTarget::Mix(MixField::Send(1)));
+        slots.apply_lane(4, 1, 127);
+        assert_eq!(slots.mix_csv(4).as_deref(), Some("1.0000,0.0000,0,0.0000,1.0000"));
+    }
+
+    #[test]
+    fn releasing_a_lane_stops_it_writing() {
+        let mut slots = ChainSlots::new();
+        slots.bind_lane(4, 3, LaneTarget::Mix(MixField::Gain));
+        slots.bind_lane(4, 3, LaneTarget::None);
+        assert!(!slots.apply_lane(4, 3, 64));
+    }
+
+    /* A lane that survives a module swap must not survive into a different
+     * SET: the set document is a whole-set replace, and a stale binding would
+     * write a key the new set's module may also have. */
+    #[test]
+    fn a_new_set_document_clears_the_lane_bindings() {
+        let mut slots = ChainSlots::new();
+        slots.bind_lane(4, 0, LaneTarget::Mix(MixField::Gain));
+        assert!(slots.set_chain_set("0\n"));
+        assert!(!slots.apply_lane(4, 0, 64));
+    }
+
+    std::thread_local! {
+        static WRITES: core::cell::RefCell<Vec<String>> = const { core::cell::RefCell::new(Vec::new()) };
+    }
+
+    unsafe extern "C" fn recording_set_param(_inst: *mut c_void, key: *const c_char, val: *const c_char) {
+        let k = unsafe { CStr::from_ptr(key) }.to_string_lossy();
+        let v = unsafe { CStr::from_ptr(val) }.to_string_lossy();
+        WRITES.with(|w| w.borrow_mut().push(format!("{k}={v}")));
+    }
+
+    fn recording_slots() -> ChainSlots {
+        let api: &'static plugin_api_v2_t = Box::leak(Box::new(plugin_api_v2_t {
+            api_version: 0,
+            create_instance: None,
+            destroy_instance: None,
+            on_midi: None,
+            set_param: Some(recording_set_param),
+            get_param: None,
+            get_error: None,
+            render_block: None,
+        }));
+        let mut slots = ChainSlots::new();
+        slots.slots[4] = Some(ChainInstance::for_test(api));
+        WRITES.with(|w| w.borrow_mut().clear());
+        slots
+    }
+
+    /* D1: a param lane is a set_param on its bound key — no CC, no knob
+     * mapping, no 256-entry table to miss. Pad 16's key on a template rack is
+     * exactly the case the CC path dropped. */
+    #[test]
+    fn a_param_lane_writes_its_key_through_set_param() {
+        let mut slots = recording_slots();
+        let bind = |s: &mut ChainSlots, spec: &str| {
+            let (lane, t) = crate::auto_lane::parse(spec).unwrap();
+            s.bind_lane(4, lane, t);
+        };
+        bind(&mut slots, "0|f|0|1|synth:p15_tune");
+        bind(&mut slots, "31|i|0|10|fx1:mix");
+        bind(&mut slots, "7|n|synth:mode|Saw|Square");
+        bind(&mut slots, "8|e|2|synth:on");
+        assert!(slots.apply_lane(4, 0, 127));
+        assert!(slots.apply_lane(4, 31, 64));
+        assert!(slots.apply_lane(4, 7, 100));
+        assert!(slots.apply_lane(4, 8, 63));
+        WRITES.with(|w| assert_eq!(*w.borrow(), vec![
+            "synth:p15_tune=1.0000", "fx1:mix=5", "synth:mode=Square", "synth:on=0",
+        ]));
+        // No chain loaded on a slot: the bind stands, nothing is written.
+        slots.bind_lane(5, 0, crate::auto_lane::parse("0|f|0|1|synth:x").unwrap().1);
+        assert!(!slots.apply_lane(5, 0, 64));
+    }
+
+    /* A send bus is not a chain. It rides the same load queue — so the
+     * one-load-per-audio-callback bound covers it — under a slot number above
+     * every track, because `ch<N>` IS track N and a collision there would load
+     * a reverb into somebody's synth. */
+    #[test]
+    fn a_send_load_is_queued_above_every_chain() {
+        let mut slots = ChainSlots::new();
+        slots.request_send_load(0, "reverb");
+        assert_eq!(slots.pending_loads(), 1, "a send load rides the shared queue");
+        slots.request_send_load(1, "delay");
+        assert_eq!(slots.pending_loads(), 2, "the two buses are separate requests");
+    }
+
+    #[test]
+    fn a_send_bus_that_cannot_exist_is_refused() {
+        let mut slots = ChainSlots::new();
+        slots.request_send_load(SEND_BUSES, "reverb");
+        assert_eq!(slots.pending_loads(), 0, "there are only two buses");
+    }
+
+    /* Every send accessor is reachable before a module has ever been loaded —
+     * the UI reads a slot to decide whether to draw "click jog to add". */
+    #[test]
+    fn an_empty_send_answers_without_panicking() {
+        let mut slots = ChainSlots::new();
+        assert_eq!(slots.send_get_param(0, "fx1_module"), None);
+        slots.send_param(0, "fx1:mix", "0.5");
+        slots.set_send_state(0, "blob");
+        assert!(!slots.sends_dirty());
+    }
+
+    /* The mix is movy's own state — no chain-host param carries it — so it was
+     * write-only: `get_param` forwarded `mix` to the instance, which does not
+     * know the key, and every reader fell back to unity. That is why the volume
+     * gesture always restarted at 0 dB and why nothing could save the level. */
+    #[test]
+    fn the_mix_reads_back_what_was_set() {
+        let mut slots = ChainSlots::new();
+        assert_eq!(slots.mix_csv(4).as_deref(), Some("1.0000,0.0000,0,0.0000,0.0000"),
+                   "unity, centred, no sends by default");
+        slots.set_mix(4, TrackMix { gain: 0.3162, pan: -0.5, muted: true,
+                                    send: [0.25, 0.0, 0.0] });
+        assert_eq!(slots.mix_csv(4).as_deref(), Some("0.3162,-0.5000,1,0.2500,0.0000"));
+        assert_eq!(slots.mix_csv(5).as_deref(), Some("1.0000,0.0000,0,0.0000,0.0000"),
+                   "one slot only");
+        assert_eq!(slots.mix_csv(MOVY_CHAINS), None, "out of range");
+    }
+
+    /* A set document is a whole-set replace. Without this the level set in one
+     * Set went on attenuating whatever the next Set loaded into that chain. */
+    #[test]
+    fn a_new_set_document_clears_the_mixes() {
+        let mut slots = ChainSlots::new();
+        slots.set_mix(4, TrackMix { gain: 0.1, ..TrackMix::default() });
+        assert!(slots.set_chain_set("0\n"));
+        assert_eq!(slots.mix_csv(4).as_deref(), Some("1.0000,0.0000,0,0.0000,0.0000"));
+    }
+
+    #[test]
+    fn renders_nothing_when_empty() {
+        let mut slots = ChainSlots::new();
+        let mut out = vec![1234i16; SCRATCH_SAMPLES];
+        slots.render(&mut out);
+        assert!(out.iter().all(|&s| s == 1234),
+            "an empty slot set must not touch the output buffer");
+    }
+
+    #[test]
+    fn no_chain_host_means_no_panic_anywhere() {
+        let mut slots = ChainSlots::new();
+        assert!(!slots.is_available());
+        slots.request_load(0, "synth", "plaits");
+        slots.service_loads();
+        slots.set_param(0, "synth:cutoff", "0.5");
+        slots.on_midi(0, &[0x90, 60, 100], 0);
+        let mut out = vec![0i16; SCRATCH_SAMPLES];
+        slots.render(&mut out);
+        assert_eq!(slots.get_param(0, "synth:cutoff"), None);
+    }
+
+    #[test]
+    fn out_of_range_slots_are_ignored() {
+        let mut slots = ChainSlots::new();
+        /* The last bus is a real slot — a track's is not the only numbered
+         * thing here any more. One past it is not. */
+        slots.request_load(send_index(SEND_BUSES - 1), SEND_COMPONENT, "mverb");
+        assert_eq!(slots.pending_loads(), 1, "the last bus is loadable");
+        /* The master's slot exists, but holds audio FX only. */
+        slots.request_load(master_index(), "synth", "plaits");
+        slots.request_load(DOC_SLOTS, "fx1", "mverb");
+        slots.request_load(999, "synth", "plaits");
+        assert_eq!(slots.pending_loads(), 1, "neither impossible slot joined the one real load");
+        slots.set_param(999, "synth:cutoff", "1");
+        slots.on_midi(999, &[0x90, 60, 100], 0);
+    }
+
+    /* The lane count is fixed at `LANES` now, so what has to hold is that
+     * everything sized by it agrees. A plan with more lanes than the task-list
+     * vector indexes out of range on the audio thread, and the send phase has a
+     * second planner that would go unnoticed if it disagreed. */
+
+    #[test]
+    fn everything_sized_by_the_lane_count_agrees_on_it() {
+        let slots = ChainSlots::new();
+        assert_eq!(slots.planner.lane_count(), LANES);
+        assert_eq!(slots.lanes.len(), LANES, "and so do the task lists it is copied into");
+        assert_eq!(slots.send_planner.lane_count(), LANES, "the send phase plans the same lanes");
+        assert_eq!(slots.send_lanes.len(), LANES);
+        assert!(slots.render_report().contains(&format!("lanes={LANES}")));
+    }
+
+    #[test]
+    fn a_changed_lane_count_resizes_everything_sized_by_it() {
+        let mut slots = ChainSlots::new();
+        for (asked, got) in [(4, 4), (9, MAX_LANES), (0, 1), (LANES, LANES)] {
+            slots.set_lane_count(asked);
+            assert_eq!(slots.planner.lane_count(), got);
+            assert_eq!(slots.lanes.len(), got);
+            assert_eq!(slots.send_planner.lane_count(), got);
+            assert_eq!(slots.send_lanes.len(), got);
+            assert!(slots.render_report().contains(&format!("lanes={got}")));
+        }
+    }
+
+    /// Spawning blocks, so it may never happen on the audio thread — which is
+    /// what `configure` being the only spawn site buys. Constructing the engine
+    /// must therefore start no threads, and a chain host that fails to load
+    /// must start none either: movy still sequences its host tracks without one.
+    #[test]
+    fn no_chain_host_means_no_helper_threads() {
+        let mut slots = ChainSlots::new();
+        assert!(slots.pool.is_none(), "constructing the engine spawned threads");
+        slots.configure("/nonexistent", "/nonexistent/dsp.so");
+        assert!(slots.host_failed);
+        assert!(slots.pool.is_none(), "a failed chain host still spawned threads");
+    }
+
+    /* Pinning is containment, so the ways it can fail quietly matter more than
+     * the ways it can fail loudly: a set that thinks it pinned a racing module
+     * and did not sounds exactly like one that had nothing to pin. */
+
+    /// The blacklist rewrites the planner's keys, so it needs the same
+    /// replan — a module blacklisted mid-set must stop racing THIS block, not in
+    /// `REPLAN_BLOCKS`.
+    #[test]
+    fn blacklisting_forces_a_replan_too() {
+        let mut slots = ChainSlots::new();
+        slots.plan_generation = slots.generation;
+        slots.set_blacklist("helm");
+        assert_eq!(slots.plan_generation, u32::MAX);
+    }
+
+    /// The blacklist is the only containment left, and a harness cannot infer
+    /// it: a set with no duplicated module plans identically whatever the list
+    /// holds, so a list that never arrived looks exactly like one with nothing
+    /// to do.
+    #[test]
+    fn the_report_says_what_the_blacklist_holds() {
+        let mut slots = ChainSlots::new();
+        assert!(slots.render_report().contains("blocked=0"), "free is the default");
+        slots.set_blacklist("helm,obxd");
+        let r = slots.render_report();
+        assert!(r.contains("blocked=2"), "the blacklist is reported: {r}");
+    }
+
+    #[test]
+    fn loads_are_queued_not_applied_inline() {
+        let mut slots = ChainSlots::new();
+        slots.request_load(0, "synth", "plaits");
+        slots.request_load(1, "synth", "obxd");
+        assert_eq!(slots.pending_loads(), 2, "requesting does not load");
+    }
+
+    #[test]
+    fn service_releases_one_load_per_call() {
+        let mut slots = ChainSlots::new();
+        for i in 0..MOVY_CHAINS {
+            slots.request_load(i, "synth", "plaits");
+        }
+        assert_eq!(slots.pending_loads(), MOVY_CHAINS);
+        slots.service_loads();
+        assert_eq!(
+            slots.pending_loads(),
+            MOVY_CHAINS - 1,
+            "one callback releases exactly one load"
+        );
+    }
+
+    #[test]
+    fn teardown_clears_pending_work() {
+        let mut slots = ChainSlots::new();
+        slots.request_load(0, "synth", "plaits");
+        slots.teardown();
+        assert_eq!(slots.pending_loads(), 0);
+    }
+
+    #[test]
+    fn a_failed_host_is_not_retried_forever() {
+        let mut slots = ChainSlots::new();
+        slots.configure("/nonexistent/chain", "/nonexistent/chain/dsp.so");
+        assert!(!slots.is_available());
+        assert!(slots.host_failed, "a broken install must not be re-dlopened every block");
+        slots.configure("/nonexistent/chain", "/nonexistent/chain/dsp.so");
+        assert!(!slots.is_available());
+    }
+
+    /* ── the chain set as a document ──────────────────────────────────────────
+     * The set used to cross the wire as one unacknowledged write per component,
+     * and a save read back whatever had survived — so a dropped write deleted a
+     * module from the set file. `desired` is what was ASKED for, which is what
+     * a save has to report. See plans/2026-08-29-chain-set-document.md. */
+
+    #[test]
+    fn the_set_reports_what_was_requested_not_what_has_loaded() {
+        let mut slots = ChainSlots::new();
+        slots.request_load(4, "synth", "noisemaker");
+        assert_eq!(slots.pending_loads(), 1, "nothing has loaded yet");
+        assert_eq!(
+            chain_doc::decode(&slots.chain_set()),
+            Some(vec![chain_doc::Entry { slot: 4, component: "synth".into(),
+                                         module: "noisemaker".into() }]),
+            "a queued load is already part of the set"
+        );
+    }
+
+    /* A send bus is part of the set for the same reason a track's chain is:
+     * the document is what a save writes down. Left out of it, a send FX is
+     * loaded, audible, and absent from the Set file — it simply does not come
+     * back. */
+    #[test]
+    fn a_send_bus_is_part_of_the_set_the_engine_reports() {
+        let mut slots = ChainSlots::new();
+        slots.request_send_load(1, "mverb");
+        assert_eq!(
+            chain_doc::decode(&slots.chain_set()),
+            Some(vec![chain_doc::Entry { slot: send_index(1), component: SEND_COMPONENT.into(),
+                                         module: "mverb".into() }]),
+            "a loaded send must be in the document a save reads"
+        );
+    }
+
+    /* The other half of the same round trip: a Set file NAMES its sends, and
+     * applying it has to queue them. `request_load` refuses every slot above
+     * MOVY_CHAINS, so a send in a document used to be dropped at the door —
+     * silently, which is why nothing ever failed loudly. */
+    #[test]
+    fn applying_a_set_queues_the_sends_it_names() {
+        let mut slots = ChainSlots::new();
+        let doc = chain_doc::encode(&[chain_doc::Entry {
+            slot: send_index(0), component: SEND_COMPONENT.into(), module: "mverb".into(),
+        }]);
+        assert!(slots.set_chain_set(&doc));
+        assert_eq!(slots.pending_loads(), 1, "a named send is queued like a chain");
+    }
+
+    /* A restored send's preset has to reach the load it was queued with — the
+     * load path bails above `MOVY_CHAINS`, so without its own hop the module
+     * arrives with the patch left behind. A send that comes back at the
+     * module's shipped defaults is the "my filter reopened" loss one page out
+     * from where it was first paid for. */
+    #[test]
+    fn a_sets_send_preset_rides_the_load_that_queued_it() {
+        fn doc(items: &[&str]) -> String {
+            let mut out = format!("{}\n", items.len());
+            for it in items {
+                out.push_str(&format!("{}\n{}", it.len(), it));
+            }
+            out
+        }
+        let mut slots = ChainSlots::new();
+        let saved = doc(&[&send_index(0).to_string(), SEND_COMPONENT, "mverb", "PATCH", "", ""]);
+        assert!(crate::chain_state::restore(&mut slots, &saved));
+        let req = slots.queue.take_one().expect("the send's load is queued");
+        assert_eq!((req.slot, req.component.as_str()), (send_index(0), SEND_COMPONENT));
+        assert_eq!(req.state.as_deref(), Some("PATCH"), "the patch rides the load");
+    }
+
+    /* The SAVE half of that round trip, and it is the half that was missing.
+     * `chain_state::serialize` read every record's blob through `get_param`,
+     * which is `.get`-based over `slots` — MOVY_CHAINS entries — so a bus's
+     * slot indexed past the end of it and answered None. Every send therefore
+     * went into the file with an empty blob, and a restore re-loaded the module
+     * with `fx1:state` never set: the module came back and its knobs did not.
+     *
+     * The fake answers `fx1:state` because that is the key the LIVE instance
+     * holds it under — the accessor translates the bus, not the key. */
+    #[test]
+    fn a_live_sends_preset_reaches_the_file() {
+        unsafe extern "C" fn fake_send_get_param(
+            _inst: *mut c_void, key: *const c_char, buf: *mut c_char, buf_len: c_int,
+        ) -> c_int {
+            let k = unsafe { CStr::from_ptr(key) }.to_str().unwrap_or("");
+            let v = match k {
+                "fx1:state" => "PATCH",
+                _ => "",
+            };
+            let bytes = v.as_bytes();
+            if bytes.len() as c_int >= buf_len {
+                return -1;
+            }
+            unsafe {
+                core::ptr::copy_nonoverlapping(bytes.as_ptr() as *const c_char, buf, bytes.len());
+            }
+            bytes.len() as c_int
+        }
+        let api: &'static plugin_api_v2_t = Box::leak(Box::new(plugin_api_v2_t {
+            api_version: 0,
+            create_instance: None,
+            destroy_instance: None,
+            on_midi: None,
+            set_param: None,
+            get_param: Some(fake_send_get_param),
+            get_error: None,
+            render_block: None,
+        }));
+
+        let mut slots = ChainSlots::new();
+        slots.request_send_load(0, "mverb");
+        slots.send_slots[0] = Some(ChainInstance::for_test(api));
+
+        let saved = crate::chain_state::serialize(&mut slots);
+        let items = crate::chain_state::parse_items(&saved).expect("the file parses");
+        assert_eq!(items.len(), 6, "one record: the bus");
+        assert_eq!(items[3], "PATCH", "a send's patch belongs in the Set file");
+
+        /* And the whole point of writing it down: reopening the Set hands it
+         * back to the load that will re-create the module. */
+        let mut reopened = ChainSlots::new();
+        assert!(crate::chain_state::restore(&mut reopened, &saved));
+        let req = reopened.queue.take_one().expect("the send is queued again");
+        assert_eq!(req.state.as_deref(), Some("PATCH"), "knobs and all");
+    }
+
+    /* `loaded_report` is a device test's only read-back for a movy chain, so
+     * the one thing it must never do is echo the request as though it were
+     * evidence: a fixture that "verified" against `desired` would pass while
+     * every module failed to instantiate. There is no chain host on the host
+     * build, so a queued load here is exactly that unloaded case. */
+    #[test]
+    fn the_loaded_report_marks_a_component_that_has_not_instantiated() {
+        let mut slots = ChainSlots::new();
+        assert_eq!(slots.loaded_report(), "-", "no chains, nothing to report");
+        slots.request_load(4, "synth", "noisemaker");
+        assert_eq!(
+            slots.loaded_report(),
+            "4:synth=noisemaker?",
+            "a queued load is a request, not a loaded module"
+        );
+    }
+
+    #[test]
+    fn clearing_a_component_removes_it_from_the_set() {
+        let mut slots = ChainSlots::new();
+        slots.request_load(4, "synth", "noisemaker");
+        slots.request_load(4, "synth", "");
+        assert_eq!(chain_doc::decode(&slots.chain_set()), Some(vec![]));
+    }
+
+    #[test]
+    fn a_document_queues_every_component_it_names() {
+        let mut slots = ChainSlots::new();
+        let doc = chain_doc::encode(&(0..MOVY_CHAINS)
+            .map(|i| chain_doc::Entry { slot: i, component: "synth".into(),
+                                        module: "noisemaker".into() })
+            .collect::<Vec<_>>());
+        assert!(slots.set_chain_set(&doc));
+        assert_eq!(slots.pending_loads(), MOVY_CHAINS,
+            "one message delivers the whole set");
+        assert_eq!(slots.chain_set(), doc, "and the set reads back identically");
+    }
+
+    #[test]
+    fn a_document_clears_what_it_does_not_name() {
+        let mut slots = ChainSlots::new();
+        slots.request_load(4, "synth", "noisemaker");
+        slots.request_load(5, "synth", "plaits");
+        assert!(slots.set_chain_set(&chain_doc::encode(&[chain_doc::Entry {
+            slot: 5, component: "synth".into(), module: "plaits".into() }])));
+        assert_eq!(
+            chain_doc::decode(&slots.chain_set()),
+            Some(vec![chain_doc::Entry { slot: 5, component: "synth".into(),
+                                         module: "plaits".into() }]),
+            "chain 4 is gone from the set"
+        );
+    }
+
+    #[test]
+    fn a_component_both_sets_want_is_left_alone() {
+        /* A full teardown dlcloses and dlopens to arrive back where we started,
+         * and schwung's own note on this is that it has caused audio dropouts. */
+        let mut slots = ChainSlots::new();
+        let doc = chain_doc::encode(&[chain_doc::Entry {
+            slot: 4, component: "synth".into(), module: "noisemaker".into() }]);
+        assert!(slots.set_chain_set(&doc));
+        while slots.pending_loads() > 0 { slots.service_loads(); }
+        assert!(slots.set_chain_set(&doc));
+        assert_eq!(slots.pending_loads(), 0, "the same set queues no work");
+    }
+
+    #[test]
+    fn a_replaced_module_is_queued_once_not_cleared_and_reloaded() {
+        let mut slots = ChainSlots::new();
+        slots.request_load(4, "synth", "noisemaker");
+        while slots.pending_loads() > 0 { slots.service_loads(); }
+        assert!(slots.set_chain_set(&chain_doc::encode(&[chain_doc::Entry {
+            slot: 4, component: "synth".into(), module: "plaits".into() }])));
+        assert_eq!(slots.pending_loads(), 1, "one load, not a clear plus a load");
+    }
+
+    #[test]
+    fn a_malformed_document_changes_nothing() {
+        /* The dangerous reading: a truncated write decoding as "no chains" and
+         * unloading the user's set. */
+        let mut slots = ChainSlots::new();
+        slots.request_load(4, "synth", "noisemaker");
+        let before = slots.chain_set();
+        assert!(!slots.set_chain_set("3\n1\n4"), "a torn document is refused");
+        assert_eq!(slots.chain_set(), before);
+    }
+
+    #[test]
+    fn an_out_of_range_slot_never_enters_the_set() {
+        let mut slots = ChainSlots::new();
+        assert!(slots.set_chain_set(&chain_doc::encode(&[chain_doc::Entry {
+            slot: DOC_SLOTS, component: "fx1".into(), module: "plaits".into() }])));
+        assert_eq!(chain_doc::decode(&slots.chain_set()), Some(vec![]));
+    }
+
+    /* A bus holds one FX under one component, which the engine hard-codes, so
+     * a document that names a different component at a bus slot is malformed:
+     * honouring it would load the module where nothing can read it back. */
+    #[test]
+    fn a_document_cannot_load_a_bus_under_another_component() {
+        let mut slots = ChainSlots::new();
+        assert!(slots.set_chain_set(&chain_doc::encode(&[chain_doc::Entry {
+            slot: send_index(0), component: "synth".into(), module: "plaits".into() }])));
+        assert_eq!(slots.pending_loads(), 0, "a malformed bus entry queues nothing");
+        assert_eq!(chain_doc::decode(&slots.chain_set()), Some(vec![]));
+    }
+
+
+    /* ── send-bus co-location ─────────────────────────────────────────────────
+     * The planner half. `arm_colocated` and the tap building need a chain host
+     * and are covered on device; the ORDERING and the accept/refuse rule are
+     * the parts that can be wrong silently, and both are decided here.
+     * See plans/2026-09-07-send-bus-colocation.md. */
+
+    /// Load `n` chains at `ns` each, as a block of real rendering would.
+    fn chains(slots: &mut ChainSlots, costs: &[u64]) {
+        for (i, &ns) in costs.iter().enumerate() {
+            slots.cost.add_ns(i, ns);
+            slots.loaded[i] = true;
+        }
+    }
+
+    /// The shape the measurement was taken in: a busy set with two light chains
+    /// in it. Ten chains at 150 us and two at 40 us — the light ones are the
+    /// feeders, as `plaits` at 41 us was on device.
+    ///
+    /// The shape MATTERS and a uniform set is the wrong fixture: with equal
+    /// chains a static partition has no slack, so an indivisible group raises
+    /// the makespan by exactly the bus's cost and co-location correctly refuses.
+    /// Twelve equal chains would test the refusal, not the mechanism.
+    fn busy_set(slots: &mut ChainSlots) {
+        chains(slots, &[150_000; 10]);
+        slots.cost.add_ns(10, 40_000);
+        slots.cost.add_ns(11, 40_000);
+        slots.loaded[10] = true;
+        slots.loaded[11] = true;
+    }
+
+    /// Track `c` sends to bus `n`.
+    fn sends_to(slots: &mut ChainSlots, c: usize, n: usize) {
+        slots.mixes[c].send[n] = 1.0;
+    }
+
+    /// The lane holding a bus, and what is on it.
+    fn lane_of(slots: &ChainSlots, bus: usize) -> Option<Vec<usize>> {
+        slots
+            .planner
+            .lanes
+            .iter()
+            .find(|l| l.contains(&send_index(bus)))
+            .map(|l| l.clone())
+    }
+
+    /// The safety property, and the whole mechanism in one assertion: a bus must
+    /// share a lane with every track feeding it, and must come AFTER them.
+    ///
+    /// Before it, the FX processes a partial sum — silent, and audible only as a
+    /// send that is quietly missing a track. On another lane it is a data race
+    /// on the bus buffer.
+    #[test]
+    fn a_bus_lands_behind_every_chain_that_feeds_it() {
+        let mut slots = ChainSlots::new();
+        busy_set(&mut slots);
+        sends_to(&mut slots, 10, 0);
+        sends_to(&mut slots, 11, 0);
+        cost(&mut slots, 0, 200_000);
+        slots.plan_with_colocation();
+
+        let lane = lane_of(&slots, 0).expect("the bus was not co-located at all");
+        let bus_at = lane.iter().position(|&x| x == send_index(0)).unwrap();
+        for feeder in [10usize, 11] {
+            let at = lane
+                .iter()
+                .position(|&x| x == feeder)
+                .unwrap_or_else(|| panic!("feeder {feeder} is on another lane: {lane:?}"));
+            assert!(at < bus_at, "feeder {feeder} renders after its bus: {lane:?}");
+        }
+    }
+
+    /// The refusal case is a SPARSE set, not a heavy bus.
+    ///
+    /// One chain feeding one bus: the other lanes have nothing to run
+    /// underneath it, so the group IS the block either way and the plan buys
+    /// nothing. This is the fixture `measure-send-cost.sh` uses — one synth at
+    /// ~36 us — and it is why that fixture could not have measured this change.
+    #[test]
+    fn a_bus_with_nothing_to_overlap_keeps_the_send_phase() {
+        let mut slots = ChainSlots::new();
+        chains(&mut slots, &[40_000]);
+        sends_to(&mut slots, 0, 0);
+        cost(&mut slots, 0, 2_000_000);
+        slots.plan_with_colocation();
+        assert_eq!(slots.colocated_mask(), 0, "a lone chain has nothing to hide a bus behind");
+    }
+
+    /// A bus far heavier than the whole partition is still taken, as long as the
+    /// other lanes have work to run underneath it — a 2 ms bus beside 600 us of
+    /// chains costs 2040 us co-located against 2600 us serial.
+    ///
+    /// Worth pinning because it is the counter-intuitive half: the rule is not
+    /// "is the bus small enough to hide", it is "does the BLOCK get shorter".
+    /// A guard written on the first reading would refuse the biggest saving
+    /// available and look conservative doing it.
+    #[test]
+    fn a_bus_heavier_than_the_partition_is_still_taken() {
+        let mut slots = ChainSlots::new();
+        busy_set(&mut slots);
+        sends_to(&mut slots, 10, 0);
+        cost(&mut slots, 0, 2_000_000);
+        slots.plan_with_colocation();
+        assert_eq!(slots.colocated_mask(), 1, "600 us of chains can run under a 2 ms bus");
+    }
+
+    /// Before a bus has rendered its cost is zero, and a partition built on a
+    /// guess is one nobody priced. It bootstraps instead: the send phase runs
+    /// it, the cost settles, and the next replan can see it.
+    #[test]
+    fn an_unmeasured_bus_is_not_colocated() {
+        let mut slots = ChainSlots::new();
+        busy_set(&mut slots);
+        sends_to(&mut slots, 10, 0);
+        slots.plan_with_colocation();
+        assert_eq!(slots.colocated_mask(), 0, "a bus that has never rendered was planned for");
+    }
+
+    /// A pinned feeder disqualifies its bus. Honouring both constraints would
+    /// mean merging groups transitively; declining leaves the bus exactly where
+    /// a pinned set has it today. See `chain_colo::group_is_free`.
+    #[test]
+    fn a_pinned_feeder_keeps_its_bus_in_the_send_phase() {
+        let mut slots = ChainSlots::new();
+        busy_set(&mut slots);
+        sends_to(&mut slots, 10, 0);
+        cost(&mut slots, 0, 200_000);
+        slots.pin.set_key_for_test(10, "sound_generators/helm");
+        slots.plan_with_colocation();
+        assert_eq!(slots.colocated_mask(), 0);
+    }
+
+    /// Two buses fed by one track cannot both claim it. The second is refused
+    /// rather than merged into the first's group — merging makes one longer lane,
+    /// which is the outcome the rule exists to avoid.
+    #[test]
+    fn two_buses_cannot_both_claim_one_feeder() {
+        let mut slots = ChainSlots::new();
+        busy_set(&mut slots);
+        sends_to(&mut slots, 10, 0);
+        sends_to(&mut slots, 10, 1);
+        cost(&mut slots, 0, 200_000);
+        cost(&mut slots, 1, 150_000);
+        slots.plan_with_colocation();
+        assert_eq!(
+            slots.colocated_mask().count_ones(),
+            1,
+            "both buses took the same feeder: {:x}",
+            slots.colocated_mask()
+        );
+        assert_eq!(slots.colocated_mask(), 1, "the heavier bus is offered the lane first");
+    }
+
+    /// Two buses fed by DIFFERENT tracks are independent groups and both get a
+    /// lane. Only a SHARED feeder forces a choice — see the test above.
+    ///
+    /// Worth its own test because the refusal above is easy to over-apply: a
+    /// rule that declined "a second bus" rather than "a second claim on one
+    /// track" would silently halve the feature for anyone using two sends,
+    /// which is the ordinary way to use them.
+    #[test]
+    fn two_buses_on_separate_feeders_both_get_a_lane() {
+        let mut slots = ChainSlots::new();
+        busy_set(&mut slots);
+        sends_to(&mut slots, 10, 0);
+        sends_to(&mut slots, 11, 1);
+        cost(&mut slots, 0, 200_000);
+        cost(&mut slots, 1, 150_000);
+        slots.plan_with_colocation();
+        assert_eq!(slots.colocated_mask(), 0b11, "both buses must be co-located");
+        for bus in 0..2 {
+            let lane = lane_of(&slots, bus).unwrap();
+            let at = lane.iter().position(|&x| x == send_index(bus)).unwrap();
+            let feeder = 10 + bus;
+            let f = lane
+                .iter()
+                .position(|&x| x == feeder)
+                .unwrap_or_else(|| panic!("bus {bus} left its feeder behind: {lane:?}"));
+            assert!(f < at, "bus {bus} renders before its feeder: {lane:?}");
+        }
+    }
+
+    /* The replan trigger. A feeder appearing on another lane under a stale plan
+     * is two threads writing one bus buffer, so this is a correctness rule and
+     * not a balance one. */
+
+    #[test]
+    fn a_send_gain_crossing_zero_forces_a_replan() {
+        let mut slots = ChainSlots::new();
+        let mut m = TrackMix::default();
+        m.send[0] = 0.4;
+        slots.set_mix(2, m);
+        assert!(slots.plan_dirty, "a track began feeding a bus and the plan did not know");
+    }
+
+    /// The other half, and the reason this compares against zero rather than for
+    /// equality: an automation lane rides a send every block, and a replan on
+    /// every one of them would churn the partition for nothing.
+    #[test]
+    fn riding_a_send_does_not_force_a_replan() {
+        let mut slots = ChainSlots::new();
+        let mut m = TrackMix::default();
+        m.send[0] = 0.3;
+        slots.set_mix(2, m);
+        slots.plan_dirty = false;
+        m.send[0] = 0.4;
+        slots.set_mix(2, m);
+        assert!(!slots.plan_dirty, "a gain change is not a feeder change");
+        m.send[0] = 0.0;
+        slots.set_mix(2, m);
+        assert!(slots.plan_dirty, "but turning it off is");
+    }
+
+    /* The send phase's fan-out decision. `render` itself is unreachable on a
+     * host build — it returns before the phase when there is no chain host, the
+     * same reason `send_bus.rs` asserts the zero-cost rule in its own file — but
+     * `plan_sends` is the whole decision and needs nothing loaded. */
+
+    /// Seed a bus's measured cost, as a block of real rendering would.
+    fn cost(slots: &mut ChainSlots, bus: usize, ns: u64) {
+        slots.sends.add_cost(bus, ns);
+    }
+
+    /// Exactly these buses are running this block; every other one is retired.
+    /// Sized from `SEND_BUSES` rather than written out, so adding a bus does not
+    /// silently shorten the slice these tests hand the planner.
+    fn running(slots: &mut ChainSlots, buses: &[usize]) {
+        slots.send_work = vec![false; SEND_BUSES];
+        for &b in buses {
+            slots.send_work[b] = true;
+        }
+    }
+
+    /* What the CPU page's capacity bar is over. `render` cannot be driven on a
+     * host build, so the rule lives in `close_block` and is asserted there. */
+
+    #[test]
+    fn the_capacity_bar_counts_the_send_phase() {
+        let mut slots = ChainSlots::new();
+        slots.close_block(400_000, 150_000, 2, true);
+        assert_eq!(slots.cost.ui_wall().0, 550_000, "the send phase is missing from the wall");
+    }
+
+    /// One call, not two: the meter holds a per-CALL maximum, so splitting the
+    /// block in half reports two smaller peaks and a bar that never sees a whole
+    /// one.
+    #[test]
+    fn a_block_reaches_the_peak_whole() {
+        let mut slots = ChainSlots::new();
+        slots.close_block(400_000, 150_000, 2, true);
+        assert_eq!(slots.cost.ui_wall().1, 550_000);
+    }
+
+    /// A set with no movy instrument but a ringing reverb on a send still spent
+    /// the time. Gated on `active > 0` alone, the meter reads zero on a block
+    /// that was half full.
+    #[test]
+    fn a_send_only_block_still_reaches_the_meter() {
+        let mut slots = ChainSlots::new();
+        slots.close_block(0, 150_000, 0, true);
+        assert_eq!(slots.cost.ui_wall(), (150_000, 150_000));
+    }
+
+    /// And a block where nothing at all ran is not a block. Counted, it would
+    /// drag the mean towards zero for every silent block between notes.
+    #[test]
+    fn an_empty_block_is_not_counted() {
+        let mut slots = ChainSlots::new();
+        slots.close_block(0, 0, 0, false);
+        assert_eq!(slots.cost.ui_wall(), (0, 0));
+    }
+
+    /// THE no-regression claim. One bus overlaps with nothing, so a fan-out can
+    /// only add a wake and a wait — and "is the send phase busy?" is not the
+    /// question, because a single tape-echo is as busy as a phase gets.
+    #[test]
+    fn one_running_bus_is_never_fanned_out() {
+        let mut slots = ChainSlots::new();
+        cost(&mut slots, 0, 353_600);
+        running(&mut slots, &[0]);
+        assert!(!slots.plan_sends(), "a lone bus was fanned out");
+    }
+
+    /// And neither is none of them — the phase does not even reach here, but a
+    /// planner asked to partition nothing must not answer "worth it".
+    #[test]
+    fn no_running_bus_is_never_fanned_out() {
+        let mut slots = ChainSlots::new();
+        running(&mut slots, &[]);
+        assert!(!slots.plan_sends());
+    }
+
+    /// The case the phase exists for: two heavy reverbs, 584 us serial, split
+    /// onto separate lanes for a 354 us makespan.
+    #[test]
+    fn two_heavy_buses_are_split_across_lanes() {
+        let mut slots = ChainSlots::new();
+        cost(&mut slots, 0, 230_800); // dragonfly-hall
+        cost(&mut slots, 1, 353_600); // tape-echo2
+        running(&mut slots, &[0, 1]);
+        assert!(slots.plan_sends(), "584 us serial was not worth a 21 us wake");
+        let lane_of = |b: usize| {
+            slots.send_planner.lanes.iter().position(|l| l.contains(&b)).expect("unplanned bus")
+        };
+        assert_ne!(lane_of(0), lane_of(1), "{:?}", slots.send_planner.lanes);
+    }
+
+    /// Three heavy buses are the loadout the third send was added FOR: 938 us
+    /// serial, and one lane each brings the makespan down to the slowest of
+    /// them.
+    ///
+    /// The makespan and not just the lane assignment, because that is what the
+    /// saving is made of: with `DEFAULT_LANES` at 2 the planner still returns a
+    /// valid partition — two buses on one lane — and every "each bus got a
+    /// lane" assertion would pass while the phase ran 584 us instead of 354.
+    #[test]
+    fn three_heavy_buses_each_get_a_lane() {
+        let mut slots = ChainSlots::new();
+        cost(&mut slots, 0, 230_800); // dragonfly-hall
+        cost(&mut slots, 1, 353_600); // tape-echo2
+        cost(&mut slots, 2, 353_600); // tape-echo2
+        running(&mut slots, &[0, 1, 2]);
+        assert!(slots.plan_sends(), "938 us serial was not worth a wake");
+        assert_eq!(slots.send_planner.makespan(), 353_600,
+                   "two buses shared a lane: {:?}", slots.send_planner.lanes);
+        let lane_of = |b: usize| {
+            slots.send_planner.lanes.iter().position(|l| l.contains(&b)).expect("unplanned bus")
+        };
+        let (a, b, c) = (lane_of(0), lane_of(1), lane_of(2));
+        assert!(a != b && b != c && a != c, "{:?}", slots.send_planner.lanes);
+    }
+
+    /// Every per-bus array a fresh `ChainSlots` holds is `SEND_BUSES` wide.
+    ///
+    /// The planning tests set `send_work` themselves, so none of them would
+    /// notice a field left at the old width — and the failure it hides is not
+    /// the loud kind everywhere: `plan_sends` panics on a short `send_work`,
+    /// but a short cost slice would simply price the new bus at zero forever
+    /// and the planner would keep stacking it onto whichever lane looked idle.
+    #[test]
+    fn every_per_bus_array_is_as_wide_as_the_bus_count() {
+        let mut slots = ChainSlots::new();
+        assert_eq!(slots.send_work.len(), SEND_BUSES, "send_work");
+        assert_eq!(slots.sends.plan_cost().len(), SEND_BUSES, "plan_cost");
+        assert_eq!(slots.send_slots.len(), SEND_BUSES, "send_slots");
+        /* And the shared index space reaches the last bus: `pin_keys` is sliced
+         * from `MOVY_CHAINS` on, so a policy still sized to the chains alone
+         * would panic here rather than quietly skip the containment. */
+        assert_eq!(slots.pin.pin_keys().len(), MOVY_CHAINS + SEND_BUSES, "pin keys");
+        running(&mut slots, &[SEND_BUSES - 1]);
+        slots.plan_sends();
+    }
+
+    /// A bus that is not running this block must get no task. It is the tail
+    /// rule that retires one — a reverb whose input stopped and whose tail has
+    /// decayed — so this happens in the middle of ordinary playing, not only at
+    /// the edges.
+    #[test]
+    fn a_bus_that_is_not_running_is_given_no_lane() {
+        let mut slots = ChainSlots::new();
+        cost(&mut slots, 0, 353_600);
+        cost(&mut slots, 1, 353_600);
+        running(&mut slots, &[0]);
+        slots.plan_sends();
+        assert!(
+            slots.send_planner.lanes.iter().all(|l| !l.contains(&1)),
+            "a retired bus was planned: {:?}",
+            slots.send_planner.lanes
+        );
+    }
+
+    /* The safety claim. Two buses holding ONE module share its whole `.data`,
+     * and the send phase renders them on different lanes — the same hazard
+     * `chain_pin` contains for chains, which had no reach into the sends at all
+     * until they entered its index space.
+     *
+     * The keys are sliced from `MOVY_CHAINS` on, so this also pins the offset:
+     * read from 0 instead, the planner would be handed CHAIN 0 and 1's keys and
+     * silently split a pinned pair. */
+    #[test]
+    fn two_sends_holding_one_module_can_be_pinned_onto_one_lane() {
+        let mut slots = ChainSlots::new();
+        slots.set_blacklist("mverb");
+        slots.pin.on_load(send_index(0), SEND_COMPONENT, "mverb");
+        slots.pin.on_load(send_index(1), SEND_COMPONENT, "mverb");
+        cost(&mut slots, 0, 353_600);
+        cost(&mut slots, 1, 353_600);
+        running(&mut slots, &[0, 1]);
+
+        assert!(!slots.plan_sends(), "a pinned pair has nothing to overlap");
+        let with = |b: usize| slots.send_planner.lanes.iter().filter(|l| l.contains(&b)).count();
+        assert_eq!(with(0), 1);
+        let together = slots
+            .send_planner
+            .lanes
+            .iter()
+            .any(|l| l.contains(&0) && l.contains(&1));
+        assert!(together, "pinned sends were split: {:?}", slots.send_planner.lanes);
+    }
+
+    /// Chains must not be pinned to sends. They are one index space now, but
+    /// two phases: the send phase runs after the chain join, so no chain and no
+    /// bus is ever in flight at the same time and a shared module between them
+    /// costs a lane for nothing.
+    #[test]
+    fn a_chain_and_a_send_sharing_a_module_still_use_every_lane() {
+        let mut slots = ChainSlots::new();
+        slots.set_blacklist("mverb");
+        slots.pin.on_load(0, "fx1", "mverb");
+        slots.pin.on_load(send_index(0), SEND_COMPONENT, "mverb");
+        cost(&mut slots, 0, 230_800);
+        cost(&mut slots, 1, 353_600);
+        running(&mut slots, &[0, 1]);
+        assert!(slots.plan_sends());
+        let lane_of = |b: usize| {
+            slots.send_planner.lanes.iter().position(|l| l.contains(&b)).expect("unplanned bus")
+        };
+        assert_ne!(lane_of(0), lane_of(1), "a chain pinned the sends together");
+    }
+
+    #[test]
+    fn teardown_forgets_the_set() {
+        let mut slots = ChainSlots::new();
+        slots.request_load(4, "synth", "noisemaker");
+        slots.teardown();
+        assert_eq!(chain_doc::decode(&slots.chain_set()), Some(vec![]));
+    }
+
+    fn master_entry(component: &str, module: &str) -> chain_doc::Entry {
+        chain_doc::Entry { slot: master_index(), component: component.into(), module: module.into() }
+    }
+
+    /* The master is its own document slot, past the sends and outside the pool:
+     * the pool's space stays exactly the tracks and buses it renders. */
+    #[test]
+    fn the_master_slot_is_past_the_pool() {
+        assert_eq!(master_index(), RENDER_SLOTS);
+        assert_eq!(bus_of_slot(master_index()), None, "not a send");
+        assert_eq!(DOC_SLOTS, RENDER_SLOTS + 1);
+    }
+
+    #[test]
+    fn mfx_module_writes_queue_into_the_set_document() {
+        let mut slots = ChainSlots::new();
+        slots.master_param("fx2:module", "freeverb");
+        assert_eq!(slots.pending_loads(), 1);
+        assert_eq!(chain_doc::decode(&slots.chain_set()), Some(vec![master_entry("fx2", "freeverb")]));
+        /* Parity is four, and the master has no synth or MIDI FX. */
+        slots.master_param("fx5:module", "freeverb");
+        slots.master_param("synth:module", "plaits");
+        slots.master_param("midi_fx1:module", "arp");
+        slots.master_param("imported:module", "x");
+        assert_eq!(slots.pending_loads(), 1, "none of the refused keys queued anything");
+        /* And clearing takes it back out of the document. */
+        slots.master_param("fx2:module", "");
+        assert_eq!(chain_doc::decode(&slots.chain_set()), Some(vec![]));
+    }
+
+    #[test]
+    fn the_stage_flags_read_back() {
+        let mut slots = ChainSlots::new();
+        slots.master_param("vol", "0.5");
+        assert_eq!(slots.master_get("vol").as_deref(), Some("0.5000"));
+        assert_eq!(slots.master_get("fx1:module"), None, "no instance yet");
+        assert!(slots.cost_status().ends_with(" mfxcost=-"), "{}", slots.cost_status());
+    }
+
+    /* The import mark rides the document so both save paths carry it, and is
+     * a fact about the Set: a document without it reads as never imported. */
+    #[test]
+    fn the_import_mark_round_trips_and_is_never_loaded() {
+        let mut slots = ChainSlots::new();
+        slots.master_param("imported", "1");
+        let doc = slots.chain_set();
+        assert_eq!(chain_doc::decode(&doc), Some(vec![master_entry(IMPORT_MARK, "1")]));
+
+        let mut reopened = ChainSlots::new();
+        assert!(reopened.set_chain_set(&doc));
+        assert_eq!(reopened.master_get("imported").as_deref(), Some("1"));
+        assert_eq!(reopened.pending_loads(), 0, "the mark is not a component to load");
+
+        assert!(reopened.set_chain_set(&chain_doc::encode(&[])));
+        assert_eq!(reopened.master_get("imported").as_deref(), Some("0"), "a whole-set replace");
+    }
+
+    #[test]
+    fn a_document_naming_a_non_fx_master_component_loads_nothing_of_it() {
+        let mut slots = ChainSlots::new();
+        assert!(slots.set_chain_set(&chain_doc::encode(&[
+            master_entry("synth", "plaits"),
+            master_entry("fx5", "mverb"),
+            master_entry("fx1", "mverb"),
+        ])));
+        assert_eq!(slots.pending_loads(), 1);
+        assert_eq!(chain_doc::decode(&slots.chain_set()), Some(vec![master_entry("fx1", "mverb")]));
+    }
+
+    /* LFO targets and params written before the instance exists would be
+     * dropped by the chain host; they are held until the loads are in. */
+    #[test]
+    fn master_params_wait_for_the_instance() {
+        let mut slots = ChainSlots::new();
+        slots.master_param("fx1:module", "mverb");
+        slots.master_param("lfo1:target", "fx1");
+        slots.master_param("fx1:mix", "0.3");
+        assert!(slots.master_report().contains("held=2"), "{}", slots.master_report());
+        /* A new Set's document drops what the previous Set's restore held. */
+        assert!(slots.set_chain_set(&chain_doc::encode(&[])));
+        assert!(slots.master_report().contains("held=0"));
+    }
+
+    #[test]
+    fn a_master_preset_reaches_the_file_and_comes_back() {
+        unsafe extern "C" fn fake_master_get_param(
+            _inst: *mut c_void, key: *const c_char, buf: *mut c_char, buf_len: c_int,
+        ) -> c_int {
+            let k = unsafe { CStr::from_ptr(key) }.to_str().unwrap_or("");
+            let v = match k {
+                "fx3:state" => "MPATCH",
+                "lfo2:target" => "fx3",
+                _ => "",
+            };
+            let bytes = v.as_bytes();
+            if bytes.len() as c_int >= buf_len {
+                return -1;
+            }
+            unsafe {
+                core::ptr::copy_nonoverlapping(bytes.as_ptr() as *const c_char, buf, bytes.len());
+            }
+            bytes.len() as c_int
+        }
+        let api: &'static plugin_api_v2_t = Box::leak(Box::new(plugin_api_v2_t {
+            api_version: 0,
+            create_instance: None,
+            destroy_instance: None,
+            on_midi: None,
+            set_param: None,
+            get_param: Some(fake_master_get_param),
+            get_error: None,
+            render_block: None,
+        }));
+        let mut slots = ChainSlots::new();
+        slots.master_param("fx3:module", "freeverb");
+        slots.master_param("imported", "1");
+        slots.master.inst = Some(ChainInstance::for_test(api));
+
+        let saved = crate::chain_state::serialize(&mut slots);
+        let items = crate::chain_state::parse_items(&saved).expect("parses");
+        assert_eq!(items.len(), 12, "the FX and the mark");
+        assert_eq!(items[1], "fx3");
+        assert_eq!(items[3], "MPATCH");
+        assert!(!items[5].is_empty(), "the master's LFOs ride its first record");
+        assert_eq!(items[7], IMPORT_MARK);
+
+        let mut reopened = ChainSlots::new();
+        assert!(crate::chain_state::restore(&mut reopened, &saved));
+        let req = reopened.queue.take_one().expect("the master FX is queued again");
+        assert_eq!((req.slot, req.component.as_str()), (master_index(), "fx3"));
+        assert_eq!(req.state.as_deref(), Some("MPATCH"));
+        assert_eq!(reopened.master_get("imported").as_deref(), Some("1"));
+        assert!(reopened.master_report().contains("held=1"), "the LFO target waits for its FX");
+    }
+}
+
+#[cfg(test)]
+#[path = "serialize_job_tests.rs"]
+mod serialize_job_tests;

@@ -1,0 +1,613 @@
+{
+ "id": "midiverb",
+ "name": "Midiverb",
+ "version": "0.2.2",
+ "author": "Charles Vestal (DSP: thement/midiverb_emulator)",
+ "category": "audio_fx",
+ "status": "ok",
+ "load_ms": 42,
+ "dsp_size": 392456,
+ "capabilities": {
+  "chainable": true,
+  "component_type": "audio_fx"
+ },
+ "presets": {
+  "count": 64,
+  "sample": []
+ },
+ "native": {
+  "hierarchy_levels": [
+   "root",
+   "extras",
+   "unit"
+  ],
+  "params": [
+   {
+    "key": "unit",
+    "name": "Unit",
+    "type": "enum",
+    "min": null,
+    "max": null,
+    "step": null,
+    "options": [
+     "Midiverb",
+     "Midifex",
+     "Midiverb II"
+    ],
+    "default": "0"
+   },
+   {
+    "key": "program",
+    "name": "Program",
+    "type": "int",
+    "min": 0,
+    "max": 63,
+    "step": null,
+    "options": null,
+    "default": "0"
+   },
+   {
+    "key": "mix",
+    "name": "Mix",
+    "type": "float",
+    "min": 0,
+    "max": 1,
+    "step": 0.01,
+    "options": null,
+    "default": "0.350"
+   },
+   {
+    "key": "feedback",
+    "name": "Feedback",
+    "type": "float",
+    "min": 0,
+    "max": 0.95,
+    "step": 0.01,
+    "options": null,
+    "default": "0.000"
+   },
+   {
+    "key": "input_gain",
+    "name": "Input Gain",
+    "type": "float",
+    "min": 0,
+    "max": 2,
+    "step": 0.01,
+    "options": null,
+    "default": "1.000"
+   },
+   {
+    "key": "output_gain",
+    "name": "Output Gain",
+    "type": "float",
+    "min": 0,
+    "max": 2,
+    "step": 0.01,
+    "options": null,
+    "default": "1.000"
+   },
+   {
+    "key": "predelay_ms",
+    "name": "Pre-delay",
+    "type": "float",
+    "min": 0,
+    "max": 200,
+    "step": 1,
+    "options": null,
+    "default": "0.0"
+   },
+   {
+    "key": "low_cut_hz",
+    "name": "Low Cut",
+    "type": "float",
+    "min": 20,
+    "max": 1000,
+    "step": 1,
+    "options": null,
+    "default": "20"
+   },
+   {
+    "key": "high_cut_hz",
+    "name": "High Cut",
+    "type": "float",
+    "min": 1000,
+    "max": 20000,
+    "step": 50,
+    "options": null,
+    "default": "20000"
+   },
+   {
+    "key": "width",
+    "name": "Width",
+    "type": "float",
+    "min": 0,
+    "max": 1.5,
+    "step": 0.01,
+    "options": null,
+    "default": "1.000"
+   },
+   {
+    "key": "damping",
+    "name": "Damping",
+    "type": "float",
+    "min": 0,
+    "max": 1,
+    "step": 0.01,
+    "options": null,
+    "default": "0.000"
+   },
+   {
+    "key": "tilt",
+    "name": "Tilt",
+    "type": "float",
+    "min": -1,
+    "max": 1,
+    "step": 0.01,
+    "options": null,
+    "default": "+0.000"
+   },
+   {
+    "key": "lfo_rate",
+    "name": "LFO Rate",
+    "type": "float",
+    "min": 0,
+    "max": 4,
+    "step": 0.05,
+    "options": null,
+    "default": "1.00x"
+   },
+   {
+    "key": "lfo_depth",
+    "name": "LFO Depth",
+    "type": "float",
+    "min": 0,
+    "max": 1,
+    "step": 0.01,
+    "options": null,
+    "default": "1.00"
+   }
+  ]
+ },
+ "movy": {
+  "hasConfig": false,
+  "usesMovyConfigFile": false,
+  "drum": null,
+  "banks": [
+   {
+    "name": "Preset",
+    "global": false,
+    "padSpecific": false
+   },
+   {
+    "name": "Main",
+    "global": false,
+    "padSpecific": false
+   },
+   {
+    "name": "Extras",
+    "global": false,
+    "padSpecific": false
+   }
+  ],
+  "pages": [
+   {
+    "name": "Preset",
+    "envelopeLines": [
+     false,
+     false
+    ],
+    "lfoViz": false,
+    "rows": [
+     [
+      {
+       "shortName": "UNIT",
+       "fullName": "Unit",
+       "renderStyle": "items",
+       "type": "enum",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "PRESET",
+       "fullName": "Preset",
+       "renderStyle": "preset",
+       "type": "enum",
+       "displayValue": "..."
+      },
+      null,
+      null
+     ],
+     [
+      null,
+      null,
+      null,
+      null
+     ]
+    ]
+   },
+   {
+    "name": "Main",
+    "envelopeLines": [
+     false,
+     false
+    ],
+    "lfoViz": false,
+    "rows": [
+     [
+      {
+       "shortName": "MIX",
+       "fullName": "Mix",
+       "renderStyle": "arc",
+       "type": "float",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "FEEDB",
+       "fullName": "Feedback",
+       "renderStyle": "arc",
+       "type": "float",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "INPUT",
+       "fullName": "Input Gain",
+       "renderStyle": "vbar",
+       "type": "float",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "OUTPUT",
+       "fullName": "Output Gain",
+       "renderStyle": "vbar",
+       "type": "float",
+       "displayValue": "..."
+      }
+     ],
+     [
+      {
+       "shortName": "LOW",
+       "fullName": "Low Cut",
+       "renderStyle": "arc",
+       "type": "float",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "HIGH",
+       "fullName": "High Cut",
+       "renderStyle": "arc",
+       "type": "float",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "DELAY",
+       "fullName": "Pre-delay",
+       "renderStyle": "arc",
+       "type": "float",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "WIDTH",
+       "fullName": "Width",
+       "renderStyle": "arc",
+       "type": "float",
+       "displayValue": "..."
+      }
+     ]
+    ]
+   },
+   {
+    "name": "Extras",
+    "envelopeLines": [
+     false,
+     false
+    ],
+    "lfoViz": false,
+    "rows": [
+     [
+      {
+       "shortName": "DAMPIN",
+       "fullName": "Damping",
+       "renderStyle": "arc",
+       "type": "float",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "TILT",
+       "fullName": "Tilt",
+       "renderStyle": "arc",
+       "type": "float",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "RATE",
+       "fullName": "LFO Rate",
+       "renderStyle": "arc",
+       "type": "float",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "DEPTH",
+       "fullName": "LFO Depth",
+       "renderStyle": "arc",
+       "type": "float",
+       "displayValue": "..."
+      }
+     ],
+     [
+      null,
+      null,
+      null,
+      null
+     ]
+    ]
+   }
+  ],
+  "params": [
+   {
+    "key": "unit",
+    "label": "Unit",
+    "shortLabel": null,
+    "type": "enum",
+    "min": 0,
+    "max": 2,
+    "step": 1,
+    "options": [
+     "* Midiverb (ROM)",
+     "Midifex (ROM)",
+     "Midiverb II (ROM)"
+    ],
+    "itemIndices": [
+     0,
+     1,
+     2
+    ],
+    "itemsKey": "unit_list",
+    "renderStyle": "items",
+    "capturesModuleState": true,
+    "automatable": false,
+    "increment": {
+     "kind": "enum",
+     "detentsPerStep": 4,
+     "steps": 3
+    }
+   },
+   {
+    "key": "program",
+    "label": "Preset",
+    "shortLabel": null,
+    "type": "enum",
+    "min": 0,
+    "max": 63,
+    "step": 1,
+    "options": null,
+    "nameKey": "program_name",
+    "renderStyle": "preset",
+    "capturesModuleState": true,
+    "automatable": false,
+    "increment": {
+     "kind": "enum",
+     "detentsPerStep": 4,
+     "steps": 64
+    }
+   },
+   null,
+   null,
+   null,
+   null,
+   null,
+   null,
+   {
+    "key": "mix",
+    "label": "Mix",
+    "shortLabel": null,
+    "type": "float",
+    "options": null,
+    "min": 0,
+    "max": 1,
+    "step": 0.01,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "float",
+     "perDetent": 0.005,
+     "detentsFullSweep": 200
+    }
+   },
+   {
+    "key": "feedback",
+    "label": "Feedback",
+    "shortLabel": null,
+    "type": "float",
+    "options": null,
+    "min": 0,
+    "max": 0.95,
+    "step": 0.01,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "float",
+     "perDetent": 0.005,
+     "detentsFullSweep": 190
+    }
+   },
+   {
+    "key": "input_gain",
+    "label": "Input Gain",
+    "shortLabel": "Input",
+    "type": "float",
+    "options": null,
+    "min": 0,
+    "max": 2,
+    "step": 0.01,
+    "renderStyle": "vbar",
+    "automatable": true,
+    "increment": {
+     "kind": "float",
+     "perDetent": 0.01,
+     "detentsFullSweep": 200
+    }
+   },
+   {
+    "key": "output_gain",
+    "label": "Output Gain",
+    "shortLabel": "Output",
+    "type": "float",
+    "options": null,
+    "min": 0,
+    "max": 2,
+    "step": 0.01,
+    "renderStyle": "vbar",
+    "automatable": true,
+    "increment": {
+     "kind": "float",
+     "perDetent": 0.01,
+     "detentsFullSweep": 200
+    }
+   },
+   {
+    "key": "predelay_ms",
+    "label": "Pre-delay",
+    "shortLabel": "delay",
+    "type": "float",
+    "options": null,
+    "min": 0,
+    "max": 200,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "float",
+     "perDetent": 0.5,
+     "detentsFullSweep": 400
+    }
+   },
+   {
+    "key": "low_cut_hz",
+    "label": "Low Cut",
+    "shortLabel": "Low",
+    "type": "float",
+    "options": null,
+    "min": 20,
+    "max": 1000,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "float",
+     "perDetent": 0.5,
+     "detentsFullSweep": 1960
+    }
+   },
+   {
+    "key": "high_cut_hz",
+    "label": "High Cut",
+    "shortLabel": "High",
+    "type": "float",
+    "options": null,
+    "min": 1000,
+    "max": 20000,
+    "step": 50,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "float",
+     "perDetent": 25,
+     "detentsFullSweep": 760
+    }
+   },
+   {
+    "key": "width",
+    "label": "Width",
+    "shortLabel": null,
+    "type": "float",
+    "options": null,
+    "min": 0,
+    "max": 1.5,
+    "step": 0.01,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "float",
+     "perDetent": 0.005,
+     "detentsFullSweep": 300
+    }
+   },
+   {
+    "key": "damping",
+    "label": "Damping",
+    "shortLabel": null,
+    "type": "float",
+    "options": null,
+    "min": 0,
+    "max": 1,
+    "step": 0.01,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "float",
+     "perDetent": 0.005,
+     "detentsFullSweep": 200
+    }
+   },
+   {
+    "key": "tilt",
+    "label": "Tilt",
+    "shortLabel": null,
+    "type": "float",
+    "options": null,
+    "min": -1,
+    "max": 1,
+    "step": 0.01,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "float",
+     "perDetent": 0.005,
+     "detentsFullSweep": 400
+    }
+   },
+   {
+    "key": "lfo_rate",
+    "label": "LFO Rate",
+    "shortLabel": "Rate",
+    "type": "float",
+    "options": null,
+    "min": 0,
+    "max": 4,
+    "step": 0.05,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "float",
+     "perDetent": 0.025,
+     "detentsFullSweep": 160
+    }
+   },
+   {
+    "key": "lfo_depth",
+    "label": "LFO Depth",
+    "shortLabel": "Depth",
+    "type": "float",
+    "options": null,
+    "min": 0,
+    "max": 1,
+    "step": 0.01,
+    "renderStyle": "arc",
+    "automatable": true,
+    "increment": {
+     "kind": "float",
+     "perDetent": 0.005,
+     "detentsFullSweep": 200
+    }
+   },
+   null,
+   null,
+   null,
+   null
+  ]
+ },
+ "analysis": {
+  "hiddenParams": [],
+  "noMetadata": [],
+  "warnings": []
+ }
+}

@@ -1,0 +1,131 @@
+/* browser-test/logic/probe.mjs — the device harness's ViewModel probe.
+ *
+ * Run by browser-test/logic.mjs. The probe's response shape is a CONTRACT the
+ * device scenarios parse, so pinning it here means a rename fails locally
+ * instead of on hardware.
+ */
+import { ok, eq, _log } from './harness.mjs';
+import { answer, noteRender, setProbeDeps, _resetForTest }
+    from '../../dist/esm/test/probe.js';
+
+const vmFixture = (over = {}) => ({ moduleName: 'plaits', automationHeld: true, ...over });
+
+/* What `app/param-body.ts` reports about the last drawn Schwung page. */
+const drawnBody = () => ({
+    body: 'schwung',
+    schwung: { pageIndex: 2, pageCount: 5, keys: ['decay', null, null, null, null, null, null, null] },
+    cells: [{ name: 'DCAY', value: '69%', automated: true, touched: true, modulated: false },
+            null, null, null, null, null, null, null],
+    session: false, masterDetail: false, masterSlot: 0,
+});
+
+export async function run() {
+_log('\nTest: device probe');
+{
+    _resetForTest();
+    setProbeDeps({
+        lanesForTrack: (t) => (t === 0 ? ['octave_transpose', 'decay'] : []),
+        activeTrack:   () => 0,
+
+        leaveModal:    () => ({ active: false, label: '', sel: 0 }),
+        ready:         () => true,
+        view:          () => 'knobs',
+        paramBody:     drawnBody,
+    });
+
+    const tick0 = JSON.parse(answer(JSON.stringify({ key: 'tick' })));
+    eq('renderSeq starts at zero', tick0.renderSeq, 0);
+
+    noteRender(vmFixture());
+    const tick1 = JSON.parse(answer(JSON.stringify({ key: 'tick' })));
+    eq('renderSeq advances per render', tick1.renderSeq, 1);
+    noteRender(vmFixture());
+    eq('renderSeq advances again',
+        JSON.parse(answer(JSON.stringify({ key: 'tick' }))).renderSeq, 2);
+
+    const page = JSON.parse(answer(JSON.stringify({ key: 'page' })));
+    eq('page reports the held-step state', page.held, true);
+    eq('page reports the drawn page index', page.pageIndex, 2);
+    eq('page reports the drawn page count', page.pageCount, 5);
+    eq('page always reports eight cells', page.cells.length, 8);
+    eq('cell carries the short name', page.cells[0].name, 'DCAY');
+    eq('cell carries the display value', page.cells[0].value, '69%');
+    eq('cell carries the automation dot', page.cells[0].automated, true);
+    eq('cell carries the touched flag', page.cells[0].touched, true);
+    ok('an empty slot is null, not a blank cell', page.cells[1] === null,
+        JSON.stringify(page.cells[1]));
+    /* A screen with no page behind it — the file browser a dive opens — is the
+     * reason this exists, and it is precisely the case `page` cannot describe:
+     * the VM goes on being the last PAGE movy drew. A scenario reads this to
+     * tell "the gesture did nothing" from "the gesture changed the screen". */
+    eq('page reports the screen movy is showing', page.view, 'knobs');
+
+    const auto = JSON.parse(answer(JSON.stringify({ key: 'auto' })));
+    eq('auto reports the active track', auto.track, 0);
+    eq('auto reports the lane registry', auto.lanes.join(','), 'octave_transpose,decay');
+
+    /* An empty registry is the bug the device suite's P3 check exists to catch,
+     * so it must be reported as empty rather than omitted. */
+    setProbeDeps({
+        lanesForTrack: () => [], activeTrack: () => 1,
+        leaveModal: () => ({ active: true, label: 'Close Movy', sel: 1 }),
+        ready: () => false,
+        view: () => 'file-browse',
+        browse: () => ({ dir: '/data/UserData/Samples', sel: 1,
+                         items: [{ name: '..', path: '/data/UserData', isDir: true },
+                                 { name: 'a.wav', path: '/data/UserData/Samples/a.wav',
+                                   isDir: false }] }),
+    });
+    const empty = JSON.parse(answer(JSON.stringify({ key: 'auto' })));
+    eq('an empty lane registry reports as empty', empty.lanes.length, 0);
+    ok('tick no longer reports a parked state (no Background since WP9)',
+       !('parked' in JSON.parse(answer(JSON.stringify({ key: 'tick' })))));
+    /* Read live, not off the view model: this is the one field that answers
+     * about the screen rather than the page on it, and the two disagree
+     * whenever movy is showing something that is not a module's knobs. */
+    eq('page reflects a screen change too',
+        JSON.parse(answer(JSON.stringify({ key: 'page' }))).view, 'file-browse');
+    /* The screen name alone cannot say WHICH CLICK lands on a file, and on the
+     * device the walk that finds one is a property of the user's library. The
+     * rows and the cursor are what a scenario grades a commit against, so the
+     * file the parameter ends up holding can be checked against the file the
+     * browser said was selected rather than against a written-down name. */
+    const rows = JSON.parse(answer(JSON.stringify({ key: 'browse' }))).browse;
+    eq('browse reports the directory on screen', rows && rows.dir, '/data/UserData/Samples');
+    eq('browse reports the cursor', rows && rows.sel, 1);
+    eq('browse reports the row under the cursor',
+        rows && rows.items[rows.sel].name + ':' + rows.items[rows.sel].path,
+        'a.wav:/data/UserData/Samples/a.wav');
+    eq('browse reports which rows are directories',
+        rows && rows.items.map((it) => it.name + (it.isDir ? '/' : '')).join(','),
+        '../,a.wav');
+
+    /* Correlation: without the echoed id the harness cannot distinguish a
+     * fresh reply from the previous one still in the engine's mailbox. */
+    const tagged = JSON.parse(answer(JSON.stringify({ id: 42, key: 'tick' })));
+    eq('a reply echoes the request id', tagged.id, 42);
+    const untagged = JSON.parse(answer(JSON.stringify({ key: 'tick' })));
+    ok('an untagged request gets no id', untagged.id === undefined, JSON.stringify(untagged));
+    const taggedErr = JSON.parse(answer(JSON.stringify({ id: 7, key: 'nope' })));
+    eq('an error reply echoes the id too', taggedErr.id, 7);
+
+    /* The harness closes movy by reading this, because a fixed number of Back
+     * presses cannot do it reliably. */
+    const leave = JSON.parse(answer(JSON.stringify({ key: 'leave' })));
+    eq('leave reports the modal is up', leave.active, true);
+    eq('leave reports the selected label', leave.label, 'Close Movy');
+
+    eq('tick reports session readiness',
+        JSON.parse(answer(JSON.stringify({ key: 'tick' }))).ready, false);
+
+    const bad = JSON.parse(answer(JSON.stringify({ key: 'nope' })));
+    ok('an unknown key answers with an error, not a throw', typeof bad.error === 'string', bad.error);
+    const torn = JSON.parse(answer('{not json'));
+    ok('malformed json answers with an error, not a throw', typeof torn.error === 'string', torn.error);
+
+    /* No render yet must be distinguishable from a page with no cells. */
+    _resetForTest();
+    const none = JSON.parse(answer(JSON.stringify({ key: 'page' })));
+    ok('page before any render reports an error', typeof none.error === 'string', none.error);
+}
+}

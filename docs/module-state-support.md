@@ -1,0 +1,223 @@
+# Module `state` support — what's missing, and what it costs
+
+A Schwung chain module is expected to expose its whole configuration through one
+param:
+
+```c
+get_param("state")   ->  every setting, as one string
+set_param("state", s)->  restore them all
+```
+
+Eight of them don't provide one at all, and their settings are lost whenever a
+Set is reopened. Ten more provide one that isn't JSON, which persists but
+costs more to read and can't be shown by the web UI. This documents what breaks,
+which modules are affected, and what each needs.
+
+**Scanned 2026-08-10** on `move.local`, by loading each module into a chain slot
+and reading `<component>:state` from inside Movy.
+
+| Category | JSON state | Non-JSON state | No state | Scanned |
+|---|---:|---:|---:|---|
+| Sound generators | 23 | 7 | 5 | 35 of 35 |
+| Audio FX | 27 | 3 | 2 | 32 of 32 |
+| MIDI FX | 8 | 0 | 1 | 9 of 9 |
+| **Total** | **58** | **10** | **8** | **76 of 76** |
+
+Every installed module has a reading.
+
+---
+
+## Why it matters
+
+### 1. Settings are lost when a Set is reopened
+
+This is the serious one, and it has nothing to do with Movy.
+
+Schwung saves a chain slot in `buildSlotPatchJson` (`shadow_ui.js:4247`). It
+starts from `cfg.synth.params`, then replaces it with the state blob:
+
+```js
+let synthConfig = cfg.synth.params || {};
+const stateJson = getSlotStateWithRetry(slotIndex, "synth:state");
+if (stateJson) synthConfig = { state: state };
+```
+
+`cfg.synth.params` is initialised to `{}` and **never written to** for a track
+slot — the only two writers in the file are on the master-FX path
+(`shadow_ui.js:4750`, `:4761`). So when `synth:state` comes back empty, the
+saved patch contains no parameters at all. Schwung's own comment says so:
+
+> *"it also blocks legitimate saves when the user swaps to a module that doesn't
+> implement `get_param("state")` at all … save with whatever we have (possibly
+> empty) so the module selection survives a reboot."*
+
+**The module selection survives a restart. Its settings do not.**
+
+A module whose state is present but whose *parser* is wrong fails differently
+and more quietly: the blob saves and reloads, but comes back scrambled. That was
+`weird-dreams` — its deserializer read one field more than its serializer wrote,
+so every field after the master block landed one slot out and the instrument
+reloaded silent. Fixed in
+[filliformes/weird-dreams-move#2](https://github.com/filliformes/weird-dreams-move/pull/2).
+
+### 2. Movy's undo captures slowly
+
+Undo snapshots a module before any change that rewrites it wholesale — a preset,
+a bank or ROM selector, a randomiser. With a JSON state blob that is one read.
+Without one, Movy falls back to reading every published parameter individually,
+at 3–5 ms each on device:
+
+| | Surge XT (302 params) |
+|---|---|
+| Reading each param | **884 ms**, in a single tick |
+| Parsing the state blob | **18 ms** |
+
+Both are measured on device. The fallback is correct — it is tested, and it is
+what lets Movy repair a module that cannot parse its own state — but on a
+200-param module the first turn of a preset knob visibly stalls.
+
+---
+
+## What a module needs to provide
+
+1. **`get_param("state")` returns every setting.** Not just what the UI shows —
+   anything the module keeps and would want back.
+2. **`set_param("state", s)` restores exactly what the getter wrote.** The two
+   must agree field for field; a single extra or missing read shifts everything
+   after it (this is the `weird-dreams` bug).
+3. **Prefer JSON: `{"key": value, ...}`.** Any non-empty string is accepted and
+   persisted — Schwung stores an unrecognised blob verbatim — but JSON is worth
+   the small effort:
+   - Schwung's remote UI can flatten it into individual params
+     (`remote_ui.go` `fetchAllParams`), which is how the web UI shows a module's
+     values at all.
+   - Movy reads values from it directly instead of polling each param, which is
+     the 884 ms → 18 ms above.
+   - Writing the values back individually bypasses the module's own parser, so a
+     parser bug like `weird-dreams`' is corrected rather than inherited.
+
+A round-trip test is worth having in the module itself: serialize, deserialize,
+serialize again, and assert the two strings match. That single test would have
+caught the `weird-dreams` bug before release.
+
+---
+
+## Affected modules
+
+The FX modules are all small — none exceeds 49 parameters — so the capture cost
+Movy pays for them is tens of milliseconds, not the hundreds the big synths
+cost. **For FX this is purely a Set-reload correctness issue**, not a
+performance one.
+
+### No usable state — settings lost on Set reload
+
+| Module | Params | State read | Work needed |
+|---|---:|---|---|
+| `forge` | 193 | absent | Implement `get_param`/`set_param("state")`. Largest exposure here: 193 params, all lost on reload. |
+| `osirus` | 156 | 0 bytes | Implement, or find why it returns empty. Note the ROM/bank selectors must be restored **before** the preset index, or the preset addresses the wrong bank. |
+| `chordism` | 135 | 0 bytes | Implement, or find why it returns empty. |
+| `denis` | 61 | absent | Implement `get_param`/`set_param("state")`. |
+| `linein` | 20 | absent | Probably fine to leave — a line input has little worth persisting. Confirm and close. |
+
+#### Audio FX
+
+| Module | Params | State read | Work needed |
+|---|---:|---|---|
+| `superboom` | 36 | absent | Implement `get_param`/`set_param("state")`. |
+| `midiverb` | 14 | absent | Implement. Its `program` selector rewrites the other params, so it must be restored before them. |
+
+#### MIDI FX
+
+| Module | Params | State read | Work needed |
+|---|---:|---|---|
+| `branchage` | 27 | absent | Implement `get_param`/`set_param("state")`. |
+
+> **Caveat on the 0-byte and absent readings:** each was taken as the module's
+> hierarchy loaded. A module that populates its state later would look empty
+> here — `osirus` loads a ROM asynchronously, for one. Worth re-reading after a
+> full load before treating any of these as genuinely absent.
+
+### State present but not JSON — persists, but slow to capture
+
+These reload correctly (assuming their parser is right — see `weird-dreams`).
+Converting them to JSON is a performance and tooling improvement, not a
+correctness fix.
+
+| Module | Params | State size | Approx. capture cost today |
+|---|---:|---:|---|
+| `weird-dreams` | 219 | 1067 B | ~880 ms |
+| `signal` | 146 | 2012 B | ~580 ms |
+| `aphex` | 83 | 1396 B | ~330 ms |
+| `fizzik` | 73 | 1072 B | ~290 ms |
+| `krautdrums` | 41 | 292 B | ~160 ms |
+| `essaim` | 34 | 3171 B | ~140 ms |
+| `wurl` | 11 | 91 B | negligible |
+
+#### Audio FX with non-JSON state
+
+All small enough that the capture cost is negligible; converting them to JSON is
+a tooling improvement only (the web UI can then show their parameters).
+
+| Module | Params | State size |
+|---|---:|---:|
+| `magneto` | 49 | 542 B |
+| `palette` | 29 | 126 B |
+| `dissolver` | 18 | 215 B |
+
+### Working — JSON state
+
+**Sound generators:** `303`, `belt-in`, `braids`, `breakbeat`, `chiptune`,
+`dexed`, `freak`, `granny`, `hera`, `hush1`, `minijv`, `moog`, `mrdrums`,
+`mrsample`, `nusaw`, `obxd`, `plaits`, `po32-drum`, `rex`, `sf2`, `sfz`,
+`smack-in`, `surge`.
+
+**Audio FX:** `ambiotica`, `belt`, `chowtape`, `clap`, `cloudseed`,
+`dragonfly-hall`, `ducker`, `filter`, `freeverb`, `gate`, `granular`,
+`junologue-chorus`, `mverb`, `nam`, `ottx`, `psxverb`, `punchfx`, `pushnpull`,
+`smack`, `spectra`, `structor`, `tapedelay`, `tapescam`, `usefulity`,
+`verglas`, `vocoder`, `war_bells`.
+
+**MIDI FX:** `arp`, `chord`, `eucalypso`, `euclidrum`, `genera`,
+`impressive-chords`, `superarp`, `velocity_scale`.
+
+`minijv` (418 params, 12 KB blob) and `surge` (302 params, 6.8 KB) show the
+approach scales; `euclidrum` (3 KB) and `eucalypso` (1.5 KB) show it is normal
+for MIDI FX too.
+
+---
+
+## A separate finding: Schwung's remote UI can't read large blobs
+
+During the scan, Schwung's remote-UI WebSocket reported **zero** parameters for
+`surge` while Movy read its 6864-byte blob in-process without trouble. Whatever
+size limit applies to `shm.GetParam` in `schwung-manager`, it is below what the
+larger modules produce.
+
+Consequence: the web UI likely cannot show parameters for the most
+parameter-dense modules. This is a Schwung issue, unrelated to the module work
+above, and worth raising separately.
+
+---
+
+## How to verify a fix
+
+No Set reload or reboot needed:
+
+1. Load the module on track 0 and set some parameters to distinctive values.
+2. Turn a preset knob (or fire a randomiser) once, then press **Undo**.
+3. Read the log:
+   ```
+   ssh ableton@move.local 'grep "\[movy\] undo:" /data/UserData/schwung/debug.log'
+   ```
+
+What the lines mean:
+
+| Line | Meaning |
+|---|---|
+| `restored <comp> state (N bytes)` | The blob is being used — the module has one. |
+| `dumped N params … from state` | Values came from the blob — it parsed as JSON. |
+| `dumped N params … 884 ms` | No usable blob; every param was read individually. |
+| `verify rewrote N param(s)` | The restore did not hold; the module's own parser is rewriting them. `N` should be 0. |
+
+A module that is fully working shows `restored … state`, a `from state` dump in
+the tens of milliseconds, and no `verify rewrote` line.

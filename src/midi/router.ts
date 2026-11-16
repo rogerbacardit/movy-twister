@@ -1,0 +1,1252 @@
+import { trackRef } from '../track/ref.js';
+import { pageOwnerOf, pageRefOf } from '../app/page-owner.js';
+import { schwungGridDrop } from '../renderer/schwung-grid.js';
+import { pageOwnerForComponent } from '../app/page-owner-virtual.js';
+import { CLIP_PARAMS_COMPONENT, SET_PARAMS_COMPONENT, STEP_PARAMS_COMPONENT } from '../chain/config.js';
+import { pinPage, unpinPage } from './knob-page-pin.js';
+import { pinModel, unpinModel } from './knob-model-pin.js';
+import { perfPhase, perfPhaseEnd } from '../app/perf-probe.js';
+import { openSchwungEditor, schwungEditorActive, schwungEditorJog,
+         schwungEditorCommit, schwungEditorCancel } from '../renderer/schwung-editor.js';
+import { openSchwungDive } from '../browser/schwung-dive.js';
+import { canvasDiveTakes } from './canvas-dive-input.js';
+
+/*
+ * WHICH PARAMETER IS UNDER KNOB k — one answer, for every gesture.
+ *
+ * The turn path asked Schwung and the touch/release paths asked movy, so a
+ * single gesture had two answers: the lane was CREATED against the parameter
+ * on screen, then Delete+touch cleared the lane for a different one, and
+ * hold-to-modulate armed a third. Under Schwung pagination those are genuinely
+ * different keys — obxd page 1 knob 0 is `cutoff` to Schwung and `attack` to
+ * movy — so this was not theoretical.
+ *
+ * Applying the rule to one of three sites is how I introduced it; asking the
+ * one owner is how it stays fixed.
+ */
+function knobOwner() { return pageOwnerOf(knobModel()); }
+
+/* Set/Clip Params (SP-53) have no MODEL for `knobOwner()`'s `pageOwnerOf` to
+ * ask — see `pageOwnerForComponent`'s own header. Their own accessors, asked
+ * only from the gesture sites below that already gate on
+ * `mainPageActive()`/`clipPageActive()`. */
+function mainParamsOwner() { return pageOwnerForComponent(SET_PARAMS_COMPONENT); }
+function clipParamsOwner() { return pageOwnerForComponent(CLIP_PARAMS_COMPONENT); }
+/* SP-54: same shape, for the step page's five intrinsic trig cells. */
+function stepParamsOwner() { return pageOwnerForComponent(STEP_PARAMS_COMPONENT); }
+import { focusedTrack, focusGroupStep, GROUP_DIR_UP, GROUP_DIR_DOWN } from '../track/focus.js';
+import { beginTrackSwitch, restoreTrackState, switchToTrack } from '../track/switch.js';
+import { portFor } from '../track/registry.js';
+import { mappingFor } from '../seq/lane-mapping.js';
+import { setButtonHeld } from '../seq/button-held.js';
+import { currentSetUuid, sessionFailScope, sessionFlush, sessionPhase, sessionReady } from '../seq/set-session.js';
+import { sessionStartFromScratch } from '../seq/set-fail.js';
+import { appState, trackIsDrum, VIEW_KEYS, VIEW_KNOBS, VIEW_BROWSE, VIEW_CHAIN, VIEW_FILE_BROWSE, VIEW_MAIN_PARAMS, VIEW_CLIP_PARAMS } from '../app/state.js';
+import { mainPageActive, mainPageRelease } from '../seq/main-page.js';
+import { mixerPageActive } from '../seq/mixer-page.js';
+import { mixerJog, mixerKnobTouch, mixerKnobTurn } from '../seq/mixer-input.js';
+import { noteViewActive } from '../seq/note-view.js';
+import { clipPageActive, clipPageRelease } from '../seq/clip-page.js';
+import { clickVolumeTurn } from '../seq/click-volume.js';
+import { backupsRowSelected, clickRowSelected, flagsPageActive, flagsPageJog, linkRowSelected, migrateRowSelected } from '../seq/flags-page.js';
+import { linkSettingToggle, linkSettingTurn } from '../seq/link-setting.js';
+import { migrateRowClick } from '../seq/migrate-action.js';
+import { setsPageActive, setsPageBack, setsPageClick, setsPageJog } from '../seq/sets-page.js';
+import { textEntry, textEntryActive } from '../renderer/text-entry-lib.js';
+import { openVersionsPage, versionsPageActive, versionsPageBack, versionsPageClick, versionsPageJog }
+    from '../seq/versions-page.js';
+import { cpuPageActive } from '../seq/cpu-page.js';
+import { closeParamPage, paramPageActive } from '../seq/param-page.js';
+import { CHAIN_SLOTS, MASTER_FX_SLOTS, LAST_CHAIN_INDEX, LAST_MASTER_INDEX,
+         LFO_CHAIN_INDEX, MASTER_LFO_INDEX, isLfoSlot, isMasterLfoSlot } from '../chain/config.js';
+import { keyboardState } from '../keyboard/state.js';
+import { browserState, browsedTrack } from '../browser/state.js';
+import { noteOn, noteOff, changeOctave } from '../keyboard/handler.js';
+import { soundingPitch, soundingTrack } from '../keyboard/held-notes.js';
+import { releaseAllLive } from '../keyboard/release.js';
+import { drumPadOn, drumPadOff, padFocusWrite } from '../keyboard/drum-handler.js';
+import { drumNoteOfPad, drumNoteOfPhys } from '../keyboard/drum-grid.js';
+import { padsPlayNotes } from '../seq/router-pads.js';
+import { padMuteGesture } from '../mixer/pad-mutes.js';
+import { openBrowser, loadSelectedModule } from '../browser/handler.js';
+import { openFileBrowser, navigateFileBrowser, activateFileBrowserItem, cancelFileBrowser } from '../browser/file-handler.js';
+import { seqHandleMidi, seqNotePadPlayed, seqNotePadReleased, muteHeld, muteMarkGestured, muteShiftHeld, muteTrack } from '../seq/router.js';
+import { anyStepHeld } from '../seq/step-edit.js';
+import { stepPageState, setStepPageSelected, stepPageAvailable } from '../seq/step-page.js';
+import { seqState } from '../seq/state.js';
+import { WHITE_BRIGHT, WHITE_DIM } from '../seq/colors.js';
+import { momentaryDown, momentaryGesture, momentaryUp } from '../seq/momentary.js';
+import { handleAutomationKnob, clearLaneForKnob, automationKnobReleased, automationKnobTouched } from '../seq/automation.js';
+import { holdTouch, holdRelease, holdTurnCancel, assignActive, assignCycle, assignCommit } from '../lfo/assign-mode.js';
+import { masterScope, trackScope } from '../lfo/scope.js';
+import { deleteActive, markDeleteActed } from '../seq/edit-ops.js';
+import { seqToast } from '../seq/render.js';
+import { aiRunningInput } from '../ai/job.js';
+import { aiPreviewActive } from '../ai/preview.js';
+import { previewInput } from '../ai/preview-input.js';
+import { leaveModalActive, openLeaveModal, closeLeaveModal, leaveModalMove, leaveModalConfirm, leaveModalPass,
+         } from '../app/leave-modal.js';
+import { freezeCancelCapture, freezeGuard, freezeBusy } from '../seq/freeze.js';
+import { openTrackMenu } from '../seq/track-menu.js';
+import { trackMenuMidi } from '../seq/track-menu-input.js';
+import { freezeSwallows } from '../seq/freeze-busy.js';
+import { isMixSlot } from '../chain/config.js';
+import {
+    quantOverlayActive, quantOverlayAction, quantOverlayJog, quantOverlayHold,
+    dismissQuantOverlay,
+} from '../seq/quant-overlay.js';
+import { captureOverlayActive, captureOverlayAction, captureJog, captureDismiss } from '../seq/capture.js';
+import { resetHeldInput } from '../app/input-reset.js';
+import { jogHintTouch } from '../app/jog-hint.js';
+import { MASTER_CC, volumeTrackDown, volumeTrackUp, volumeTouch, volumeKnobDelta } from '../mixer/track-volume.js';
+import { masterVolumeKnob, masterVolumeTouch } from '../mixer/master-volume.js';
+import { toggleSolo } from '../mixer/track-mutes.js';
+import { mlog } from '../log.js';
+import { platform } from '../platform/index.js';
+import { knobDirectionHeld } from './knob-direction.js';
+
+const PAD_MIN        = MovePads[0];
+const PAD_MAX        = MovePads[MovePads.length - 1];
+const KNOB_CC_BASE   = MoveKnob1;
+const NUM_KNOBS      = 8;
+const MASTER_TOUCH   = MoveKnob8Touch + 1;  /* note 8 = master (volume) knob touch */
+const JOG_TOUCH      = MoveKnob8Touch + 2;  /* note 9 = main encoder (jog) touch */
+const TRACK_CC_START = 40;                   /* MoveRow4 → slot 3 */
+const TRACK_CC_END   = 43;                   /* MoveRow1 → slot 0 */
+
+/* True for an event that RELEASES something we may be holding. Relative
+ * encoders are excluded on purpose: they send a value, not a button state, and
+ * d2 === 0 there means "no movement", not "up". */
+function isRelease(data: number[]): boolean {
+    const type = data[0] & 0xF0;
+    if (type === 0x80) return true;
+    if (type === 0x90) return data[2] === 0;
+    if (type === 0xB0) {
+        const k = data[1];
+        if (k === MoveMainKnob || k === MASTER_CC) return false;
+        if (k >= KNOB_CC_BASE && k < KNOB_CC_BASE + NUM_KNOBS) return false;
+        return data[2] === 0;
+    }
+    return false;
+}
+
+/* Every non-encoder CC is a button; led-cache uses this to light whichever one
+ * is under the finger (see seq/button-held.ts). Recorded before dispatch so the
+ * same tick's repaint already sees it. */
+function trackButtonPress(data: number[]): void {
+    if ((data[0] & 0xF0) !== 0xB0) return;
+    const k = data[1];
+    if (k === MoveMainKnob || k === MASTER_CC) return;
+    if (k >= KNOB_CC_BASE && k < KNOB_CC_BASE + NUM_KNOBS) return;
+    setButtonHeld(k, data[2] > 0);
+}
+
+function activeModel() {
+    return appState.trackModels[appState.activeTrack.index]?.[appState.trackChainIndex[appState.activeTrack.index]];
+}
+
+function chainIndex(): number { return appState.trackChainIndex[appState.activeTrack.index]; }
+function setChainIndex(i: number): void { appState.trackChainIndex[appState.activeTrack.index] = i; }
+
+/* The track's instrument always lives in chain slot 1 (synth). Drum pad input
+ * is keyed off it — not the focused chain slot — so pads keep sounding and
+ * selecting drum lanes while the user edits the MIDI FX or an audio-FX slot on
+ * the same track. (tick.ts already reads drum status/lane from this slot.) */
+function synthModel() {
+    return appState.trackModels[appState.activeTrack.index]?.[1];
+}
+
+function masterModel() { return appState.masterFxModels[appState.masterChainIndex]; }
+
+/* The model the 8 knobs edit and the screen shows: the master FX slot while the
+ * master chain is on screen (Session mode), otherwise the active track slot. */
+function knobModel() { return masterChainActive() ? masterModel() : activeModel(); }
+
+/* Which pair of LFOs a knob on that model can be assigned to. */
+function knobLfoScope() {
+    return masterChainActive() ? masterScope() : trackScope(appState.activeTrack.index);
+}
+
+/* Session mode shows the master FX chain, but a browse/file-browse view (opened
+ * from it) takes over the screen and the jog wheel — so master-chain navigation
+ * only applies while that chain is actually on screen. */
+function masterChainActive(): boolean {
+    return seqState.sessionMode
+        && appState.currentView !== VIEW_BROWSE
+        && appState.currentView !== VIEW_FILE_BROWSE;
+}
+
+/* The track whose chain the knobs / jog click would edit, or -1 for none a
+ * freeze can stand behind. Not in Session mode: the master chain is on screen
+ * there. In the module browser, the track it was opened on (`browsedTrack`):
+ * a send or master FX slot belongs to no track, so a send FX can be picked
+ * while a frozen track is focused. Not on the MIX slot: level, pan and sends
+ * are the engine's mixer, which a frozen track keeps. */
+function chainEditTrack(): number {
+    if (seqState.sessionMode) return -1;
+    if (appState.currentView === VIEW_BROWSE || appState.currentView === VIEW_FILE_BROWSE) return browsedTrack();
+    const t = appState.activeTrack.index;
+    return isMixSlot(appState.trackChainIndex[t]) ? -1 : t;
+}
+
+/** Refused (and the big toast shown) when that chain is a frozen track's. */
+function frozenChainRefuses(): boolean {
+    const t = chainEditTrack();
+    return t >= 0 && freezeGuard(t);
+}
+
+/* The master slot grid is on screen (jog scrolls slots, click adds/drills). */
+function masterGridActive(): boolean { return masterChainActive() && !appState.masterDetail; }
+
+/* A master slot's module detail page is on screen (jog scrolls param banks). */
+function masterDetailActive(): boolean { return masterChainActive() && appState.masterDetail; }
+
+/* Reset whenever the session is live, so each boot logs its own refusal. */
+let refusedThisBoot = false;
+
+export function onMidiMessageInternal(data: number[]): void {
+    if (!data || data.length < 3) return;
+    /* Before any dispatch, including the paths that swallow input: a button
+     * whose press is swallowed by a modal is still physically down, and its LED
+     * must not stay dim under the finger. */
+    trackButtonPress(data);
+
+    /* Nothing is live until the engine holds this Set. A press accepted before
+     * then used to queue into an engine that did not exist yet and flush on the
+     * very tick a blank state landed on top of it — the whole reason the set
+     * lifecycle was rewritten. Two exceptions, both about not trapping the
+     * user: Back always exits, and on the failure screen the jog click is the
+     * one offered recovery. */
+    if (!sessionReady()) {
+        const isCc = (data[0] & 0xF0) === 0xB0 && data[2] > 0;
+        if (isCc && data[1] === MoveBack) { /* fall through to the Back handler */ }
+        else if (isCc && data[1] === MoveMainButton && sessionPhase() === 'failed'
+                 && sessionFailScope() === 'set') {
+            /* Only a set-scoped failure. Starting empty BLANKS THE SET on disk,
+             * which cannot fix an engine that never started — it would just
+             * destroy an intact set while the user is trying to get past a
+             * screen. The engine failure screen offers no jog click at all. */
+            sessionStartFromScratch();
+            appState.dirty = true;
+            return;
+        } else {
+            /* Once per boot, not per press: a refusal is the gate doing its job,
+             * and the device suite needs a positive signal for it — "no note was
+             * entered" also holds when the press never arrived, which is how the
+             * first version of that test passed with the gate removed. */
+            if (!refusedThisBoot) {
+                refusedThisBoot = true;
+                mlog('seq: input refused during ' + sessionPhase());
+            }
+            return;
+        }
+    } else refusedThisBoot = false;
+
+    /* A freeze being recorded: every press but Back is swallowed, releases
+     * pass (seq/freeze-busy.ts). */
+    if (freezeBusy(Date.now())) {
+        /* Back is the one way out, taken here: below, the sequencer's router
+         * and the pages each have a use for Back of their own. */
+        if ((data[0] & 0xF0) === 0xB0 && data[1] === MoveBack && data[2] > 0) {
+            freezeCancelCapture();
+            appState.dirty = true;
+            return;
+        }
+        if (freezeSwallows(data)) { appState.dirty = true; return; }
+    }
+
+    /* The track menu (Shift + track button) owns input while it is open. */
+    if (trackMenuMidi(data)) { appState.dirty = true; return; }
+
+    /* Schwung's keyboard (the Sets page's rename) owns every control while it
+     * is up, releases included — it tracks its own presses, a pad would
+     * otherwise play under a screen that is typing, and Back is its cancel. */
+    if (textEntryActive()) { textEntry()?.handleTextEntryMidi(data); appState.dirty = true; return; }
+
+    // The Leave-Movy modal owns the jog assembly while it is up: jog turn moves
+    // the highlight, jog click confirms (Background parks / Close exits), Back
+    // cancels. Everything else keeps working — using the instrument answers the
+    // question by walking away, so it dismisses the menu and still acts. Only
+    // the param knobs are swallowed (an edit behind a full-screen menu is one
+    // you cannot see), and only Shift and the transport run without dismissing.
+    // The policy lives in leave-modal.ts:leaveModalPass.
+    //
+    // Releases are never swallowed or treated as a dismissal. The handler that
+    // armed a hold has no other way to learn the button came up, so a dropped
+    // release strands it for the rest of the session — a stranded step hold
+    // keeps stepAutoMode latched and eats every subsequent knob turn (tempo,
+    // clip length, module params), curable only by reopening movy.
+    // The post-capture overlay stays up until something is pressed. The jog
+    // picks a tempo (applied as you turn); every other PRESS just dismisses it
+    // and is swallowed. Swallowed rather than passed through because movy has
+    // no undo — a step button that both dismissed this and wrote a note into
+    // the clip you just captured is not a trade worth offering. Releases fall
+    // through so no handler is left holding a button that never came up.
+    /* A knob count the worn-encoder filter holds back is consumed before ANY
+     * knob consumer sees it (midi/knob-direction.ts; off unless opted in). */
+    if (knobDirectionHeld(data)) return;
+    /* An AI request in flight owns the device: only Back (cancel) does
+     * anything, and releases still pass (ai/job.ts). */
+    if (aiRunningInput(data)) return;
+    /* The AI preview keeps the jog (switch/commit), Back (commit) and idles
+     * the knobs; everything else edits the clip underneath. */
+    if (previewInput(data)) { appState.dirty = true; return; }
+    /* A module's fullscreen canvas (DR32's engine picker) owns the jog
+     * assembly, Back and the knobs while it is up — canvas-dive-input.ts. */
+    if (canvasDiveTakes(data)) { appState.dirty = true; return; }
+
+    if (captureOverlayActive()) {
+        const action = captureOverlayAction(data);
+        if (action === 'jog') { captureJog(decodeDelta(data[2])); return; }
+        if (action === 'swallow') return;
+        if (action === 'dismiss') { captureDismiss(data); return; }
+    }
+
+    /* The quantize panel is a confirmation, not a decision: only Back and the
+     * jog assembly are consumed, and anything that neither repaints nor toasts
+     * runs underneath without even closing it. Below capture's gate, so a
+     * screen-owning overlay always wins. */
+    if (quantOverlayActive()) {
+        const action = quantOverlayAction(data, appState.shiftHeld);
+        if (action === 'jog') { quantOverlayJog(decodeDelta(data[2]), Date.now()); return; }
+        if (action === 'swallow') { quantOverlayHold(Date.now()); return; }
+        if (action === 'dismiss') { dismissQuantOverlay(); return; }
+    }
+
+    if (leaveModalActive()) {
+        if ((data[0] & 0xF0) === 0xB0) {
+            const k = data[1], v = data[2];
+            if (k === MoveBack && v > 0) { closeLeaveModal('Back'); appState.dirty = true; return; }
+            if (k === MoveMainKnob) {
+                const delta = decodeDelta(v);
+                if (delta !== 0) { leaveModalMove(delta); appState.dirty = true; }
+                return;
+            }
+            if (k === MoveMainButton && v > 0) {
+                const action = leaveModalConfirm();
+                appState.dirty = true;
+                /* Confirming leaves movy, so no release still owed to us will
+                 * arrive and anything armed under
+                 * the menu would strand — Rec latches step-record, Shift latches
+                 * shiftHeld, and both pass without dismissing. The open path's
+                 * reset cannot cover presses that arrived after it. Live notes
+                 * need no equivalent only because everything that sounds one
+                 * dismisses first; move a pad to `through` and that changes. */
+                resetHeldInput(true);
+                if (action === 'close') platform.exit();
+                else if (action === 'poweroff') platform.powerOff();
+                return;
+            }
+        }
+        const pass = leaveModalPass(data);
+        if (pass === 'swallow' && !isRelease(data)) return;
+        if (pass === 'dismiss' && !isRelease(data)) {
+            closeLeaveModal('input ' + data.map((b) => b.toString(16).padStart(2, '0')).join(' '));
+            appState.dirty = true;
+        }
+    }
+
+    if (seqHandleMidi(data, appState.shiftHeld)) return;
+    const status = data[0];
+    const d1     = data[1];
+    const d2     = data[2];
+
+    /* Capacitive knob touch: NoteOn note=0..7. Hold-Clear (Delete) + touch
+     * clears that knob's automation lane. */
+    if ((status & 0xF0) === 0x90 && d1 < 8) {
+        /*
+         * A RELEASE IS OWED TO THE PRESS, NOT TO WHAT IS ON SCREEN NOW.
+         *
+         * Delivered here, ABOVE the page overrides below, because they `return`
+         * — a step page or a param page that comes up while a knob is down
+         * would otherwise swallow the release and strand the pressed page's
+         * controller exactly as a page change does. The ledger records the page
+         * at the press; see midi/knob-page-pin.ts for why the latch it prevents
+         * is permanent.
+         *
+         * The MODEL underneath owes the same debt, independently: it recorded
+         * the touch, and knobModel() re-resolved at release time can name a
+         * different one (track switch, chain-slot swap, Session toggle) — that
+         * model's touch would otherwise stick. See knob-model-pin.ts.
+         */
+        const owed = d2 > 0 ? undefined : unpinPage(d1);
+        const owedModel = d2 > 0 ? undefined : unpinModel(d1);
+        owed?.knobTouch(d1, false);
+        owedModel?.handleKnobRelease(d1);
+        // Main/Clip Params are pages the user opened deliberately and are what
+        // app/tick.ts actually renders, so they own the knobs ahead of the step
+        // page. (The other order let a step hold silently steer the knobs away
+        // from the page on screen.)
+        if (mixerPageActive()) { mixerKnobTouch(d1, d2 > 0); return; }
+        if (noteViewActive()) return;   // Loop mode's note view: knobs are idle
+        if (mainPageActive()) {
+            if (d1 < 8) {   // every knob on the page (3 is unused but harmless)
+                /* Same reasoning as Clip Params below: Set Params has no
+                 * per-track model to re-pin against, so asking fresh at touch
+                 * and at release is safe. */
+                const owner = mainParamsOwner();
+                if (d2 > 0) owner.page?.knobTouch(d1, true);
+                else { owner.page?.knobTouch(d1, false); mainPageRelease(d1); }
+            }
+            appState.dirty = true;
+            return;
+        }
+        if (clipPageActive()) {
+            /* The clip page edits the frozen clip itself (speed, length,
+             * transpose, quantize): refused before it is touched. */
+            if (d1 < 4 && d2 > 0 && freezeGuard(appState.activeTrack.index)) { appState.dirty = true; return; }
+            if (d1 < 4) {
+                /* SP-53: Clip Params has no per-track model to re-pin against
+                 * (its owner is the same fixed component whoever is touching
+                 * it), so — unlike the module page above — asking fresh at
+                 * touch and at release is safe: nothing about the answer can
+                 * change mid-hold the way a track switch changes `knobModel()`. */
+                const owner = clipParamsOwner();
+                if (d2 > 0) owner.page?.knobTouch(d1, true);
+                else { owner.page?.knobTouch(d1, false); clipPageRelease(d1, appState.activeTrack.index); }
+            }
+            appState.dirty = true;
+            return;
+        }
+        /* Global Params owns its knobs too, for the same reason — but it has no
+         * touch behaviour: the value edits on the turn and there is no overlay
+         * to open. Claiming the touch anyway is what stops it reaching the
+         * model underneath and arming a hold-to-modulate on a param the page is
+         * not showing. */
+        if (flagsPageActive()) return;
+        // Step page owns the knobs: a touch shows that param's top toast; the
+        // step params are intrinsic (no automation lane / model touch).
+        if (stepPageAvailable() && stepPageState.selected) {
+            /* SP-54: gated to the 5 real cells so knobs 5-7 (blank) never
+             * reach a component with no such keys. */
+            if (d1 < 5) stepParamsOwner().page?.knobTouch(d1, d2 > 0);
+            appState.dirty = true;
+            return;
+        }
+        /* A frozen track's chain is unloaded: a touch says so (the big toast)
+         * and goes no further. The MIX slot is the engine's mixer and works. */
+        if (d2 > 0 && frozenChainRefuses()) {
+            appState.dirty = true;
+            return;
+        }
+        const owner = knobOwner();
+        if (d2 > 0) {
+            const info = owner.knobParamInfo(d1);
+            /*
+             * CLEAR + KNOB IS A KNOB GESTURE, WHATEVER IT FOUND.
+             *
+             * Clear's RELEASE deletes the active clip unless the gesture marked
+             * itself as having acted, and this branch used to mark it only when
+             * the owner named a parameter. A knob with nothing under it — an
+             * empty cell on a page that does not fill all 8, a delegated page
+             * still loading — answered null, fell through, and letting go of
+             * Clear wiped the clip. That is data loss, and it is the reason
+             * consuming the gesture cannot be conditional on the lookup
+             * succeeding. The lane is cleared when there is one to clear.
+             */
+            if (deleteActive()) {
+                if (info) clearLaneForKnob(appState.activeTrack.index, info);
+                markDeleteActed();
+                appState.dirty = true;
+                return;
+            }
+            /* A DIVE BELONGS TO THE PAGE THAT DREW THE CELL, so the model never
+             * opens its own overlay — it only records the touch, which the
+             * release, the header readout and the file-browse gesture read. */
+            const model = knobModel();
+            model?.handleKnobTouch(d1);
+            /* Pinned so the release goes back to THIS model, not whatever
+             * knobModel() resolves to later (see knob-model-pin.ts). */
+            pinModel(d1, model ?? null);
+            /* Schwung shows the held param's full name and value in the header
+             * strip, and a dive is a click WITH a knob held — both need the same
+             * finger movy just saw. */
+            pinPage(d1, owner.page);
+            owner.page?.knobTouch(d1, true);
+            automationKnobTouched(d1);    // arm tap-to-clear in step-auto mode
+            /* Scoped to whichever chain the knobs are editing: hold-to-modulate
+             * works on the master FX pages too, and a master knob's target
+             * belongs to the master LFOs, not the active track's. */
+            /* Only a REGULAR knob arms it: every other kind's click already
+             * means something (`regularKnob`). */
+            const armable = !!owner.page?.regularKnobAt(d1);
+            holdTouch(knobLfoScope(), d1, armable ? info : null);   // arm hold-to-modulate
+        } else {
+            const info = owner.knobParamInfo(d1);
+            /* The same rule from the other end: letting go of a knob while
+             * Clear is held is still the knob's gesture, even when Clear went
+             * down after the touch did. */
+            if (deleteActive()) markDeleteActed();
+            /* The model's release is delivered above, from owedModel (the pin
+             * taken at the top of this block) — NOT by re-resolving
+             * knobModel() here, which is exactly the bug this pin exists to
+             * avoid (see knob-model-pin.ts). */
+            /* Only when the press recorded no page: the pinned page above has
+             * already taken the release, and asking this owner as well would
+             * hand it one it never heard. */
+            if (!owed) owner.page?.knobTouch(d1, false);
+            if (info) automationKnobReleased(appState.activeTrack.index, d1, info);
+            holdRelease(d1);
+        }
+        return;
+    }
+
+    /* Master (volume) knob touch: note=8 — arms the track-volume gesture, and
+     * shows the master slider where the knob is movy's. */
+    if ((status & 0xF0) === 0x90 && d1 === MASTER_TOUCH) {
+        volumeTouch(d2 > 0);
+        masterVolumeTouch(d2 > 0);
+        appState.dirty = true;
+        return;
+    }
+
+    /* Main encoder (jog) touch: note=9. Arms the hint only — it appears a
+     * beat later (jogHintTick), so grabbing the jog to scroll shows nothing.
+     * The repaint is needed only when the release takes a visible hint away.
+     * In the generator preview the touch itself names the generator showing. */
+    if ((status & 0xF0) === 0x90 && d1 === JOG_TOUCH) {
+        if (appState.currentView === VIEW_CHAIN || appState.currentView === VIEW_KNOBS || aiPreviewActive()) {
+            if (jogHintTouch(d2 > 0)) appState.dirty = true;
+        }
+        return;
+    }
+
+    /* Any other sub-10 note is an encoder touch we don't use */
+    if ((status & 0xF0) === 0x90 && d1 < 10) return;
+
+    /* Pad notes */
+    if (d1 >= PAD_MIN && d1 <= PAD_MAX) {
+        const model   = synthModel();
+        const drumCfg = model?.getDrumConfig() ?? null;
+        const track = appState.activeTrack.index;
+        /* Mute (+Shift) and a pad silences that drum VOICE — the per-voice form
+         * of the track mute, on the same gesture shape. Taken here, ahead of
+         * everything below, and consumed whole: no note sounds and the page
+         * does not follow a pad the user was only silencing.
+         *
+         * `muteMarkGestured` is what stops Mute's own release from muting the
+         * whole track on top of this — without it every pad mute would also
+         * silence the track, which is the one thing the user did not ask for.
+         *
+         * Drum tracks only. On a melodic track the pads ARE notes, and a note
+         * has no voice to silence; in Session they are the clip grid, which
+         * `seqHandleMidi` has already answered. Shift is read at the action as
+         * well as at the press, like the track solo — either order is natural. */
+        if ((status & 0xF0) === 0x90 && d2 > 0 && muteHeld() && drumCfg && padsPlayNotes()) {
+            const voice = drumNoteOfPhys(d1, PAD_MIN, drumCfg);
+            if (voice >= 0) {
+                muteMarkGestured();
+                padMuteGesture(track, voice, muteShiftHeld() || appState.shiftHeld);
+                appState.dirty = true;
+                return;
+            }
+        }
+        if ((status & 0xF0) === 0x90 && d2 > 0) {
+            const vel = seqState.fullVelocity ? 127 : d2;
+            /* "A finger did that." Move turns a pad press into an ordinary note
+             * BEFORE playing it, so by the time it reaches the module's on_midi
+             * a hit and a sequenced note are the same bytes — same status,
+             * channel, note and source. This is the one fact the module cannot
+             * get for itself, and under `page` it is the other half of the
+             * follow: focusVoice() below moves the SCHWUNG page to the voice,
+             * and this moves the MODULE's own focus, which is what its
+             * per-voice keys resolve against. Without it the page turns to the
+             * snare while the knobs still edit the kick.
+             *
+             * No hardware-press sift is needed here, unlike Schwung's own
+             * vouch: that one reads raw cable 0, where steps, track buttons and
+             * knob touch all arrive as notes on the same wire. movy owns the
+             * surface and has already decoded this as a pad — and the
+             * sequencer's own notes never reach this site.
+             *
+             * The vouch, never a pad id: the pad-to-note map is Move's (drum
+             * layout, octave, a track's transpose), and a module told "pad 68"
+             * could only ever address one bank, mis-strided. The module pairs
+             * this with the note it receives itself. Note-on only, one write
+             * per press — which is exactly this branch. */
+            const pressParam = model?.getPressParam();
+            if (pressParam) {
+                portFor(track).setParam(model!.getComponentKey() + ':' + pressParam, '1');
+            }
+            if (drumCfg) {
+                const pad = drumPadOn(d1, PAD_MIN, appState.shiftHeld, drumCfg, model!.getComponentKey(), track, vel);
+                /* The only trace a pad leaves: without it there is no way to
+                 * tell a pad that changed nothing from a pad that never
+                 * arrived. */
+                mlog('drumPad note=' + d1 + ' pad=' + pad);
+                if (pad !== null) {
+                    model!.updateDrumPad(pad, d1);
+                    /* SP-39. THE PAGE-FOLLOW GESTURE, TIMED. A pad press is the
+                     * most-used gesture on a drum track. It sits OUTSIDE the
+                     * tick (a press is handled before `tick()`), so without this
+                     * phase a synchronous cost here is visible only as a
+                     * `peak_period` spike against the host loop's 12-32 ms
+                     * noise floor. */
+                    perfPhase('padpage');
+                    /* `finally` BECAUSE `perf_phase` IS AN OPEN/CLOSE PAIR WITH
+                     * NO RESET: `perfPhase`/`perfPhaseEnd` share one name and
+                     * one start stamp, so a throw between them leaves the phase
+                     * open and the NEXT window reports this gesture's start as
+                     * its own — a cost attributed to the wrong window, and one
+                     * the probe cannot show you. A phase that is only closed on
+                     * the happy path is a phase that lies exactly when something
+                     * went wrong. */
+                    try {
+                        /* PAD-FOLLOW: the module said which level each voice
+                         * lives on and Schwung named that level on the page it
+                         * planned, so the pad shows its voice's page. Reported
+                         * from the device as the header following the pad while
+                         * the page stood still. */
+                        const page = pageOwnerOf(model).page;
+                        /* A config rack's focus write (sophie's `focused_pad`)
+                         * is the press too: the page resolves its child level
+                         * at movy's pad, never at the module's report (D8). */
+                        const fw = padFocusWrite(drumCfg, pad);
+                        if (fw) page?.focusWritten(model!.getComponentKey() + ':' + fw.key, fw.value);
+                        page?.focusVoice(pad, drumNoteOfPad(pad, drumCfg));
+                    } finally {
+                        perfPhaseEnd();
+                    }
+                }
+            } else {
+                noteOn(d1, PAD_MIN, track, vel);
+            }
+            /* The pitch this pad actually sounded, from the ledger — not
+             * `lastPlayedNote`, which is the last note played ANYWHERE and is
+             * simply stale when the press produced nothing (a pad outside the
+             * drum grid, a piano-layout gap, a shift-select). Passing that stale
+             * value let a gesture act on a pitch the user never touched: holding
+             * Clear and hitting a dead pad wiped the previous pad's whole lane. */
+            const played = soundingPitch(d1);
+            if (played !== undefined) seqNotePadPlayed(track, d1, played, vel);
+            return;
+        }
+        if ((status & 0xF0) === 0x80 || ((status & 0xF0) === 0x90 && d2 === 0)) {
+            // Read the owner before the release drains it — the record-capture
+            // note-off has to reach the same track the note was played on.
+            const owner = soundingTrack(d1) ?? track;
+            if (drumCfg) {
+                drumPadOff(d1);
+            } else {
+                noteOff(d1, PAD_MIN);
+            }
+            seqNotePadReleased(d1, owner);
+            return;
+        }
+    }
+
+    /* Master volume knob (CC 79): with a track button held it edits that track's
+     * level; otherwise it is the master (master-volume.ts). */
+    if ((status & 0xF0) === 0xB0 && d1 === MASTER_CC) {
+        if (volumeKnobDelta(d2)) {
+            momentaryGesture();   // a volume edit means the release must not latch
+            appState.dirty = true;
+        } else if (masterVolumeKnob(d2)) {
+            appState.dirty = true;
+        }
+        return;
+    }
+
+    /* Knob CC (71–78) — automation gets first refusal (hold-step / Rec / a
+     * param already bound to a lane); otherwise the normal param-set path. */
+    if ((status & 0xF0) === 0xB0 && d1 >= KNOB_CC_BASE && d1 < KNOB_CC_BASE + NUM_KNOBS) {
+        const k     = d1 - KNOB_CC_BASE;
+        const delta = decodeDelta(d2);
+        holdTurnCancel();   // a knob turn cancels a pending / active hold-to-modulate
+        // Main/Clip Params first, for the same reason as the touch branch above:
+        // the page on screen owns its knobs, whatever a step hold thinks.
+        if (mixerPageActive()) { mixerKnobTurn(k, delta); return; }
+        if (noteViewActive()) return;
+        if (mainPageActive()) {
+            // 0 tempo, 1 swing, 3 quant, 4 root, 5 key, 6 mode, 7 layout.
+            if (k < 8) {
+                mainParamsOwner().page?.knobTurn(k, delta);
+                appState.dirty = true;
+            }
+            return;
+        }
+        if (clipPageActive()) {
+            if (k < 4 && freezeGuard(appState.activeTrack.index)) return;
+            if (k < 4) {
+                clipParamsOwner().page?.knobTurn(k, delta);
+                appState.dirty = true;
+            }
+            return;
+        }
+        if (flagsPageActive()) {
+            // Knob 1 edits the selected row: CLICK VOLUME's level, LINK's
+            // on/off. Everything else is consumed anyway, so a stray turn
+            // cannot reach the module underneath.
+            if (k === 0 && clickRowSelected() && clickVolumeTurn(delta)) appState.dirty = true;
+            if (k === 0 && linkRowSelected() && linkSettingTurn(delta)) appState.dirty = true;
+            return;
+        }
+        if (cpuPageActive()) {
+            // Nothing on this page is editable. Consumed anyway, or a stray
+            // turn reaches the module underneath and edits a parameter the user
+            // cannot see.
+            return;
+        }
+        // Step page owns the knobs while it is selected (intrinsic trig props,
+        // never chain automation). Knobs 5..7 are blank → ignored.
+        if (stepPageAvailable() && stepPageState.selected) {
+            if (k < 5) stepParamsOwner().page?.knobTurn(k, delta);
+            return;
+        }
+        mlog('knobCC k=' + k + ' d2=' + d2 + ' delta=' + delta);
+        const model = knobModel();
+        const track = appState.activeTrack.index;
+        /* A frozen track's chain is unloaded: an edit would go nowhere and the
+         * unfreeze would bring the old sound back. Say so instead. */
+        if (frozenChainRefuses()) return;
+        /*
+         * THE LANE MUST TARGET THE PARAMETER THAT IS ACTUALLY UNDER THE KNOB.
+         *
+         * `model.getKnobParamInfo(k)` is movy's idea of it, and under Schwung
+         * pagination the two planners put DIFFERENT keys in the same cell — 9
+         * of them across the mock presets. Binding a lane from movy's answer
+         * while Schwung draws the page is a silent mis-target: the lane works
+         * perfectly, on the wrong param. So the info comes from whoever owns
+         * the page, and the automation layer is unchanged.
+         */
+        const owner = pageOwnerOf(model);
+        const info = owner.knobParamInfo(k);
+        if (info && handleAutomationKnob(track, k, info, delta,
+                mappingFor(info, (key, val) => portFor(track).setParam(key, val)))) {
+            return;
+        }
+        /* Not automation, so it is an edit — through Schwung's own onKnobTurn,
+         * which carries the acceleration curve, the enum seeding, the write
+         * throttle and the settle window. A second write path here is what the
+         * one-implementation rule exists to prevent. */
+        /* A page still loading takes no turn: nothing is on screen to turn. */
+        if (owner.page) { owner.page.knobTurn(k, delta, appState.shiftHeld); appState.dirty = true; }
+        return;
+    }
+
+    if ((status & 0xF0) !== 0xB0) return;
+
+    /* Track buttons (CC 40–43): CC43=slot0 … CC40=slot3.
+     * Mute+track gesture mutes; otherwise momentary: down opens the track's
+     * note layout, up decides tap (latch) vs hold (return to prior state). */
+    if (d1 >= TRACK_CC_START && d1 <= TRACK_CC_END) {
+        /* The four buttons are hardware, not tracks: they address the focused
+         * group's quartet. CC 43 is the group's first track (the mapping is
+         * reversed — CC 40 is the fourth). */
+        const track = focusedTrack(TRACK_CC_END - d1);
+        if (d2 > 0) {
+            volumeTrackDown(track);   // arm hold-track + volume knob
+            // Mute+track mutes that track; Shift+Mute+track solos it instead.
+            // Shift counts if it was down at the Mute press or is down now, so
+            // neither ordering of the two modifiers loses the gesture.
+            // Either marks the Mute press as gestured, so its release no longer
+            // toggles the *current* track as well.
+            if (muteHeld()) {
+                if (muteShiftHeld() || appState.shiftHeld) toggleSolo(track);
+                else muteTrack(track);
+                muteMarkGestured(); appState.dirty = true; return;
+            }
+            /* Snapshot before switching so the hold-release closure returns
+             * exactly here. beginTrackSwitch also closes the global Main/Clip
+             * Params pages, which a track button always leaves. */
+            /* Shift + track button: that track's menu (Freeze / Unfreeze,
+             * seq/track-menu.ts), without switching to it. */
+            if (appState.shiftHeld) {
+                openTrackMenu(track);
+                appState.dirty = true;
+                return;
+            }
+            const prev = beginTrackSwitch();
+            momentaryDown(d1, () => restoreTrackState(prev));
+            switchToTrack(track, prev);
+        } else {
+            volumeTrackUp(track);
+            momentaryUp(d1);
+            appState.dirty = true;
+        }
+        return;
+    }
+
+    /* Shift */
+    if (d1 === MoveShift) { appState.shiftHeld = d2 > 0; return; }
+
+    /* Back */
+    if (d1 === MoveBack && d2 > 0) {
+        jogHintTouch(false);
+        holdTurnCancel();   // Back cancels an active hold-to-modulate
+        /*
+         * SCHWUNG'S LAYERS COME DOWN FIRST, one per press: a hint, then the
+         * enum peek, then the section picker, then an entered menu. Only when
+         * none of them was up does Schwung answer `exit`, and only then is Back
+         * movy's — which is what keeps it from being a trap. Reported upstream
+         * as "if i hit back during autopeek it exits the module": a peek about
+         * to vanish on its own should not take the module with it.
+         *
+         * The ladder is Schwung's own `applyInput`, not a copy — see
+         * schwung-page.ts. movy asks and obeys.
+         */
+        /* An armed restore confirm is movy's own layer too, and the innermost
+         * one on this page: Back must cancel the restore before it leaves the
+         * page, or the only way out of a confirm is to perform it. */
+        if (versionsPageActive() && versionsPageBack()) { appState.dirty = true; return; }
+        if (setsPageActive() && setsPageBack()) { appState.dirty = true; return; }
+        /* The divable editor is movy's own layer, so it comes down before we
+         * ask Schwung about its layers. */
+        if (schwungEditorActive()) { schwungEditorCancel(); appState.dirty = true; return; }
+        {
+            /* ONLY WHILE SCHWUNG IS THE THING ON SCREEN.
+             *
+             * A DELEGATED page EXISTS whatever is on screen — it stays ready
+             * while movy shows its module browser, the keys view, a param page
+             * of its own. Routing Back to it from
+             * those swallowed the press and the browser could not be left:
+             * Back is Schwung's ladder on Schwung's pages and movy's
+             * everywhere else. Found on device, backing out of the module
+             * browser. */
+            const onSchwungView = appState.currentView === VIEW_KNOBS
+                               || appState.currentView === VIEW_CHAIN
+                               || appState.currentView === VIEW_CLIP_PARAMS
+                               || appState.currentView === VIEW_MAIN_PARAMS;
+            /* Set/Clip Params (SP-53) have no model for `knobOwner()` to
+             * resolve — their own accessors answer the same question. */
+            const spb = appState.currentView === VIEW_CLIP_PARAMS ? clipParamsOwner().page
+                      : appState.currentView === VIEW_MAIN_PARAMS ? mainParamsOwner().page
+                      : onSchwungView ? knobOwner().page : null;
+            if (spb) {
+                const intent = spb.back();
+                appState.dirty = true;
+                if (!intent) return;         /* a layer came down; that was the press */
+            }
+        }
+        if (masterDetailActive()) {
+            appState.masterDetail = false;   // master detail → back to the slot grid
+            appState.dirty = true;
+            return;
+        }
+        if (paramPageActive()) {         // Set/Clip Params: one Back leaves both
+            appState.currentView = closeParamPage();
+            appState.dirty = true;
+            return;
+        }
+        if (appState.currentView === VIEW_BROWSE) {
+            appState.currentView = appState.browseOrigin;
+            appState.dirty = true;
+        } else if (appState.currentView === VIEW_FILE_BROWSE) {
+            cancelFileBrowser();
+            appState.currentView      = appState.browseOrigin;
+            appState.dirty = true;
+        } else if (appState.currentView === VIEW_KEYS || appState.currentView === VIEW_KNOBS) {
+            appState.currentView = VIEW_CHAIN;
+            appState.dirty = true;
+        } else {
+            // Root view → open the Leave-Movy modal (Background vs Close Movy).
+            // Release live notes now: the modal swallows pad MIDI while it's up,
+            // so a physically-held pad would otherwise strand. Background then
+            // parks (sequencer + Phase 1 clock keep running under Move's UI);
+            // Shift+Back stays the host's instant full-exit.
+            releaseAllLive();
+            // Confirming Background hands the foreground to Move, and every
+            // release still owed to us goes there instead. Forget them now,
+            // while we still know what they are.
+            resetHeldInput(true);
+            openLeaveModal();
+            appState.dirty = true;
+        }
+        return;
+    }
+
+    /* Jog click */
+    if (d1 === MoveMainButton && d2 > 0) {
+        /* The two list pages take the click before any of the chain/knob
+         * handling below: on them it is the list's own action, not a door. */
+        if (setsPageActive()) {
+            setsPageClick(currentSetUuid());
+            appState.dirty = true;
+            return;
+        }
+        if (versionsPageActive()) {
+            /* A restore rewrote the files under the open Set, so it has to be
+             * re-entered — the same path a set switch takes, which is what
+             * makes the modules reload behind the ordinary splash. */
+            versionsPageClick(currentSetUuid());
+            appState.dirty = true;
+            return;
+        }
+        if (flagsPageActive() && linkRowSelected()) {
+            linkSettingToggle();
+            appState.dirty = true;
+            return;
+        }
+        if (flagsPageActive() && backupsRowSelected()) {
+            openVersionsPage();
+            appState.dirty = true;
+            return;
+        }
+        if (flagsPageActive() && migrateRowSelected()) {
+            migrateRowClick(currentSetUuid());
+            appState.dirty = true;
+            return;
+        }
+        /* A frozen track's chain is unloaded: the click would open the module
+         * browser on an empty slot. Say why instead (seq/freeze.ts). */
+        if (frozenChainRefuses()) {
+            appState.dirty = true;
+            return;
+        }
+        /*
+         * A GESTURE ALREADY IN FLIGHT DECIDES ITS OWN CLICK — which is why the
+         * next two blocks sit ABOVE Schwung's door below. Both of them end with
+         * a knob or a step under a finger, and a knob under the hand is one of
+         * the conditions Schwung's ladder takes a click on: with the door
+         * first, assign mode could never be committed or navigated out of, and
+         * a held-step click never drilled from the chain into the params.
+         */
+        // Assign-mode: commit the LFO modulation (assign → jump to that LFO's
+        // chain page; remove → stay + toast). Consumes the click.
+        if (assignActive()) {
+            const r = assignCommit();
+            if (r) {
+                knobModel()?.refreshModulation();   // update the ~ mark immediately
+                if (r.assigned) {
+                    /* Land on the LFO page that now owns the param — the master
+                     * chain's when the gesture happened there, the track's
+                     * otherwise. */
+                    const onMaster = masterChainActive();
+                    let lm;
+                    if (onMaster) {
+                        appState.masterChainIndex = MASTER_LFO_INDEX;
+                        appState.masterDetail = false;
+                        lm = appState.masterFxModels[MASTER_LFO_INDEX];
+                    } else {
+                        appState.trackChainIndex[appState.activeTrack.index] = LFO_CHAIN_INDEX;
+                        appState.currentView = VIEW_CHAIN;
+                        lm = appState.trackModels[appState.activeTrack.index]?.[LFO_CHAIN_INDEX];
+                    }
+                    if (lm) {
+                        lm.reload();   // re-read the freshly-written target (cache was stale)
+                        /* Under `page` the LFO page is Schwung's, and ITS values
+                         * were read before the write — the controller keeps them
+                         * until its cursor comes round. Dropped, so the owner
+                         * builds it afresh and the landing warms it live, rather
+                         * than showing the LFO Off for a few ticks (SP-60). */
+                        const ref = pageRefOf(lm);
+                        if (ref) schwungGridDrop(ref.track, ref.componentKey);
+                        pageOwnerOf(lm).goToPage(r.lfoIdx);
+                    }
+                } else {
+                    seqToast('LFO' + (r.lfoIdx + 1) + ' mod removed');
+                }
+                appState.dirty = true;
+            }
+            return;
+        }
+        // While a step is held, the jog click is navigation-only: drill from the
+        // chain into the focused module's params, never open a browser (Back
+        // returns to the chain). Lets one held step automate across modules.
+        if (anyStepHeld()) {
+            if (appState.currentView === VIEW_CHAIN) {
+                appState.currentView = VIEW_KNOBS;
+                appState.dirty = true;
+            }
+            return;
+        }
+        /*
+         * A DOOR IS SCHWUNG'S CLICK.
+         *
+         * While Schwung owns the pages, a menu / items / preset / child page is
+         * something you go INTO, and only Schwung knows that — movy's click on
+         * these views opens its module browser. Asking `isDoor()` rather than
+         * listing kinds is the controller's own instruction ("Ask the
+         * controller; do not restate the kinds"), and it is what keeps the
+         * module browser reachable everywhere else.
+         */
+        {
+            /* Set/Clip Params (SP-53) have no model for `knobOwner()` to
+             * resolve — their own accessors answer the same question. */
+            const spc = appState.currentView === VIEW_CLIP_PARAMS ? clipParamsOwner().page
+                      : appState.currentView === VIEW_MAIN_PARAMS ? mainParamsOwner().page
+                      : knobOwner().page;
+            /*
+             * Schwung takes the click when it has something to do with it: a
+             * door page to enter, its own picker to choose from, or a KNOB
+             * UNDER THE HAND whose parameter dives.
+             *
+             * Deliberately NOT the fourth rung of Schwung's ladder — a click
+             * with nothing held opens its section picker, and that is movy's
+             * module browser on both these views. Taking it would trade a
+             * gesture people use for one they have never had. Left with movy
+             * until the collision is decided.
+             */
+            /*
+             * SHIFT+CLICK IS THE SECTION PICKER, which is Schwung's own idiom
+             * ("Shift+Click is the section picker, EVERYWHERE" — page_input).
+             * Taken only on VIEW_KNOBS: on VIEW_CHAIN Shift+click already opens
+             * movy's module browser, and that gesture is older and more used.
+             *
+             * The plain no-knob-held click stays movy's on both views for the
+             * same reason — it is the module browser, and Schwung's fourth rung
+             * would have taken it.
+             */
+            const wantPicker = appState.shiftHeld && appState.currentView === VIEW_KNOBS;
+            /* Same gate as Back: a page that exists is not a page you are
+             * looking at, and a click on movy's own screens is movy's. */
+            const onSchwungView = appState.currentView === VIEW_KNOBS
+                               || appState.currentView === VIEW_CHAIN
+                               || appState.currentView === VIEW_CLIP_PARAMS
+                               || appState.currentView === VIEW_MAIN_PARAMS;
+            if (onSchwungView && spc
+                && (wantPicker || spc.ctl.pickerOpen || spc.ctl.isDoor()
+                    || spc.ctl.state.touched >= 0)) {
+                const intent = spc.click(wantPicker);
+                appState.dirty = true;
+                /* A divable param opens its list, or — with no options, as a
+                 * filepath has none — movy's file browser, bound to the
+                 * intent's own key; a canvas opens the module's own screen
+                 * (schwung-canvas-dive.ts). What is left is still logged rather
+                 * than dropped: a string has no screen here yet, and a param
+                 * that appears inert is exactly the failure a silent drop
+                 * would hide. */
+                if (intent && intent.action === 'open'
+                    && !openSchwungEditor(intent, spc)
+                    && !(spc.canvasDive && spc.canvasDive(intent))
+                    && !openSchwungDive(intent, spc, activeModel())) {
+                    mlog('schwung-open unhandled ' + (intent.key || '?')
+                       + ' kind=' + (intent.meta ? intent.meta.kind : '?')
+                       + ' type=' + (intent.meta ? intent.meta.type : '?'));
+                }
+                return;
+            }
+        }
+        if (appState.currentView === VIEW_BROWSE) {
+            loadSelectedModule();
+        } else if (appState.currentView === VIEW_FILE_BROWSE) {
+            /* A file committed into a component Schwung owns changes what that
+             * module DECLARES — a wav decides the position marker that indexes
+             * it, a ROM its banks — so the contract this page was planned from
+             * comes due shortly. `selectionChanged` is the controller's own
+             * name for that, and the shadow host's list editor drives the same
+             * modules through its own browser and has the same race. */
+            const committed = appState.fileBrowserState;
+            activateFileBrowserItem();
+            if (committed && !appState.fileBrowserState) {
+                const owner = pageOwnerOf(activeModel());
+                if (owner.page && owner.ref
+                    && owner.ref.componentKey === committed.componentKey) {
+                    owner.page?.ctl.selectionChanged();
+                }
+            }
+        } else if (masterChainActive()) {
+            // Master FX chain, mirroring the track chain:
+            //  - in the detail page, a click opens the browser to swap the module
+            //    (browseOrigin VIEW_CHAIN + masterDetail kept → Back returns to detail);
+            //  - on the grid, an empty slot (or Shift) opens the browser to add/swap,
+            //    and a loaded slot drills into its detail page.
+            const mi = appState.masterChainIndex;
+            const isEmpty = masterModel()?.getViewModel().isEmpty ?? false;
+            /* The LFO slot has no module to browse for — a click only ever
+             * drills into it, exactly as the track chain's LFO slot does. */
+            if (isMasterLfoSlot(mi)) {
+                appState.masterDetail = true;
+                appState.dirty = true;
+            } else if (appState.masterDetail || appState.shiftHeld || isEmpty) {
+                openBrowser(MASTER_FX_SLOTS[mi], 0, () => masterModel()?.reload());
+                appState.browseOrigin = VIEW_CHAIN;
+            } else {
+                appState.masterDetail = true;
+                appState.dirty = true;
+            }
+        } else if (appState.currentView === VIEW_KEYS) {
+            appState.currentView = VIEW_CHAIN;
+            appState.dirty = true;
+        } else if (appState.currentView === VIEW_CHAIN || appState.currentView === VIEW_KNOBS) {
+            // Holding a file-param knob + jog click opens the file browser — the
+            // same gesture works on the module knob page and on the chain page,
+            // since the touched param lives on the model regardless of view.
+            // browseOrigin returns to whichever view the click happened in.
+            /* The editor is a modal layer: while it is up the click is its
+             * commit and nothing else's. */
+            if (schwungEditorActive()) { schwungEditorCommit(); appState.dirty = true; return; }
+            /* The parameter under the finger comes from the page that DREW the cell. */
+            const fileOwner = pageOwnerOf(activeModel());
+            const fileTarget = activeModel()?.getFileBrowseTarget(
+                (slot) => fileOwner.knobParamInfo(slot)?.key ?? null) ?? null;
+            if (fileTarget) {
+                // Capture the origin BEFORE openFileBrowser flips currentView to
+                // VIEW_FILE_BROWSE — otherwise Back/select return to the browser
+                // itself, leaving a frozen screen.
+                appState.browseOrigin = appState.currentView;
+                openFileBrowser(
+                    appState.activeTrack.index,
+                    activeModel()!.getComponentKey(),
+                    fileTarget.key,
+                    fileTarget.gi,
+                    fileTarget.root,
+                    fileTarget.filter,
+                    fileTarget.startPath,
+                    fileTarget.currentPath,
+                    fileTarget.requireContains,
+                    fileTarget.browse,
+                );
+            } else if (appState.currentView === VIEW_CHAIN) {
+                const isEmpty = activeModel()?.getViewModel().isEmpty ?? false;
+                // The LFO slot has no module to add/swap — a click always drills.
+                if (!isLfoSlot(chainIndex()) && (appState.shiftHeld || isEmpty)) {
+                    openBrowser(CHAIN_SLOTS[chainIndex()], appState.activeTrack.index, () => activeModel()?.reload());
+                    appState.browseOrigin = VIEW_CHAIN;
+                } else {
+                    appState.currentView = VIEW_KNOBS;
+                    appState.dirty = true;
+                }
+            } else if (!isLfoSlot(chainIndex())) {
+                // VIEW_KNOBS with no file param held → module browser (the LFO
+                // slot has no module to swap, so a click is a no-op there).
+                openBrowser(CHAIN_SLOTS[chainIndex()], appState.activeTrack.index, () => activeModel()?.reload());
+                appState.browseOrigin = VIEW_KNOBS;
+            }
+        }
+        return;
+    }
+
+    /* Jog rotation */
+    if (d1 === MoveMainKnob) {
+        const delta = decodeDelta(d2);
+        if (delta !== 0) {
+            jogHintTouch(false);   // a turn answers the hint's question — drop it
+            /* The editor's list is what the jog moves while it is up — ahead of
+             * everything, because a modal that let the page change underneath
+             * it would commit against a parameter you can no longer see. */
+            if (schwungEditorActive()) { schwungEditorJog(delta); appState.dirty = true; return; }
+            if (assignActive()) { assignCycle(delta); appState.dirty = true; return; }
+            if (mixerPageActive()) { mixerJog(delta); return; }   // its pages, like any Schwung page
+            /* Global Params scrolls its list. Ahead of the view branches below
+             * because the jog is the page's ONLY navigation — the other two
+             * param pages put every parameter under a knob and leave the jog to
+             * the chain nav underneath. */
+            /* Shift+jog jumps a screen: 32 versions is eight screens of plain
+             * scrolling, and the level-skip idiom is already established by the
+             * cursor pagination. */
+            /* The whole delta, never its sign: movy-host sums a tick's detents
+             * into one packet (host/deltas.c), so a fast spin arrives as one
+             * event of many rows and the sign alone moved one. */
+            if (setsPageActive()) {
+                setsPageJog(delta, appState.shiftHeld);
+                appState.dirty = true;
+                return;
+            }
+            if (versionsPageActive()) {
+                versionsPageJog(delta, appState.shiftHeld);
+                appState.dirty = true;
+                return;
+            }
+            if (flagsPageActive()) {
+                flagsPageJog(delta);
+                appState.dirty = true;
+                return;
+            }
+            if (cpuPageActive()) return;   // sixteen columns fit; nothing to scroll
+            if (masterDetailActive()) {
+                pageOwnerOf(masterModel()).changePage(delta > 0 ? 1 : -1);
+            } else if (masterGridActive()) {
+                appState.masterChainIndex = Math.max(0, Math.min(LAST_MASTER_INDEX, appState.masterChainIndex + (delta > 0 ? 1 : -1)));
+            } else if (appState.currentView === VIEW_CHAIN) {
+                const dir = delta > 0 ? 1 : -1;
+                if (stepPageAvailable()) {
+                    if (stepPageState.selected) {
+                        if (dir > 0) setStepPageSelected(false);       // leave step → slots
+                    } else if (dir < 0 && chainIndex() === 0) {
+                        setStepPageSelected(true);                     // enter step page
+                    } else {
+                        setChainIndex(Math.max(0, Math.min(LAST_CHAIN_INDEX, chainIndex() + dir)));
+                    }
+                } else {
+                    setChainIndex(Math.max(0, Math.min(LAST_CHAIN_INDEX, chainIndex() + dir)));
+                }
+                mlog('chain chainIndex=' + chainIndex());
+            } else if (appState.currentView === VIEW_KNOBS) {
+                const dir = delta > 0 ? 1 : -1;
+                const m = activeModel();
+                if (stepPageAvailable()) {
+                    const onBank0 = pageOwnerOf(m).pageIndex === 0;
+                    if (stepPageState.selected) {
+                        if (dir > 0) setStepPageSelected(false);
+                    } else if (dir < 0 && onBank0) {
+                        setStepPageSelected(true);
+                    } else {
+                        pageOwnerOf(m).changePage(dir);
+                    }
+                } else {
+                    pageOwnerOf(m).changePage(dir);
+                }
+            } else if (appState.currentView === VIEW_BROWSE) {
+                browserState.browseIndex = Math.max(0, Math.min(browserState.modules.length - 1, browserState.browseIndex + delta));
+            } else if (appState.currentView === VIEW_FILE_BROWSE) {
+                navigateFileBrowser(delta);
+            }
+            appState.dirty = true;
+        }
+        return;
+    }
+
+    /* Left/Right — master FX slot nav in session mode; page nav in VIEW_KNOBS;
+     * chain-slot nav in VIEW_CHAIN. */
+    if (d1 === MoveLeft && d2 > 0) {
+        if (masterDetailActive()) {
+            pageOwnerOf(masterModel()).changePage(-1);
+        } else if (masterGridActive()) {
+            appState.masterChainIndex = Math.max(0, appState.masterChainIndex - 1);
+        } else if (appState.currentView === VIEW_CHAIN) {
+            if (stepPageAvailable() && !stepPageState.selected && chainIndex() === 0) setStepPageSelected(true);
+            else if (!(stepPageAvailable() && stepPageState.selected)) setChainIndex(Math.max(0, chainIndex() - 1));
+        } else if (appState.currentView === VIEW_KNOBS) {
+            const o = pageOwnerOf(activeModel());
+            if (stepPageAvailable() && !stepPageState.selected && o.pageIndex === 0) setStepPageSelected(true);
+            else if (!(stepPageAvailable() && stepPageState.selected)) o.changePage(-1);
+        }
+        appState.dirty = true;
+        return;
+    }
+    if (d1 === MoveRight && d2 > 0) {
+        if (masterDetailActive()) {
+            pageOwnerOf(masterModel()).changePage(1);
+        } else if (masterGridActive()) {
+            appState.masterChainIndex = Math.min(LAST_MASTER_INDEX, appState.masterChainIndex + 1);
+        } else if (appState.currentView === VIEW_CHAIN) {
+            if (stepPageAvailable() && stepPageState.selected) setStepPageSelected(false);
+            else setChainIndex(Math.min(LAST_CHAIN_INDEX, chainIndex() + 1));
+        } else if (appState.currentView === VIEW_KNOBS) {
+            if (stepPageAvailable() && stepPageState.selected) setStepPageSelected(false);
+            else pageOwnerOf(activeModel()).changePage(1);
+        }
+        appState.dirty = true;
+        return;
+    }
+
+    /* +/- buttons shift the chromatic pad layout by an octave. Disabled on drum
+     * tracks (drum pad layout has no octave concept). On melodic tracks: press
+     * flashes the button white, release clears it. */
+    if (d1 === MoveUp || d1 === MoveDown) {
+        const dir = d1 === MoveUp ? 1 : -1;
+        /* In Session view the pads are the clip grid, so there is no octave to
+         * shift and these buttons move the focused GROUP instead. Checked
+         * before the drum guard: group navigation is not a per-track concept,
+         * so a drum track must not disable it. */
+        if (seqState.sessionMode) {
+            const gdir = d1 === MoveUp ? GROUP_DIR_UP : GROUP_DIR_DOWN;
+            if (d2 > 0 && focusGroupStep(gdir)) {
+                appState.initLedsDone = false; appState.initLedIndex = 0;
+            }
+            setButtonLED(d1, d2 > 0 ? WHITE_BRIGHT : WHITE_DIM, true);
+            appState.dirty = true;
+            return;
+        }
+        if (trackIsDrum(appState.activeTrack.index)) return;
+        if (d2 > 0) {
+            changeOctave(appState.activeTrack.index, dir);
+            setButtonLED(d1, WHITE_BRIGHT, true);
+        } else {
+            setButtonLED(d1, WHITE_DIM, true);
+        }
+        appState.dirty = true;
+        return;
+    }
+}

@@ -1,0 +1,201 @@
+/* Param metadata → KnobParam. Split out of hierarchy.ts, which owns the page
+ * structure; this file owns what a single knob looks like once its metadata has
+ * been gathered from chain_params and/or ui_hierarchy. */
+import type { KnobParam } from '../types/param.js';
+import { isActionParam, isToggleParam } from './toggle.js';
+import { cellStyleFor } from './step-labels.js';
+import { readAccess } from './access.js';
+import { fileBrowseDeclOf } from './file-decl.js';
+
+/* One param's metadata as published by a module — either a chain_params entry
+ * or a ui_hierarchy params[]/knobs[] entry. Both shapes are partial and the
+ * fields overlap, so one permissive interface serves both. */
+export interface RawMeta {
+    key?: string; label?: string; name?: string; level?: string;
+    /* The cell label, when the module wants it to differ from `name`. The cell
+     * is ~5 characters and the header is the whole screen, so they want
+     * different words: `{name: "Osc 1 Pitch", short_name: "Pitch"}` draws PITCH
+     * in the cell and keeps "Osc 1 Pitch" in the held-knob header. */
+    short_name?: string;
+    type?: string; min?: number; max?: number; step?: number; options?: string[];
+    automatable?: boolean; behavior?: string;
+    /* "read" (a readout) / "write" (a trigger) / "readwrite" (the default).
+     * See model/access.ts — movy guesses both of these from names otherwise. */
+    access?: string;
+    knob_acceleration?: string; knobAcceleration?: string;
+    root?: string; filter?: unknown; start_path?: string;
+    filepath_param?: string;   // wav_position → the file param it indexes
+    ui_type?: string;          // render type when it differs from the data type
+    view_group?: string;       // markers sharing a group draw on one graphic
+    visible_if?: unknown;      // { param, equals } — see visible-if.ts
+    /* The module's own statement about drawing this param. `false` means "no
+     * inferred graphic" — 9W9 ships it on every `*_attack`, which is a click
+     * LEVEL rather than a time. Movy honours the `false` case as an envelope
+     * veto; a `{kind: ...}` object is the module asking for a specific graphic
+     * and is not read here. */
+    viz?: unknown;
+}
+
+/* The module's own cell label, or null to let movy abbreviate.
+ *
+ * PRECEDENCE IS THE REVERSE OF EVERY OTHER FIELD HERE, and deliberately so:
+ * `short_name` belongs to the parameter, but the same parameter can sit on more
+ * than one page — `env_amount` wants "Amt" on an Envelope page and something
+ * else beside an LFO Amt on Main — so a LEVEL's inline entry overrides the
+ * parameter's own. Everywhere else chain_params is the more specific source and
+ * wins; here the level is.
+ *
+ * Empty or blank is not a declaration: it would lock the cell to nothing.
+ * A declaration too wide for the cell is still fitted (shorten.ts) rather than
+ * overflowing — it is a label, not a way to smuggle six characters into five. */
+export function declaredShortName(level: RawMeta, param: RawMeta): string | null {
+    for (const v of [level.short_name, param.short_name]) {
+        if (typeof v === 'string' && v.trim().length > 0) return v.trim();
+    }
+    return null;
+}
+
+/** The first candidate that is actually an option LIST, else null.
+ *
+ *  Module metadata is not typed by anyone movy can hold to it: mrdrums's
+ *  module.json puts an OBJECT under `options` on its wav_position param
+ *  (`{"mode":"start","filepath_param":…}` — configuration for its sample view,
+ *  not choices). Taken as a list, `.map`/`.length` on it threw inside tick(),
+ *  and schwung answers a tick exception by ejecting the tool. A non-list is
+ *  skipped rather than ending the search, so a real list from a lower-priority
+ *  source still counts. */
+export function optionList(...candidates: unknown[]): string[] | null {
+    for (const c of candidates) if (Array.isArray(c)) return c as string[];
+    return null;
+}
+
+export function inferBehavior(explicit: unknown, options: string[] | null,
+                              access: 'read' | 'write' | null = null): KnobParam['behavior'] | undefined {
+    /* Ahead of everything else: `access: "write"` is the module STATING that
+     * this is an action, which outranks any convention read off its options. */
+    if (access === 'write') return 'trigger';
+    if (explicit === 'trigger') return 'trigger';
+    const normalized = (options ?? []).map(v => String(v).trim().toLowerCase());
+    return normalized.includes('idle') && normalized.includes('trigger') ? 'trigger' : undefined;
+}
+
+export function inferAcceleration(value: unknown): KnobParam['knobAcceleration'] | undefined {
+    return value === 'wide' ? 'wide' : undefined;
+}
+
+export function parseFilter(filter: unknown): string[] {
+    if (!filter) return [];
+    const vals = Array.isArray(filter) ? filter as unknown[] : [filter];
+    return (vals as string[])
+        .filter((v): v is string => typeof v === 'string' && v.length > 0)
+        .map(v => v.toLowerCase().startsWith('.') ? v.toLowerCase() : '.' + v.toLowerCase());
+}
+
+/* Generic (no movy config) path: chain_params metadata `cp` wins over the
+ * hierarchy's own `def`, which wins over movy's guesses. */
+export function buildGenericParam(key: string, cp: RawMeta, def: RawMeta): KnobParam {
+    const rawUiType = cp.ui_type || def.ui_type || '';
+    /* `wav_position` is a float with a picture attached. Carrying it as a TYPE
+     * meant every `type === 'float'` branch skipped it — including the one that
+     * encodes the value for writing, which rounded it to an integer. */
+    const declared = cp.type || def.type || 'float';
+    const uiType = rawUiType || (declared === 'wav_position' ? 'wav_position' : '');
+    const type = declared === 'wav_position' ? 'float' : declared;
+    if (type === 'filepath') {
+        /* Where a browser is described is the module's choice: granny puts
+         * root/filter in chain_params, breakbeat and slicer put them in
+         * module.json's ui_hierarchy. Reading only chain_params left a
+         * hierarchy-declared browser rooted at /data/UserData with no
+         * extension filter — every file on the device, none of them relevant. */
+        const root = String(cp.root ?? def.root ?? '/data/UserData');
+        const browse = fileBrowseDeclOf(cp, def);
+        return {
+            key,
+            label:      String(cp.name ?? def.name ?? def.label ?? key),
+            shortLabel: declaredShortName(def, cp),
+            type:       'file',
+            min: 0, max: 0, step: 0,
+            options:    null,
+            renderStyle: 'arc',
+            automatable: false,
+            fileRoot:      root,
+            fileFilter:    parseFilter(cp.filter ?? def.filter),
+            fileStartPath: String(cp.start_path ?? def.start_path ?? root),
+            ...(browse ? { fileBrowse: browse } : {}),
+        };
+    }
+    const options  = optionList(cp.options, def.options);
+    const hasRange = cp.min != null || cp.max != null || def.min != null || def.max != null;
+    let min  = cp.min  != null ? cp.min  : (def.min  != null ? def.min  : 0);
+    let max  = cp.max  != null ? cp.max  : (def.max  != null ? def.max  : 1);
+    let step = cp.step != null ? cp.step : (def.step != null ? def.step : (type === 'float' ? 0.02 : 1));
+    if (type === 'enum') { min = 0; max = options ? options.length - 1 : 127; step = 1; }
+    // C4: no metadata anywhere → movy guessed float 0..1 (numeric types
+    // only). Flag it so the first value read can infer the real int type
+    // and widen the range (see meta-infer.ts / store.ts).
+    const metaGuessed = !hasRange && (type === 'float' || type === 'int');
+    const access   = readAccess(cp.access, def.access);
+    const behavior = inferBehavior(cp.behavior ?? def.behavior, options, access);
+    return {
+        key,
+        label:      cp.name || def.label || key,
+        shortLabel: declaredShortName(def, cp),
+        type:       type as KnobParam['type'],
+        options, min, max, step,
+        ...cellStyleFor(key, type as KnobParam['type'], min, max),
+        // Config-less fallback: the `g_` global-naming convention is the
+        // only signal available here. Modules with a movy config use
+        // bank.global instead (see the config path in hierarchy.ts).
+        automatable: behavior === 'trigger' || access === 'read' ? false
+            : (cp.automatable ?? def.automatable ??
+               (shapeAutomatable(type, min, max, options) && !key.startsWith('g_'))),
+        behavior,
+        /* A readout has no value to record: an automation lane would replay
+         * writes the module ignores, over a knob that cannot be turned. */
+        ...(access === 'read' ? { readOnly: true } : {}),
+        knobAcceleration: inferAcceleration(
+            cp.knob_acceleration ?? cp.knobAcceleration ??
+            def.knob_acceleration ?? def.knobAcceleration,
+        ),
+        ...(uiType ? { uiType } : {}),
+        ...(cp.view_group || def.view_group
+            ? { viewGroup: String(cp.view_group ?? def.view_group) } : {}),
+        ...(cp.filepath_param || def.filepath_param
+            ? { filepathParam: String(cp.filepath_param ?? def.filepath_param) } : {}),
+        ...(metaGuessed ? { metaGuessed: true } : {}),
+    };
+}
+
+/* Whether a param's SHAPE can hold an automation lane: a numeric range, or an
+ * enum with at least two options (drum-modules plan D14 — a lane writes the
+ * option directly, stepped over equal bins, so the old reason to refuse enums,
+ * the chain scaling a CC against a min/max that was not the option count, is
+ * gone). Behaviour, access and the global-bank guard are the callers'. */
+export function shapeAutomatable(type: string, min: number, max: number,
+                                 options: string[] | null | undefined): boolean {
+    if (type === 'enum') return !!options && options.length >= 2;
+    return (type === 'float' || type === 'int') && max > min;
+}
+
+/* The name-driven cell styles, applied AFTER the param is built so each rule
+ * can read the RESOLVED label and options — which is where half the naming
+ * lives. Shared by the generic and config paths so the two cannot drift.
+ *
+ * `explicitRender` means a hand-written config named the style itself; a
+ * template that states its layout outranks anything inferred here. */
+export function applyAutoStyle(p: KnobParam, explicitRender = false): KnobParam {
+    /* Before the switch: an action is boolean-shaped, and drawing it as one
+     * would leave it stuck on after a single use. */
+    if (!p.behavior && isActionParam(p)) {
+        p.behavior = 'trigger';
+        p.automatable = false;
+        return p;
+    }
+    /* A declared readout keeps whatever cell style its shape earned — the frame
+     * is what says "readout", not the widget — but it must not become a SWITCH
+     * below, which would invite the flip it can never perform. */
+    if (p.readOnly) return p;
+    if (explicitRender) return p;
+    if (isToggleParam(p)) p.renderStyle = 'switch';
+    return p;
+}

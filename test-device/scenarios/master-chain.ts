@@ -1,0 +1,114 @@
+/* New with SP-58 — the master chain GRID draws Schwung's body, on hardware.
+ *
+ * Session mode shows the master chain: a slot grid (jog moves slots) and, one
+ * click in, a slot's detail page. SP-52 delegated only the detail page, so on
+ * the grid a SEND or MFX slot's knob body stayed movy's while its knobs already
+ * wrote through Schwung's page — the labels were one page set and the edits
+ * another. Reported from the device as "it only works once I drill in".
+ *
+ * Covered locally by app-loop's SP-58 block against a mock module. What only
+ * the device can add is the real path: a real module in a real send bus, the
+ * real Session latch, the real jog — and movy's own read-back of whose body
+ * the frame drew (`lastParamBody`, through the probe), rather than a picture
+ * that would have to re-encode both renderers to be told apart.
+ *
+ * Covers:
+ *   M1  Session latched onto the master chain grid, SEND 1 focused
+ *   M2  the grid draws the send's body through Schwung
+ *   M3  the master LFO slot draws Schwung's own LFO page (SP-60)
+ */
+import { scenario } from '../runner.js';
+import { Device } from '../device.js';
+import { Probe } from '../probe.js';
+import * as fixture from '../fixture.js';
+import { until } from '../wait.js';
+
+/* test-device/dist/scenarios/master-chain.js at run time. */
+
+/* Note/Session. A tap latches Session from Track view and a second tap leaves. */
+const SESSION_CC = 50;
+/* The same module sends.ts loads: cheap, always installed. SEND 1 is master
+ * slot 0 (MASTER_FX_SLOTS puts the sends first). */
+const SEND_FX = 'freeverb';
+const SEND_SLOT = 0;
+const MAX_JOG = 10;
+/* The master chain's LFO slot — last, after the three sends and four MFX
+ * (src/chain/config.ts MASTER_LFO_INDEX). */
+const LFO_SLOT = 7;
+
+type PageAnswer = { module?: string; body?: string; session?: boolean;
+                    masterDetail?: boolean; masterSlot?: number };
+
+scenario('master-chain', async (t) => {
+    fixture.setHost(t.host);
+    const dev   = new Device(t.tx);
+    const probe = new Probe(t.tx);
+    const open  = () => dev.open(probe);
+    const close = () => dev.close(probe);
+
+    /* An ENGINE param write — the path sends.ts loads a bus through. */
+    const ep = (key: string, value: string): Promise<void> => t.tx.engineSetQueued(key, value);
+    const page = async (): Promise<PageAnswer> => {
+        try { return await probe.page(); } catch { return {}; }
+    };
+    /* In device FRAMES (~2.9 ms). Returns the last answer either way — the
+     * checks say what is missing. */
+    const pageUntil = async (what: string, ok: (p: PageAnswer) => boolean,
+                             within = 1500): Promise<PageAnswer> => {
+        try { return await until(t.tx, what, page, ok, { within, every: 150 }); }
+        catch (e: any) { return (e?.last as PageAnswer) ?? {}; }
+    };
+
+    await fixture.ensure(t.tx, open, close);
+    await dev.deployUi();
+    await dev.open(probe);
+    await dev.selectTrack(0);
+
+    await ep(`snd${SEND_SLOT}:module`, SEND_FX);
+
+    /* Latch Session only if it is not already up — a tap toggles. */
+    if (!(await page()).session) await dev.tap.cc(SESSION_CC);
+    let p = await pageUntil('Session latched', (a) => a.session === true);
+    for (let i = 0; i < MAX_JOG && p.session && p.masterSlot !== SEND_SLOT; i++) {
+        await dev.tap.jogTurn(-1);
+        p = await pageUntil('the jog moved a master slot',
+            (a) => a.masterSlot !== p.masterSlot || a.masterSlot === SEND_SLOT, 600);
+    }
+    t.check('session-grid', 'Session is on the master chain grid with SEND 1 focused',
+        p.session === true && p.masterDetail === false && p.masterSlot === SEND_SLOT,
+        { expected: `session=true masterDetail=false masterSlot=${SEND_SLOT}`,
+          actual: `session=${p.session} masterDetail=${p.masterDetail} masterSlot=${p.masterSlot}` });
+
+    /* The body is whose the last param FRAME drew, so the wait is on the
+     * send's own frame being the one on screen, not on a frame count. */
+    const got = await pageUntil('the send slot drawn through Schwung',
+        (a) => (a.module ?? '').toLowerCase().includes(SEND_FX) && a.body === 'schwung', 3000);
+    t.note('grid', `module=${got.module} body=${got.body}`);
+    t.check('grid-schwung-body', 'the master grid draws the send\'s body through Schwung',
+        (got.module ?? '').toLowerCase().includes(SEND_FX) && got.body === 'schwung',
+        { expected: `module~${SEND_FX} body=schwung`,
+          actual: `module=${got.module ?? '(none)'} body=${got.body ?? '(none)'}` });
+
+    /* SP-60: the master LFO slot draws SCHWUNG'S LFO page. It is built from
+     * Schwung's own `lfoLevels`, imported by movy at load — from
+     * shared/param_pages/lfo_page.mjs (the pinned tag's copy) — so no body here means the import failed ON THE DEVICE,
+     * which no local suite can see. */
+    for (let i = 0; i < MAX_JOG && p.session && p.masterSlot !== LFO_SLOT; i++) {
+        await dev.tap.jogTurn(1);
+        p = await pageUntil('the jog moved toward the LFO slot',
+            (a) => a.masterSlot !== p.masterSlot || a.masterSlot === LFO_SLOT, 600);
+    }
+    const lfo = await pageUntil('the master LFO slot drawn through Schwung',
+        (a) => a.masterSlot === LFO_SLOT && a.body === 'schwung', 3000);
+    t.note('lfo', `slot=${lfo.masterSlot} module=${lfo.module} body=${lfo.body}`);
+    t.check('lfo-schwung-body', 'the master LFO slot draws Schwung\'s own LFO page',
+        lfo.masterSlot === LFO_SLOT && lfo.body === 'schwung',
+        { expected: `masterSlot=${LFO_SLOT} body=schwung`,
+          actual: `masterSlot=${lfo.masterSlot} body=${lfo.body ?? '(none)'}` });
+
+    /* Leave Session and empty the bus — the next suite starts where the
+     * fixture expects. */
+    if ((await page()).session) await dev.tap.cc(SESSION_CC);
+    await pageUntil('Session left', (a) => a.session === false, 700);
+    await ep(`snd${SEND_SLOT}:module`, '');
+});

@@ -1,0 +1,793 @@
+{
+ "id": "chiptune",
+ "name": "Chiptune",
+ "version": "0.1.5",
+ "author": "charlesvestal",
+ "category": "sound_generator",
+ "status": "ok",
+ "load_ms": 43,
+ "dsp_size": 553288,
+ "capabilities": {
+  "audio_out": true,
+  "audio_in": false,
+  "midi_in": true,
+  "midi_out": false,
+  "aftertouch": false,
+  "chainable": true,
+  "component_type": "sound_generator"
+ },
+ "presets": {
+  "count": 32,
+  "sample": []
+ },
+ "native": {
+  "hierarchy_levels": [
+   "root",
+   "main"
+  ],
+  "params": [
+   {
+    "key": "chip",
+    "name": "Chip",
+    "type": "enum",
+    "min": null,
+    "max": null,
+    "step": null,
+    "options": [
+     "NES",
+     "GB"
+    ],
+    "default": "NES"
+   },
+   {
+    "key": "alloc_mode",
+    "name": "Voice Mode",
+    "type": "enum",
+    "min": null,
+    "max": null,
+    "step": null,
+    "options": [
+     "Auto",
+     "Lead",
+     "Locked"
+    ],
+    "default": "Lead"
+   },
+   {
+    "key": "noise_mode",
+    "name": "Noise Mode",
+    "type": "enum",
+    "min": null,
+    "max": null,
+    "step": null,
+    "options": [
+     "Long",
+     "Short"
+    ],
+    "default": "Long"
+   },
+   {
+    "key": "duty",
+    "name": "Duty Cycle",
+    "type": "int",
+    "min": 0,
+    "max": 3,
+    "step": 1,
+    "options": null,
+    "default": "2"
+   },
+   {
+    "key": "env_attack",
+    "name": "Attack",
+    "type": "int",
+    "min": 0,
+    "max": 15,
+    "step": 1,
+    "options": null,
+    "default": "0"
+   },
+   {
+    "key": "env_decay",
+    "name": "Decay",
+    "type": "int",
+    "min": 0,
+    "max": 15,
+    "step": 1,
+    "options": null,
+    "default": "3"
+   },
+   {
+    "key": "env_sustain",
+    "name": "Sustain",
+    "type": "int",
+    "min": 0,
+    "max": 15,
+    "step": 1,
+    "options": null,
+    "default": "15"
+   },
+   {
+    "key": "env_release",
+    "name": "Release",
+    "type": "int",
+    "min": 0,
+    "max": 15,
+    "step": 1,
+    "options": null,
+    "default": "4"
+   },
+   {
+    "key": "sweep",
+    "name": "Sweep",
+    "type": "int",
+    "min": 0,
+    "max": 7,
+    "step": 1,
+    "options": null,
+    "default": "0"
+   },
+   {
+    "key": "vibrato_depth",
+    "name": "Vibrato Depth",
+    "type": "int",
+    "min": 0,
+    "max": 12,
+    "step": 1,
+    "options": null,
+    "default": "0"
+   },
+   {
+    "key": "vibrato_rate",
+    "name": "Vibrato Rate",
+    "type": "int",
+    "min": 0,
+    "max": 10,
+    "step": 1,
+    "options": null,
+    "default": "0"
+   },
+   {
+    "key": "wavetable",
+    "name": "Wavetable (GB)",
+    "type": "int",
+    "min": 0,
+    "max": 7,
+    "step": 1,
+    "options": null,
+    "default": "0"
+   },
+   {
+    "key": "channel_mask",
+    "name": "Channel Mask",
+    "type": "int",
+    "min": 0,
+    "max": 15,
+    "step": 1,
+    "options": null,
+    "default": "1"
+   },
+   {
+    "key": "detune",
+    "name": "Detune",
+    "type": "int",
+    "min": 0,
+    "max": 50,
+    "step": 1,
+    "options": null,
+    "default": "0"
+   },
+   {
+    "key": "volume",
+    "name": "Volume",
+    "type": "int",
+    "min": 0,
+    "max": 15,
+    "step": 1,
+    "options": null,
+    "default": "15"
+   },
+   {
+    "key": "octave_transpose",
+    "name": "Octave",
+    "type": "int",
+    "min": -3,
+    "max": 3,
+    "step": 1,
+    "options": null,
+    "default": "0"
+   },
+   {
+    "key": "pitch_env_depth",
+    "name": "PEnv Depth",
+    "type": "int",
+    "min": 0,
+    "max": 24,
+    "step": 1,
+    "options": null,
+    "default": "0"
+   },
+   {
+    "key": "pitch_env_speed",
+    "name": "PEnv Speed",
+    "type": "int",
+    "min": 0,
+    "max": 15,
+    "step": 1,
+    "options": null,
+    "default": "0"
+   }
+  ]
+ },
+ "movy": {
+  "hasConfig": true,
+  "usesMovyConfigFile": false,
+  "drum": null,
+  "banks": [
+   {
+    "name": "Env",
+    "global": false,
+    "padSpecific": false
+   },
+   {
+    "name": "Chip",
+    "global": false,
+    "padSpecific": false
+   },
+   {
+    "name": "Pitch",
+    "global": false,
+    "padSpecific": false
+   }
+  ],
+  "pages": [
+   {
+    "name": "Env",
+    "envelopeLines": [
+     true,
+     false
+    ],
+    "lfoViz": false,
+    "rows": [
+     [
+      {
+       "shortName": "ATTK",
+       "fullName": "Attack",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "DECAY",
+       "fullName": "Decay",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "SUST",
+       "fullName": "Sustain",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "REL",
+       "fullName": "Release",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      }
+     ],
+     [
+      {
+       "shortName": "DUTY",
+       "fullName": "Duty",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "VOL",
+       "fullName": "Volume",
+       "renderStyle": "vbar",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "DTUNE",
+       "fullName": "Detune",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "OCT",
+       "fullName": "Octave",
+       "renderStyle": "steps",
+       "type": "int",
+       "displayValue": "..."
+      }
+     ]
+    ]
+   },
+   {
+    "name": "Chip",
+    "envelopeLines": [
+     false,
+     false
+    ],
+    "lfoViz": false,
+    "rows": [
+     [
+      {
+       "shortName": "CHIP",
+       "fullName": "Chip",
+       "renderStyle": "arc",
+       "type": "enum",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "ALLOC",
+       "fullName": "Alloc Mode",
+       "renderStyle": "arc",
+       "type": "enum",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "NOISE",
+       "fullName": "Noise Mode",
+       "renderStyle": "arc",
+       "type": "enum",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "WTBL",
+       "fullName": "Wavetable",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      }
+     ],
+     [
+      {
+       "shortName": "SWEEP",
+       "fullName": "Sweep",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "CHMSK",
+       "fullName": "Channel Mask",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "VIBD",
+       "fullName": "Vibrato Depth",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "VIBR",
+       "fullName": "Vibrato Rate",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      }
+     ]
+    ]
+   },
+   {
+    "name": "Pitch",
+    "envelopeLines": [
+     false,
+     false
+    ],
+    "lfoViz": false,
+    "rows": [
+     [
+      {
+       "shortName": "PENVD",
+       "fullName": "Pitch Env Depth",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "PENVS",
+       "fullName": "Pitch Env Speed",
+       "renderStyle": "arc",
+       "type": "int",
+       "displayValue": "..."
+      },
+      {
+       "shortName": "PRSET",
+       "fullName": "Preset",
+       "renderStyle": "preset",
+       "type": "enum",
+       "displayValue": "..."
+      },
+      null
+     ],
+     [
+      null,
+      null,
+      null,
+      null
+     ]
+    ]
+   }
+  ],
+  "params": [
+   {
+    "key": "env_attack",
+    "label": "Attack",
+    "shortLabel": "ATTK",
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 15,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "capturesModuleState": false,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 30
+    }
+   },
+   {
+    "key": "env_decay",
+    "label": "Decay",
+    "shortLabel": "DECAY",
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 15,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "capturesModuleState": false,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 30
+    }
+   },
+   {
+    "key": "env_sustain",
+    "label": "Sustain",
+    "shortLabel": "SUST",
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 15,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "capturesModuleState": false,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 30
+    }
+   },
+   {
+    "key": "env_release",
+    "label": "Release",
+    "shortLabel": "REL",
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 15,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "capturesModuleState": false,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 30
+    }
+   },
+   {
+    "key": "duty",
+    "label": "Duty",
+    "shortLabel": "DUTY",
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 3,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "capturesModuleState": false,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 6
+    }
+   },
+   {
+    "key": "volume",
+    "label": "Volume",
+    "shortLabel": "VOL",
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 15,
+    "step": 1,
+    "renderStyle": "vbar",
+    "automatable": true,
+    "capturesModuleState": false,
+    "increment": {
+     "kind": "int",
+     "perDetent": 1,
+     "detentsFullSweep": 15
+    }
+   },
+   {
+    "key": "detune",
+    "label": "Detune",
+    "shortLabel": "DTUNE",
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 50,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "capturesModuleState": false,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 100
+    }
+   },
+   {
+    "key": "octave_transpose",
+    "label": "Octave",
+    "shortLabel": "OCT",
+    "type": "int",
+    "options": null,
+    "min": -3,
+    "max": 3,
+    "step": 1,
+    "renderStyle": "steps",
+    "signed": true,
+    "automatable": true,
+    "capturesModuleState": false,
+    "increment": {
+     "kind": "int",
+     "perDetent": 1,
+     "detentsFullSweep": 6
+    }
+   },
+   {
+    "key": "chip",
+    "label": "Chip",
+    "shortLabel": "CHIP",
+    "type": "enum",
+    "options": [
+     "NES",
+     "GB"
+    ],
+    "min": 0,
+    "max": 1,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": false,
+    "capturesModuleState": false,
+    "increment": {
+     "kind": "enum",
+     "detentsPerStep": 4,
+     "steps": 2
+    }
+   },
+   {
+    "key": "alloc_mode",
+    "label": "Alloc Mode",
+    "shortLabel": "ALLOC",
+    "type": "enum",
+    "options": [
+     "Auto",
+     "Lead",
+     "Locked"
+    ],
+    "min": 0,
+    "max": 2,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": false,
+    "capturesModuleState": false,
+    "increment": {
+     "kind": "enum",
+     "detentsPerStep": 4,
+     "steps": 3
+    }
+   },
+   {
+    "key": "noise_mode",
+    "label": "Noise Mode",
+    "shortLabel": "NOISE",
+    "type": "enum",
+    "options": [
+     "Long",
+     "Short"
+    ],
+    "min": 0,
+    "max": 1,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": false,
+    "capturesModuleState": false,
+    "increment": {
+     "kind": "enum",
+     "detentsPerStep": 4,
+     "steps": 2
+    }
+   },
+   {
+    "key": "wavetable",
+    "label": "Wavetable",
+    "shortLabel": "WTBL",
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 7,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "capturesModuleState": false,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 14
+    }
+   },
+   {
+    "key": "sweep",
+    "label": "Sweep",
+    "shortLabel": "SWEEP",
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 7,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "capturesModuleState": false,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 14
+    }
+   },
+   {
+    "key": "channel_mask",
+    "label": "Channel Mask",
+    "shortLabel": "CHMSK",
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 15,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "capturesModuleState": false,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 30
+    }
+   },
+   {
+    "key": "vibrato_depth",
+    "label": "Vibrato Depth",
+    "shortLabel": "VIBD",
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 12,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "capturesModuleState": false,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 24
+    }
+   },
+   {
+    "key": "vibrato_rate",
+    "label": "Vibrato Rate",
+    "shortLabel": "VIBR",
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 10,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "capturesModuleState": false,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 20
+    }
+   },
+   {
+    "key": "pitch_env_depth",
+    "label": "Pitch Env Depth",
+    "shortLabel": "PENVD",
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 24,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "capturesModuleState": false,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 48
+    }
+   },
+   {
+    "key": "pitch_env_speed",
+    "label": "Pitch Env Speed",
+    "shortLabel": "PENVS",
+    "type": "int",
+    "options": null,
+    "min": 0,
+    "max": 15,
+    "step": 1,
+    "renderStyle": "arc",
+    "automatable": true,
+    "capturesModuleState": false,
+    "increment": {
+     "kind": "int",
+     "perDetent": 0.5,
+     "detentsFullSweep": 30
+    }
+   },
+   {
+    "key": "preset",
+    "label": "Preset",
+    "shortLabel": "PRSET",
+    "type": "enum",
+    "min": 0,
+    "max": 31,
+    "step": 1,
+    "options": null,
+    "nameKey": "preset_name",
+    "renderStyle": "preset",
+    "capturesModuleState": true,
+    "automatable": false,
+    "increment": {
+     "kind": "enum",
+     "detentsPerStep": 4,
+     "steps": 32
+    }
+   },
+   null,
+   null,
+   null,
+   null,
+   null
+  ]
+ },
+ "analysis": {
+  "hiddenParams": [],
+  "noMetadata": [
+   "preset"
+  ],
+  "warnings": []
+ }
+}

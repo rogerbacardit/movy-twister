@@ -1,0 +1,680 @@
+//! Compact, dependency-free serialization of the sequencer's persistent
+//! state (tempo, per-track selection/mute, clips + notes). Transport state
+//! (playing/queued slots, recording, clock position) is deliberately not
+//! saved — it always starts stopped, matching davebox's "loop cycle doesn't
+//! persist" lesson.
+//!
+//! Line format (newline-separated):
+//!   movy1
+//!   bpm <bpm_x100>
+//!   tk <track> <active_clip> <muted0|1>
+//!   cl <track> <slot> <len_steps> <loop_start_steps> <notes>
+//!   cp <track> <slot> <scale_num> <scale_den> <transpose> <quant>
+//! where <notes> is `tick:gate:pitch:vel:step;…` (omitted when the clip is
+//! empty). `step` is stored rather than re-derived from `tick`, because under
+//! swing the step a note belongs to depends on the swing amount and the clip's
+//! playback scale — neither of which is known while the `cl` line is parsed.
+//! Legacy four-field notes fall back to the straight-grid rounding that wrote
+//! them.
+//!   sg <scene> <scene> …            (the song's raw scene presses; omitted when none)
+//! The `cp` line is optional — clips from older saves load with defaults.
+//! Unknown lines are ignored so the format can grow.
+
+use crate::clip::Clip;
+use crate::engine::Engine;
+use crate::track::LANES;
+
+pub const FORMAT_TAG: &str = "movy1";
+
+pub fn serialize(engine: &Engine) -> String {
+    let mut s = String::with_capacity(1024);
+    s.push_str(FORMAT_TAG);
+    s.push('\n');
+    s.push_str(&format!("bpm {}\n", engine.clock.bpm_x100()));
+    s.push_str(&format!("swing {}\n", engine.swing_pct));
+    /* The song is Set-level, like tempo — one line, omitted when there is no
+     * song so older builds (and songless Sets) are byte-identical to before. */
+    if !engine.song.is_empty() {
+        s.push_str("sg");
+        for scene in &engine.song {
+            s.push(' ');
+            s.push_str(&scene.to_string());
+        }
+        s.push('\n');
+    }
+    for (ti, t) in engine.tracks.iter().enumerate() {
+        s.push_str(&format!("tk {} {} {}\n", ti, t.active_clip, t.muted as u8));
+        /* One line per muted voice, omitted when there are none — so a Set that
+         * never touched a pad mute is byte-identical to before this feature,
+         * the same way `sg` and `au` are. */
+        for &note in &t.pad_mutes {
+            s.push_str(&format!("pm {} {}\n", ti, note));
+        }
+        if let Some(note) = t.pad_solo {
+            s.push_str(&format!("ps {} {}\n", ti, note));
+        }
+        for lane in 0..LANES {
+            if t.lane_assigned[lane] {
+                s.push_str(&format!("au {} {} {} {}\n", ti, lane, t.lane_base[lane], t.lane_label[lane]));
+            }
+        }
+        for (ci, c) in t.clips.iter().enumerate() {
+            if c.exists() {
+                s.push_str(&format!("cl {} {} {} {} ", ti, ci, c.length_steps, c.loop_start_steps));
+                for (i, n) in c.notes.iter().enumerate() {
+                    if i > 0 {
+                        s.push(';');
+                    }
+                    s.push_str(&format!(
+                        "{}:{}:{}:{}:{}", n.tick, n.gate, n.pitch, n.vel, n.step));
+                }
+                s.push('\n');
+                // Clip params on their own line (after `cl`, since load_clip
+                // recreates the clip): omitted-on-legacy → defaults.
+                s.push_str(&format!(
+                    "cp {} {} {} {} {} {}\n",
+                    ti, ci, c.scale_num, c.scale_den, c.transpose, c.quant
+                ));
+            }
+            if !c.locks.is_empty() {
+                s.push_str(&format!("lk {} {} ", ti, ci));
+                for (i, l) in c.locks.iter().enumerate() {
+                    if i > 0 {
+                        s.push(';');
+                    }
+                    s.push_str(&format!("{}:{}:{}", l.lane, l.step, l.val));
+                }
+                s.push('\n');
+            }
+            if !c.trigs.is_empty() {
+                s.push_str(&format!("tg {} {} ", ti, ci));
+                for (i, tr) in c.trigs.iter().enumerate() {
+                    if i > 0 {
+                        s.push(';');
+                    }
+                    // step:lane:prob:a:b:inv  (lane = pitch or -1 for melodic)
+                    let lane = tr.lane.map_or(-1i16, |p| p as i16);
+                    s.push_str(&format!(
+                        "{}:{}:{}:{}:{}:{}",
+                        tr.step, lane, tr.props.prob, tr.props.cond_a, tr.props.cond_b, tr.props.invert as u8
+                    ));
+                }
+                s.push('\n');
+            }
+        }
+    }
+    s
+}
+
+/// Replace the engine's persistent state from a serialized string. Returns
+/// true if the format tag matched (a real load happened).
+pub fn load(engine: &mut Engine, data: &str) -> bool {
+    let mut lines = data.lines();
+    if lines.next().map(str::trim) != Some(FORMAT_TAG) {
+        return false;
+    }
+    // Reset all clips before applying.
+    for t in &mut engine.tracks {
+        for c in &mut t.clips {
+            c.clear();
+        }
+        t.active_clip = 0;
+        t.muted = false;
+        t.pad_mutes.clear();
+        t.pad_solo = None;
+        t.playing_slot = None;
+        t.queued_slot = None;
+        t.pending_stop = false;
+        t.pending_select = None;
+        t.lane_assigned = [false; LANES];
+        t.lane_base = [0u8; LANES];
+        t.lane_label = Default::default();
+    }
+    // A Set with no `sg` line has no song — including one loaded over a Set
+    // that did.
+    engine.clear_song();
+    for line in lines {
+        let mut it = line.split_whitespace();
+        match it.next() {
+            Some("bpm") => {
+                if let Some(v) = it.next().and_then(|x| x.parse::<u32>().ok()) {
+                    engine.clock.set_bpm_x100(v);
+                }
+            }
+            Some("swing") => {
+                if let Some(v) = it.next().and_then(|x| x.parse::<u32>().ok()) {
+                    engine.swing_pct = v.clamp(50, 80);
+                }
+            }
+            // A Set saved before WP9 carries the retired Move transport link
+            // (`link <0|1>`); it has nothing to configure any more.
+            Some("link") => {}
+            Some("sg") => {
+                engine.song = it
+                    .filter_map(|x| x.parse::<u8>().ok())
+                    .filter(|s| (*s as usize) < crate::track::CLIPS_PER_TRACK)
+                    .collect();
+            }
+            Some("tk") => {
+                let nums: Vec<usize> = it.filter_map(|x| x.parse().ok()).collect();
+                if let [track, active, muted] = nums[..] {
+                    if track < engine.tracks.len() {
+                        engine.tracks[track].active_clip = active.min(7);
+                        engine.tracks[track].muted = muted != 0;
+                    }
+                }
+            }
+            Some("pm") => {
+                // pm <track> <note> — one muted drum voice. A line each, so an
+                // absent one for a note that is not muted simply never appears.
+                let track = it.next().and_then(|x| x.parse::<usize>().ok());
+                let note = it.next().and_then(|x| x.parse::<u8>().ok());
+                if let (Some(track), Some(note)) = (track, note) {
+                    if track < engine.tracks.len() && note < 128 {
+                        engine.tracks[track].set_pad_mute(note, true);
+                    }
+                }
+            }
+            Some("ps") => {
+                // ps <track> <note> — the track's soloed drum voice. A file
+                // with no `ps` line for a track leaves it unsoloed (the reset
+                // above), so un-soloing needs no line of its own.
+                let track = it.next().and_then(|x| x.parse::<usize>().ok());
+                let note = it.next().and_then(|x| x.parse::<u8>().ok());
+                if let (Some(track), Some(note)) = (track, note) {
+                    if track < engine.tracks.len() && note < 128 {
+                        engine.tracks[track].pad_solo = Some(note);
+                    }
+                }
+            }
+            Some("cl") => load_clip(engine, &mut it),
+            Some("cp") => {
+                // cp <track> <slot> <scale_num> <scale_den> <transpose> [quant]
+                let track = it.next().and_then(|x| x.parse::<usize>().ok());
+                let slot = it.next().and_then(|x| x.parse::<usize>().ok());
+                let sn = it.next().and_then(|x| x.parse::<u8>().ok());
+                let sd = it.next().and_then(|x| x.parse::<u8>().ok());
+                let tr = it.next().and_then(|x| x.parse::<i8>().ok());
+                // Sixth field absent = written before non-destructive
+                // quantization existed. Those notes were either already hard
+                // quantized or meant to stay raw, so 0 keeps the set sounding
+                // exactly as it did.
+                let q = it.next().and_then(|x| x.parse::<u8>().ok()).unwrap_or(0);
+                if let (Some(track), Some(slot), Some(sn), Some(sd), Some(tr)) =
+                    (track, slot, sn, sd, tr)
+                {
+                    if track < engine.tracks.len() && slot < 8 {
+                        let c = &mut engine.tracks[track].clips[slot];
+                        c.scale_num = sn.max(1);
+                        c.scale_den = sd.max(1);
+                        c.transpose = tr.clamp(-36, 36);
+                        c.quant = q.min(100);
+                    }
+                }
+            }
+            Some("au") => {
+                // au <track> <lane> <base> <label>
+                let track = it.next().and_then(|x| x.parse::<usize>().ok());
+                let lane = it.next().and_then(|x| x.parse::<usize>().ok());
+                let base = it.next().and_then(|x| x.parse::<u8>().ok());
+                let label = it.next().unwrap_or("");
+                if let (Some(track), Some(lane), Some(base)) = (track, lane, base) {
+                    if track < engine.tracks.len() && lane < LANES {
+                        engine.tracks[track].lane_assigned[lane] = true;
+                        engine.tracks[track].lane_base[lane] = base;
+                        engine.tracks[track].lane_label[lane] = label.to_string();
+                    }
+                }
+            }
+            Some("lk") => load_locks(engine, &mut it),
+            Some("tg") => load_trigs(engine, &mut it),
+            _ => {}
+        }
+    }
+    // A saved active_clip may name a slot that holds no clip — launching an
+    // empty Session cell selects it, and that selection persists. Restoring it
+    // verbatim strands the track: play() starts a track only if its selected
+    // clip exists, so a track with real clips stays silent and pressing Play
+    // again just repeats the same result. Fall back to its lowest real clip.
+    // A track with no clips at all keeps its selection (nothing to fall back
+    // to, and it is the right slot for the next recording).
+    for t in &mut engine.tracks {
+        if !t.clips[t.active_clip].exists() {
+            if let Some(first) = t.clips.iter().position(|c| c.exists()) {
+                t.active_clip = first;
+            }
+        }
+    }
+    // Slots that stayed empty must carry the current default so the next clip
+    // recorded into them is born with it. Loaded clips keep their own value.
+    engine.reseed_empty_clips();
+    true
+}
+
+fn load_locks<'a>(engine: &mut Engine, it: &mut impl Iterator<Item = &'a str>) {
+    let track = it.next().and_then(|x| x.parse::<usize>().ok());
+    let slot = it.next().and_then(|x| x.parse::<usize>().ok());
+    let (Some(track), Some(slot)) = (track, slot) else {
+        return;
+    };
+    if track >= engine.tracks.len() || slot >= 8 {
+        return;
+    }
+    if let Some(locks) = it.next() {
+        for tok in locks.split(';') {
+            let p: Vec<&str> = tok.split(':').collect();
+            if p.len() == 3 {
+                if let (Ok(lane), Ok(step), Ok(val)) =
+                    (p[0].parse::<u8>(), p[1].parse::<u16>(), p[2].parse::<u8>())
+                {
+                    /* Out of range is DROPPED, never masked: an older build
+                     * folded lane 9 into lane 1 with `& 7`, merging two
+                     * params' locks into one lane. */
+                    if (lane as usize) < LANES {
+                        engine.tracks[track].clips[slot].set_lock(lane, step, val.min(127));
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn load_trigs<'a>(engine: &mut Engine, it: &mut impl Iterator<Item = &'a str>) {
+    let track = it.next().and_then(|x| x.parse::<usize>().ok());
+    let slot = it.next().and_then(|x| x.parse::<usize>().ok());
+    let (Some(track), Some(slot)) = (track, slot) else {
+        return;
+    };
+    if track >= engine.tracks.len() || slot >= 8 {
+        return;
+    }
+    if let Some(list) = it.next() {
+        for tok in list.split(';') {
+            let p: Vec<&str> = tok.split(':').collect();
+            if p.len() != 6 {
+                continue;
+            }
+            if let (Some(step), Some(lane_raw), Some(prob), Some(a), Some(b), Some(inv)) = (
+                p[0].parse::<u16>().ok(),
+                p[1].parse::<i16>().ok(),
+                p[2].parse::<u8>().ok(),
+                p[3].parse::<u8>().ok(),
+                p[4].parse::<u8>().ok(),
+                p[5].parse::<u8>().ok(),
+            ) {
+                let lane = if (0..128).contains(&lane_raw) { Some(lane_raw as u8) } else { None };
+                let c = &mut engine.tracks[track].clips[slot];
+                c.set_trig_prob(step, step, lane, prob.min(100));
+                c.set_trig_cond(step, step, lane, a.max(1), b.max(1));
+                c.set_trig_invert(step, step, lane, inv != 0);
+            }
+        }
+    }
+}
+
+fn load_clip<'a>(engine: &mut Engine, it: &mut impl Iterator<Item = &'a str>) {
+    let track = it.next().and_then(|x| x.parse::<usize>().ok());
+    let slot = it.next().and_then(|x| x.parse::<usize>().ok());
+    let len = it.next().and_then(|x| x.parse::<u16>().ok());
+    let lstart = it.next().and_then(|x| x.parse::<u16>().ok());
+    let (Some(track), Some(slot), Some(len), Some(lstart)) = (track, slot, len, lstart) else {
+        return;
+    };
+    if track >= engine.tracks.len() || slot >= 8 {
+        return;
+    }
+    let clip = &mut engine.tracks[track].clips[slot];
+    *clip = Clip::new();
+    if let Some(notes) = it.next() {
+        for tok in notes.split(';') {
+            let parts: Vec<&str> = tok.split(':').collect();
+            if parts.len() >= 4 {
+                if let (Ok(tick), Ok(gate), Ok(pitch), Ok(vel)) = (
+                    parts[0].parse::<u32>(),
+                    parts[1].parse::<u32>(),
+                    parts[2].parse::<u8>(),
+                    parts[3].parse::<u8>(),
+                ) {
+                    // Fifth field absent = written before anchors were stored.
+                    // Those saves were made with straight-grid rounding, so
+                    // reproducing it restores exactly what they held.
+                    let step = parts.get(4)
+                        .and_then(|x| x.parse::<u16>().ok())
+                        .unwrap_or(((tick + crate::TICKS_PER_STEP / 2)
+                            / crate::TICKS_PER_STEP) as u16);
+                    clip.add_note_raw(step, tick, gate.max(1), pitch.min(127), vel.clamp(1, 127));
+                }
+            }
+        }
+    }
+    // Restore the exact saved window LAST. add_note_raw extends the length to
+    // cover each note, but a note may sit beyond a deliberately shrunk custom
+    // length — the saved length is authoritative. (Also avoids set_loop, which
+    // would round a sub-bar length up to a whole bar.)
+    clip.loop_start_steps = lstart.min(crate::clip::MAX_STEPS - 1);
+    clip.length_steps = len.clamp(1, crate::clip::MAX_STEPS - clip.loop_start_steps);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn round_trips_the_swung_step_anchor() {
+        // Under swing the anchor cannot be re-derived from the tick: the `cl`
+        // line is parsed before `cp` says what the clip's playback scale is,
+        // and straight-grid rounding would move a swung upbeat onto the next
+        // on-beat step. So it is stored.
+        let mut e = Engine::new(44100, 12000);
+        e.swing_pct = 70;
+        e.tracks[0].clips[0].record_note(1, crate::TICKS_PER_STEP + 13, 6, 42, 100, true);
+        assert_eq!(e.tracks[0].clips[0].notes[0].step, 1);
+        let blob = serialize(&e);
+        let mut e2 = Engine::new(44100, 12000);
+        assert!(load(&mut e2, &blob));
+        assert_eq!(e2.tracks[0].clips[0].notes[0].step, 1, "anchor survived the save");
+        assert_eq!(e2.tracks[0].clips[0].notes[0].tick, crate::TICKS_PER_STEP + 13);
+    }
+
+    #[test]
+    fn legacy_notes_without_an_anchor_still_load() {
+        let blob = "movy1\ncl 0 0 16 0 0:24:60:100;36:24:62:90\n";
+        let mut e = Engine::new(44100, 12000);
+        assert!(load(&mut e, blob));
+        let n = &e.tracks[0].clips[0].notes;
+        assert_eq!(n.len(), 2);
+        assert_eq!(n[0].step, 0);
+        assert_eq!(n[1].step, 2, "straight-grid rounding, as those saves were written");
+    }
+
+    #[test]
+    fn round_trips_clip_quant() {
+        let mut e = Engine::new(44100, 12000);
+        e.tracks[0].clips[0].toggle_step(0, &[(60, 100)]);
+        e.tracks[0].clips[0].quant = 70;
+        let blob = serialize(&e);
+        let mut e2 = Engine::new(44100, 12000);
+        assert!(load(&mut e2, &blob));
+        assert_eq!(e2.tracks[0].clips[0].quant, 70);
+    }
+
+    #[test]
+    fn legacy_cp_line_loads_quant_zero() {
+        // A five-field `cp` is every save written before this feature. Those
+        // clips must stay at 0 so existing sets sound exactly as they did,
+        // even when the user has since picked a non-zero default.
+        let blob = "movy1\ncl 0 0 16 0 0:24:60:100\ncp 0 0 1 1 0\n";
+        let mut e = Engine::new(44100, 12000);
+        e.default_quant = 80;
+        assert!(load(&mut e, blob));
+        assert_eq!(e.tracks[0].clips[0].quant, 0, "loaded clip keeps its own value");
+        assert_eq!(e.tracks[0].clips[1].quant, 80, "empty slot carries the default");
+    }
+
+    #[test]
+    fn round_trips_state() {
+        let mut e = Engine::new(44100, 13000);
+        e.tracks[0].active_mut().toggle_step(0, &[(60, 100)]);
+        e.tracks[0].active_mut().toggle_step(4, &[(64, 90), (67, 80)]);
+        e.tracks[2].clips[3].toggle_step(8, &[(48, 110)]);
+        e.tracks[2].active_clip = 3;
+        e.tracks[1].muted = true;
+        e.tracks[0].active_mut().set_loop(0, 32);
+
+        let s = serialize(&e);
+
+        let mut e2 = Engine::new(44100, 12000);
+        assert!(load(&mut e2, &s));
+        assert_eq!(e2.clock.bpm_x100(), 13000);
+        assert_eq!(e2.tracks[0].active().notes.len(), 3);
+        assert_eq!(e2.tracks[0].active().length_steps, 32);
+        assert!(e2.tracks[1].muted);
+        assert_eq!(e2.tracks[2].active_clip, 3);
+        assert!(e2.tracks[2].clips[3].step_has_notes(8));
+        // Transport never persists.
+        assert!(!e2.playing);
+        assert_eq!(e2.tracks[0].playing_slot, None);
+    }
+
+    #[test]
+    fn pad_mutes_and_solo_round_trip() {
+        let mut e = Engine::new(44100, 12000);
+        e.tracks[0].set_pad_mute(36, true);
+        e.tracks[0].set_pad_mute(38, true);
+        e.tracks[3].pad_solo = Some(42);
+
+        let s = serialize(&e);
+
+        let mut e2 = Engine::new(44100, 12000);
+        assert!(load(&mut e2, &s));
+        assert_eq!(e2.tracks[0].pad_mutes, vec![36, 38]);
+        assert_eq!(e2.tracks[3].pad_solo, Some(42));
+        assert!(e2.tracks[1].pad_mutes.is_empty());
+        assert_eq!(e2.tracks[1].pad_solo, None);
+    }
+
+    /// A Set with nothing muted must serialize exactly as it did before this
+    /// feature — the lines are omitted, not written empty — and a load must
+    /// clear mutes it does not find, or a Set left with a silenced kick would
+    /// hand that silence to every Set opened after it.
+    #[test]
+    fn no_pad_mute_lines_when_none_are_set() {
+        let mut e = Engine::new(44100, 12000);
+        let clean = serialize(&e);
+        assert!(!clean.lines().any(|l| l.starts_with("pm ") || l.starts_with("ps ")));
+
+        e.tracks[0].set_pad_mute(36, true);
+        e.tracks[2].pad_solo = Some(40);
+        // Loaded over an engine that HAS mutes: the absent lines must clear
+        // them, the way every other absent line resets its own state.
+        let mut e2 = Engine::new(44100, 12000);
+        e2.tracks[0].set_pad_mute(36, true);
+        e2.tracks[2].pad_solo = Some(40);
+        assert!(load(&mut e2, &clean));
+        assert!(e2.tracks[0].pad_mutes.is_empty());
+        assert_eq!(e2.tracks[2].pad_solo, None);
+    }
+
+    #[test]
+    fn clip_length_preserved_with_note_beyond_it() {
+        // A custom length shorter than a note's step (user shrank a longer clip)
+        // must survive a round-trip — loading the note must not re-extend it.
+        let mut e = Engine::new(44100, 12000);
+        {
+            let c = e.tracks[1].active_mut();
+            c.toggle_step(7, &[(60, 100)]); // note at step 7
+            c.set_clip_length(7);           // shrink length below the note
+        }
+        assert_eq!(e.tracks[1].active().length_steps, 7);
+        let saved = serialize(&e);
+        let mut e2 = Engine::new(44100, 12000);
+        assert!(load(&mut e2, &saved));
+        assert_eq!(e2.tracks[1].active().length_steps, 7);
+    }
+
+    #[test]
+    fn sub_bar_clip_length_is_preserved() {
+        let mut e = Engine::new(44100, 12000);
+        e.tracks[0].active_mut().set_clip_length(12); // custom sub-bar length
+        let saved = serialize(&e);
+        let mut e2 = Engine::new(44100, 12000);
+        assert!(load(&mut e2, &saved));
+        assert_eq!(e2.tracks[0].active().length_steps, 12); // not rounded to a bar
+    }
+
+    #[test]
+    fn clip_params_round_trip_and_default() {
+        let mut e = Engine::new(44100, 12000);
+        {
+            let c = e.tracks[1].active_mut();
+            c.set_loop(0, 16); // make the clip exist
+            c.scale_num = 3;
+            c.scale_den = 2;
+            c.transpose = -5;
+        }
+        let saved = serialize(&e);
+        let mut e2 = Engine::new(44100, 12000);
+        assert!(load(&mut e2, &saved));
+        let c2 = e2.tracks[1].active();
+        assert_eq!((c2.scale_num, c2.scale_den, c2.transpose), (3, 2, -5));
+
+        // A legacy line without `cp` parses to defaults (back-compatible).
+        let mut e3 = Engine::new(44100, 12000);
+        assert!(load(&mut e3, "movy1\ncl 0 0 16 0 \n"));
+        let c3 = e3.tracks[0].active();
+        assert_eq!((c3.scale_num, c3.scale_den, c3.transpose), (1, 1, 0));
+    }
+
+    #[test]
+    fn round_trips_automation() {
+        let mut e = Engine::new(44100, 12000);
+        let mut out = Vec::new();
+        e.tracks[0].active_mut().toggle_step(0, &[(60, 100)]);
+        crate::command::apply_batch(&mut e, "alabel 0 1 synth:cutoff;abase 0 1 70", &mut out);
+        e.tracks[0].active_mut().set_lock(1, 3, 55);
+        let s = serialize(&e);
+        let mut e2 = Engine::new(44100, 12000);
+        assert!(load(&mut e2, &s));
+        assert!(e2.tracks[0].lane_assigned[1]);
+        assert_eq!(e2.tracks[0].lane_label[1], "synth:cutoff");
+        assert_eq!(e2.tracks[0].lane_base[1], 70);
+        assert_eq!(e2.tracks[0].active().lock_at(1, 3), Some(55));
+    }
+
+    /* D13/D15: lanes 8-31 persist as themselves, and a lane past the end is
+     * dropped rather than masked into a low lane — `lane & 7` used to merge
+     * lane 9's locks into lane 1's param. */
+    #[test]
+    fn high_lanes_round_trip_and_out_of_range_lanes_are_dropped() {
+        let mut e = Engine::new(44100, 12000);
+        let mut out = Vec::new();
+        e.tracks[0].active_mut().toggle_step(0, &[(60, 100)]);
+        crate::command::apply_batch(&mut e, "alabel 0 31 synth:x;abase 0 31 9;alabel 0 9 synth:y", &mut out);
+        e.tracks[0].active_mut().set_lock(31, 2, 44);
+        e.tracks[0].active_mut().set_lock(9, 3, 33);
+        let s = serialize(&e);
+        let mut e2 = Engine::new(44100, 12000);
+        assert!(load(&mut e2, &s));
+        assert_eq!(e2.tracks[0].lane_label[31], "synth:x");
+        assert_eq!(e2.tracks[0].lane_base[31], 9);
+        assert_eq!(e2.tracks[0].active().lock_at(31, 2), Some(44));
+        assert_eq!(e2.tracks[0].active().lock_at(9, 3), Some(33));
+        assert_eq!(e2.tracks[0].active().lock_at(1, 3), None, "lane 9 is not lane 1");
+
+        let bad = s.replace("lk 0 0 ", "lk 0 0 40:5:77;") + "au 0 32 1 synth:z\n";
+        let mut e3 = Engine::new(44100, 12000);
+        assert!(load(&mut e3, &bad));
+        assert_eq!(e3.tracks[0].active().lock_at(40 & 7, 5), None, "lane 40 not masked to 0");
+        assert_eq!(e3.tracks[0].active().locks.len(), 2);
+        assert!(e3.tracks[0].lane_label.iter().all(|l| l != "synth:z"));
+    }
+
+    #[test]
+    fn round_trips_trigs() {
+        let mut e = Engine::new(44100, 12000);
+        e.tracks[0].active_mut().toggle_step(2, &[(60, 100)]);
+        e.tracks[0].active_mut().set_trig_prob(2, 2, None, 30);
+        e.tracks[0].active_mut().set_trig_cond(2, 2, None, 1, 4);
+        e.tracks[0].active_mut().set_trig_invert(2, 2, Some(36), true);
+        let s = serialize(&e);
+        let mut e2 = Engine::new(44100, 12000);
+        assert!(load(&mut e2, &s));
+        let a = e2.tracks[0].active().governing_trig(2, 60);
+        assert_eq!((a.prob, a.cond_a, a.cond_b), (30, 1, 4));
+        assert!(e2.tracks[0].active().governing_trig(2, 36).invert);
+    }
+
+    #[test]
+    fn rejects_unknown_format() {
+        let mut e = Engine::new(44100, 12000);
+        assert!(!load(&mut e, "garbage\nbpm 9000\n"));
+        assert_eq!(e.clock.bpm_x100(), 12000); // unchanged
+    }
+
+    #[test]
+    fn load_clears_previous_state() {
+        let mut e = Engine::new(44100, 12000);
+        e.tracks[0].active_mut().toggle_step(0, &[(60, 100)]);
+        // Load a state with no clips → track 0 should be empty after.
+        assert!(load(&mut e, "movy1\nbpm 12000\n"));
+        assert!(!e.tracks[0].active().exists());
+    }
+
+    #[test]
+    fn swing_round_trips() {
+        let mut e = Engine::new(44100, 12000);
+        e.swing_pct = 72;
+        let s = serialize(&e);
+        let mut e2 = Engine::new(44100, 12000);
+        assert!(load(&mut e2, &s));
+        assert_eq!(e2.swing_pct, 72);
+    }
+
+    #[test]
+    fn a_retired_link_line_still_loads() {
+        let mut e = Engine::new(44100, 12000);
+        assert!(load(&mut e, "movy1\nbpm 9000\nlink 1\n"));
+        assert_eq!(e.clock.bpm_x100(), 9000, "the lines around it still apply");
+        assert!(!serialize(&e).contains("link"), "and it is not written back");
+    }
+
+    #[test]
+    fn selected_empty_slot_falls_back_to_a_real_clip_on_load() {
+        // A saved active_clip can point at a slot that holds no clip (launch an
+        // empty Session cell, then save). Restoring that verbatim strands the
+        // track: play() only starts a track whose selected clip exists, so a
+        // track with perfectly good clips stays silent and pressing Play again
+        // repeats the same result forever.
+        let mut e = Engine::new(44100, 12000);
+        assert!(load(
+            &mut e,
+            "movy1\ntk 0 2 0\ncl 0 0 16 0 0:24:60:100\ntk 1 3 0\ncl 1 1 16 0 0:24:62:100\n"
+        ));
+        assert_eq!(e.tracks[0].active_clip, 0, "empty slot 2 → lowest real clip");
+        assert_eq!(e.tracks[1].active_clip, 1, "empty slot 3 → lowest real clip");
+
+        e.play();
+        assert_eq!(e.tracks[0].playing_slot, Some(0), "track 0 is not stranded");
+        assert_eq!(e.tracks[1].playing_slot, Some(1), "track 1 is not stranded");
+    }
+
+    #[test]
+    fn selected_empty_slot_kept_when_the_track_has_no_clips_at_all() {
+        // A genuinely empty track keeps its selection — there is nothing to fall
+        // back to, and it is the right slot for the next recording.
+        let mut e = Engine::new(44100, 12000);
+        assert!(load(&mut e, "movy1\ntk 2 4 0\n"));
+        assert_eq!(e.tracks[2].active_clip, 4);
+    }
+
+
+    #[test]
+    fn a_song_survives_a_save_and_load() {
+        let mut e = Engine::new(44100, 12000);
+        e.tracks[0].clips[1].length_steps = 16;
+        e.tracks[0].clips[3].length_steps = 16;
+        e.song_start(1);
+        e.song_add(3);
+        e.song_add(3);
+
+        let blob = serialize(&e);
+        assert!(blob.contains("sg 1 3 3\n"));
+
+        let mut loaded = Engine::new(44100, 12000);
+        assert!(load(&mut loaded, &blob));
+        assert_eq!(loaded.song, vec![1, 3, 3], "the arrangement comes back with the Set");
+    }
+
+    #[test]
+    fn a_save_with_no_song_writes_no_line_and_clears_a_stale_one() {
+        let e = Engine::new(44100, 12000);
+        let blob = serialize(&e);
+        assert!(!blob.contains("sg "), "no song, no line — old builds keep reading this");
+
+        let mut loaded = Engine::new(44100, 12000);
+        loaded.tracks[0].clips[0].length_steps = 16;
+        loaded.song_start(0);
+        assert!(load(&mut loaded, &blob));
+        assert!(loaded.song.is_empty(), "loading a songless Set clears the previous song");
+    }
+}

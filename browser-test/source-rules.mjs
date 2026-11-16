@@ -1,0 +1,186 @@
+#!/usr/bin/env node
+/* browser-test/source-rules.mjs — rules about the SHAPE of src/, not its
+ * behaviour. A rule here exists because the thing it forbids was done, cost
+ * something, and would be done again by the next person who did not know.
+ *
+ * Run from movy root: node browser-test/source-rules.mjs
+ */
+
+import { readFileSync, readdirSync } from 'node:fs';
+import { join, relative } from 'node:path';
+
+const SRC = 'src';
+let fails = 0;
+const log = (s) => console.log(s);
+const ok = (label, cond, detail = '') => {
+    if (cond) console.log(`  \x1b[32m✓\x1b[0m ${label}${detail ? '  (' + detail + ')' : ''}`);
+    else { console.log(`  \x1b[31m✗\x1b[0m ${label}${detail ? '  ' + detail : ''}`); fails++; }
+};
+
+function walk(dir, acc = []) {
+    for (const e of readdirSync(dir, { withFileTypes: true })) {
+        const p = join(dir, e.name);
+        if (e.isDirectory()) walk(p, acc);
+        else if (e.name.endsWith('.ts')) acc.push(p);
+    }
+    return acc;
+}
+
+/* Comments are allowed to name anything — most of what src/ knows about this
+ * channel is written down in them, and a rule that forbade the words would push
+ * that knowledge out of the code. So the scan is over CODE. */
+function stripComments(src) {
+    return src
+        .replace(/\/\*[\s\S]*?\*\//g, ' ')
+        .replace(/(^|[^:])\/\/[^\n]*/g, '$1 ');
+}
+
+/* ── Rule 1: the param channel has ONE door ──────────────────────────────────
+ *
+ * The channel's rules were learned on device and then re-implemented, slightly
+ * differently, by whoever needed it next — two track ports carried verbatim
+ * copies, and `seq/engine.ts` threw a refusal away entirely, which silently
+ * dropped sequencer commands until 2026-09-13 (the overtake host's single-slot
+ * param SHM). movy-host's ordered queue retired those rules (WP10), but a bulk
+ * read can still come back short and must not be read as a page of empty
+ * values, and the next host change must land in ONE place.
+ *
+ * So: `src/host/param.ts` owns the rules and nothing else touches the globals.
+ */
+log('\nRule 1: only src/host/param.ts talks to the engine param channel');
+
+/* The channel's host half is the platform's engine calls (Rule 3 keeps the raw
+ * globals inside src/platform/), so the door is the only caller of those. */
+const GLOBALS = /\bplatform\.engine(Available|Get|Set|GetBulk|SetBulk)\b/;
+
+const ALLOWED = new Set([
+    /* The door itself. */
+    'src/host/param.ts',
+]);
+
+const offenders = [];
+for (const f of walk(SRC)) {
+    const rel = relative('.', f);
+    if (ALLOWED.has(rel)) continue;
+    const code = stripComments(readFileSync(f, 'utf8'));
+    if (GLOBALS.test(code)) offenders.push(rel);
+}
+ok('no module outside the door calls the engine param channel', offenders.length === 0,
+   offenders.length
+       ? `${offenders.join(', ')} — go through src/host/param.ts (paramGet/paramSet/paramGetMany/paramSetMany)`
+       : `${ALLOWED.size} allowed, everything else clean`);
+
+/* And the door never WAITS on a write: a set that blocks costs the tick up to
+ * a frame for an answer the queue does not need (WP10). The platform no longer
+ * offers one, so its return here would be a regression, not a choice. */
+const door = readFileSync('src/host/param.ts', 'utf8');
+ok('and the door never waits on a write',
+   !/SetBlocking|set_param_blocking/.test(stripComments(door)) && /export function paramStats/.test(door));
+
+
+/* ── Rule 2: the device tier waits on the device, never on a clock ───────────
+ *
+ * Move's tick rate swings between 63 and 205 Hz with load, so a fixed sleep is
+ * a bet on how busy the device happens to be. Every one of those bets is a
+ * flake waiting for a slow run, and the bash tier this harness replaced was
+ * mostly made of them — ~25 s of `sleep` in the automation suite alone.
+ *
+ * `wait.ts` exists so a wait is a quantity of DEVICE WORK: `until` spends
+ * frames and fails with the value it was still seeing, which a sleep can never
+ * do. The rule is a ratchet — the sleeps that are left are named here, with the
+ * reason each one cannot be a frame budget.
+ */
+log('\nRule 2: no new fixed sleeps in test-device/');
+
+const SLEEP = /(^|[^.\w])setTimeout\s*\(/;
+
+const SLEEP_ALLOWED = new Map([
+    /* movy-host IS the standalone frame clock: while it is down (its launch,
+     * its exit, Move's return between the two) there is no frame to count. */
+    ['test-device/transport-standalone.ts', 'waits across the frame clock being down'],
+]);
+
+const sleepers = [];
+for (const f of walk('test-device').filter((p) => !/\/(dist|selftest)\//.test(p))) {
+    const rel = relative('.', f);
+    if (SLEEP_ALLOWED.has(rel)) continue;
+    if (SLEEP.test(stripComments(readFileSync(f, 'utf8')))) sleepers.push(rel);
+}
+ok('scenarios wait on frames, not on setTimeout', sleepers.length === 0,
+   sleepers.length
+       ? `${sleepers.join(', ')} — use until()/frames() from test-device/wait.ts`
+       : `${SLEEP_ALLOWED.size} named exceptions, everything else clean`);
+
+/* An allowlist is only a ratchet while its entries are real. A stale one is an
+ * exemption nobody asked for, sitting open for the next sleep. */
+const staleExemptions = [...SLEEP_ALLOWED.keys()]
+    .filter((f) => !SLEEP.test(stripComments(readFileSync(f, 'utf8'))));
+ok('and the named exceptions still need to be exceptions', staleExemptions.length === 0,
+   staleExemptions.length ? `${staleExemptions.join(', ')} no longer sleeps — drop it from the list` : '');
+
+
+/* ── Rule 3: the host is reached through src/platform/standalone.ts only ────
+ *
+ * movy-host is the only host (plans/2026-10-09-standalone-migration.md, WP9),
+ * and every global it answers is named in one file, behind the Platform
+ * interface the suites swap. One stray `shadow_*` call elsewhere is a call no
+ * suite can intercept.
+ *
+ * A name after `/` is a path into schwung's tree (`shadow_ui_slot_grid.mjs`),
+ * not a call, so it is skipped. Comments are free to name anything, as above.
+ */
+log('\nRule 3: host globals are named only in src/platform/standalone.ts');
+
+const HOST_GLOBAL = /(?<![\w/$])(shadow_|host_|move_midi_)[A-Za-z0-9_]+/g;
+const HOST_FILES = new Set(['src/platform/standalone.ts', 'src/platform/host-globals.d.ts']);
+
+const hostOffenders = [];
+for (const f of walk(SRC)) {
+    const rel = relative('.', f);
+    if (HOST_FILES.has(rel)) continue;
+    const hits = stripComments(readFileSync(f, 'utf8')).match(HOST_GLOBAL);
+    if (hits) hostOffenders.push(`${rel} (${[...new Set(hits)].join(', ')})`);
+}
+ok('no module but standalone.ts names a host global', hostOffenders.length === 0,
+   hostOffenders.length
+       ? `${hostOffenders.join('; ')} — add it to the Platform interface (src/platform/platform.ts)`
+       : 'everything else is clean');
+
+/* ── Rule 4: no host-presence gates, and a ratchet that keeps it so ─────────
+ *
+ * Host and UI ship as one payload, so `typeof host_x === 'function'` can only
+ * ever be true: a gate is a fallback branch nothing runs, and a place for a
+ * missing registration to hide as a silent no-op instead of a ReferenceError
+ * the first suite would catch. WP9 deleted 35 of them. The ceiling may fall and
+ * never rise (dbxhost's rule).
+ */
+log('\nRule 4: no typeof gates on host globals (ratchet)');
+
+const TYPEOF_GATES_MAX = 0;
+const GATE = /typeof\s+(?:globalThis\.)?(?:shadow_|host_|move_midi_|movy_host\b|overtakeParked\b)/g;
+const gates = [];
+for (const f of walk(SRC)) {
+    const n = (stripComments(readFileSync(f, 'utf8')).match(GATE) ?? []).length;
+    if (n) gates.push(`${relative('.', f)} (${n})`);
+}
+const gateCount = gates.reduce((sum, g) => sum + Number(/\((\d+)\)$/.exec(g)[1]), 0);
+ok(`at most ${TYPEOF_GATES_MAX} typeof gates on host globals`, gateCount <= TYPEOF_GATES_MAX,
+   gateCount ? `${gateCount}: ${gates.join('; ')} — call the global through src/platform/standalone.ts` : 'none');
+
+/* ── Rule 5: no `for (… of yield* …)` ──────────────────────────────────────
+ *
+ * QuickJS 2025-04-26, the engine movy-host runs ui.js in, throws
+ * "InternalError: stack underflow" on a for-of over a `yield*` expression;
+ * node runs it fine, so every local suite passed while the device would have
+ * thrown in New Clip's staged harmony (create/plans.ts). Assign it first.
+ */
+log('\nRule 5: no for-of over a yield* expression (QuickJS stack underflow)');
+
+const OF_YIELD = /\bof\s*\(?\s*yield\s*\*/g;
+const ofYield = walk(SRC).filter((f) => OF_YIELD.test(stripComments(readFileSync(f, 'utf8')))).map((f) => relative('.', f));
+ok('no for-of over yield*', ofYield.length === 0, ofYield.length ? `${ofYield.join('; ')} — const x = yield* …; for (… of x)` : 'none');
+
+console.log(fails === 0
+    ? '\n\x1b[32m\x1b[1mALL SOURCE RULES PASSED\x1b[0m'
+    : `\n\x1b[31m\x1b[1m${fails} SOURCE RULE(S) FAILED\x1b[0m`);
+process.exit(fails === 0 ? 0 : 1);
