@@ -26,6 +26,7 @@ import { MASTER_FX_SLOTS, CLIP_PARAMS_COMPONENT, MIXER_COMPONENT, SET_PARAMS_COM
 import { drumPadLedColor } from '../keyboard/leds.js';
 import {
     feedbackPoll, feedbackLeds, feedbackForget, feedbackTickNo, padLedColor,
+    feedbackDisplay, displayTakeDirty, displayShowing,
 } from '../keyboard/module-feedback.js';
 import { drumNoteOfPhys, drumPadOfPhys } from '../keyboard/drum-grid.js';
 import { padVoiceSilent } from '../mixer/pad-mutes.js';
@@ -33,6 +34,7 @@ import { WHITE_DIM } from '../seq/colors.js';
 import { padColor } from '../seq/pads.js';
 import { midiNoteName } from '../keyboard/notes.js';
 import { renderKnobsView } from '../renderer/knob-view.js';
+import { drawModuleDisplay } from '../renderer/module-display.js';
 import { pageOwnerOf, type PageOwner } from './page-owner.js';
 import { pageOwnerForComponent } from './page-owner-virtual.js';
 import { moduleGridOnScreen, pollDrawnPage, drawnKnobLevels } from './page-poll.js';
@@ -379,6 +381,7 @@ const drumCache = new Uint8Array(32);
  * claim at init), so there is no race left to win. The one-shot invalidation
  * stays: it is what makes the grid overwrite colours left by the previous
  * layout, which the per-pad cache would otherwise consider already correct. */
+let lastWaveOn = false;
 let drumCacheStale = false;
 let lastActiveSlot   = -1;
 let lastShownKey     = '';   // identity of the on-screen param page (for touch reset)
@@ -544,6 +547,16 @@ function tickBody(): void {
     } else {
         feedbackForget(appState.activeTrack.index);
     }
+    /* The module's own display (waveform) replaces the knob page on the two
+     * module views while no knob / jog is in use. A flip either way, and every
+     * change the module reports while it is up, repaints the frame. */
+    const waveOn = !!fbKeys && !seqState.sessionMode
+        && (appState.currentView === VIEW_KNOBS || appState.currentView === VIEW_CHAIN)
+        && !(stepPageAvailable() && stepPageState.selected)
+        && !schwungEditorActive() && !canvasDiveActive()
+        && displayShowing(Date.now(), fbKeys, appState.activeTrack.index);
+    if (waveOn !== lastWaveOn) { lastWaveOn = waveOn; appState.dirty = true; }
+    if (displayTakeDirty() && waveOn) appState.dirty = true;
 
     /* A track switch changes what the pads mean, so the grid must repaint even
      * where the new colour matches the cached one. Detected here (before the
@@ -853,6 +866,9 @@ function tickBody(): void {
             updateSingleKnobLED(-1, 0);
         } else if (appState.currentView === VIEW_KEYS) {
             renderKeysView(activeModel?.getModuleName() ?? '—', baseNoteFor(appState.activeTrack.index), midiNoteName);
+        } else if (waveOn) {
+            drawModuleDisplay(feedbackDisplay(appState.activeTrack.index)!, appState.activeTrack.index);
+            updateSingleKnobLED(-1, 0);
         } else if (appState.currentView === VIEW_KNOBS) {
             const stepAvail = stepPageAvailable();
             let vm;

@@ -3581,5 +3581,70 @@ _log('\napp-loop: module feedback (pad_leds / status_text)');
     eq('colour changes follow', padColor(69), 33);
 }
 
+/* ── a module's display view and Delete + pad forwarding ─────────────────── */
+_log('\napp-loop: module display view + delete_pad');
+{
+    const CC_DELETE = 119;
+    const hex128 = Array.from({ length: 128 }, (_, i) => (i % 200).toString(16).padStart(2, '0')).join('');
+    const declare = (extra) => {
+        resetApp();
+        env.params['synth:ui_hierarchy'] = JSON.stringify({
+            ...extra, levels: { root: { knobs: [] } },
+        });
+        env.params['synth:display'] = '1|10|' + hex128 + '|PLAY 1 - 4 BARS';
+        env.params['synth:status_text'] = '0:';
+        appState.trackModels[0][1].reload();
+        advance(40);
+    };
+    /* the playhead (pos 10) is a 1 px column over the whole wave band: only the display view draws it */
+    const headerInverted = () => painted.some((r) => r[0] === 10 && r[1] === 9 && r[2] === 1 && r[3] === 48);
+    const fb = await import('../dist/esm/keyboard/module-feedback.js');
+    declare({ display_param: 'display', status_text_param: 'status_text', delete_pad_param: 'delete_pad' });
+    fb.displayActivity(0);       // earlier tests touched knobs
+    appState.currentView = 3;   // VIEW_CHAIN
+    appState.dirty = true;
+    advance(2 * 8 + 40);        // past the 1.5 s idle gate from boot
+    painted.length = 0;
+    appState.dirty = true;
+    advance(2);
+    eq('the display view is up while nothing is touched', headerInverted(), true);
+    /* a knob touch gives the screen back to the knob page */
+    sendMidi([0x90, 0, 127]);
+    advance(2);
+    painted.length = 0;
+    appState.dirty = true;
+    advance(2);
+    eq('a touched knob shows the knob page', headerInverted(), false);
+    sendMidi([0x80, 0, 0]);
+
+    /* Delete + pad -> the module's delete_pad, with the 0-based rack pad index; movy's own wipe does not run. */
+    declare({ display_param: 'display', delete_pad_param: 'delete_pad' });
+    engine.reset();
+    sendMidi([0xB0, CC_DELETE, 127]);
+    advance(2);
+    sendMidi([0x90, PAD_KICK + 1, 110]);                // rack pad 2
+    sendMidi([0x80, PAD_KICK + 1, 0]);
+    advance(3);
+    eq('Delete + pad writes the rack pad index to the module', env.params['synth:delete_pad'], '1');
+    eq('movy does not wipe the voice steps', engine.ops.some((o) => o.startsWith('del ')), false);
+    sendMidi([0xB0, CC_DELETE, 0]);
+    advance(2);
+    eq('and releasing Delete does not delete the clip', engine.ops.some((o) => o.startsWith('clipdel')), false);
+
+    /* A module that does not declare it keeps movy's behaviour. */
+    declare({ display_param: 'display' });
+    engine.reset();
+    delete env.params['synth:delete_pad'];
+    sendMidi([0xB0, CC_DELETE, 127]);
+    advance(2);
+    sendMidi([0x90, PAD_KICK, 110]);
+    sendMidi([0x80, PAD_KICK, 0]);
+    advance(3);
+    eq('without delete_pad_param nothing is written', env.params['synth:delete_pad'], undefined);
+    eq('and movy wipes that pad as before', engine.ops.includes(`del 0 0 255 ${NOTE_KICK}`), true);
+    sendMidi([0xB0, CC_DELETE, 0]);
+    advance(2);
+}
+
 if (failures === 0) _log('\n\x1b[32m\x1b[1mALL APP-LOOP CHECKS PASSED\x1b[0m');
 else { _log(`\n\x1b[31m\x1b[1m${failures} APP-LOOP CHECK(S) FAILED\x1b[0m`); process.exit(1); }
