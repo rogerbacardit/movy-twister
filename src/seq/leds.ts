@@ -24,6 +24,7 @@ import { loopEndBar, loopStartBar, occHasStep, seqState, stepInLoop } from './st
 import { stepRecActive, stepRecCanGoLeft, stepRecHead } from './step-rec.js';
 import { cachedSetLED, cachedSetButtonLED, cachedSetAnimLED, ledFrameReset, seqLedsInvalidate } from './led-cache.js';
 import { watchedTrack } from './watch.js';
+import { feedbackStepLeds, feedbackTickNo, padLedColor } from '../keyboard/module-feedback.js';
 
 /* Re-exported so callers keep importing the LED API from one place. */
 export { seqLedsInvalidate, cachedSetAnimLED, ledFrameReset };
@@ -323,6 +324,17 @@ export function seqLedsTick(
      * stays the selector so the next press switches again. */
     if (seqState.trackSelectHold) {
         paintTrackSelector();
+        paintTransport();
+        return;
+    }
+    /* A module that declares step_buttons_param and step_leds_param paints the
+     * row itself (keyboard/module-feedback.ts). */
+    const modSteps = feedbackStepLeds(appState.activeTrack.index);
+    if (modSteps && !seqState.loopMode) {
+        const tickNo = feedbackTickNo();
+        for (let i = 0; i < NUM_STEP_BUTTONS; i++) {
+            cachedSetLED(STEP_NOTE_BASE + i, padLedColor(modSteps[i], tickNo));
+        }
         paintTransport();
         return;
     }

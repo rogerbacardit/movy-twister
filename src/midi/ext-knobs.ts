@@ -8,6 +8,9 @@ import { pageOwnerOf } from '../app/page-owner.js';
 import { onMidiMessageInternal, knobModel } from './router.js';
 import { createExtKnobState, extKnobActions, isTwisterCc } from './ext-knob-map.js';
 import { armTwisterFollow, setTwisterSync } from './ext-follow.js';
+import { moduleLoopKnob } from '../keyboard/module-input.js';
+import { loopHeld } from '../seq/loop-mode.js';
+import { seqState } from '../seq/state.js';
 import { extBaseForget, extKnobReset, extKnobTurn } from './ext-param.js';
 
 const state = createExtKnobState();
@@ -46,7 +49,11 @@ export function onExternalControlChange(data: number[]): void {
     }
     for (const a of extKnobActions(state, ch, data[1] & 0x7F, data[2] & 0x7F)) {
         if (a.kind === 'cc') onMidiMessageInternal([0xB0, a.cc, a.value]);
-        else if (a.kind === 'knob') extKnobTurn(a.knob, a.delta, a.pos);
+        else if (a.kind === 'knob') {
+            /* Loop held on a track whose module takes Loop + knob: its knob. */
+            if (loopHeld() && !seqState.sessionMode && moduleLoopKnob(a.knob, a.delta, false)) continue;
+            extKnobTurn(a.knob, a.delta, a.pos);
+        }
         else if (a.kind === 'reset') extKnobReset(a.knob);
         else presetTurn(a.delta);
     }

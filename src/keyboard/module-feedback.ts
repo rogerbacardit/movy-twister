@@ -7,6 +7,9 @@
  *   "status_text_param": "status_text"   read-only string, "<seq>:<text>"
  *   "display_param":     "display"       read-only string, "<seq>|<pos>|<peaks>|<header>"
  *   "delete_pad_param":  "delete_pad"    write-only: Delete + pad -> the rack pad index
+ *   "step_buttons_param": "step"         write-only: step button press -> 0..15
+ *   "step_leds_param":    "step_leds"    read-only string, 32 hex digits (16 bytes)
+ *   "loop_knob_param":    "loop_knob"    write-only: Loop held + knob -> "N:delta[:1]"
  *
  * pad_leds: one byte (two hex digits) per RACK pad, pad 1 first — the same
  * numbering as the module's declared voices, so the module never needs to know
@@ -29,7 +32,23 @@
  * "erase this voice's steps"; movy writes the 0-based rack pad index (0..31,
  * same numbering as pad_leds) to this param and swallows the press.
  *
- * Cost: up to three get_param reads, only for the ACTIVE track, only every
+ * step_buttons_param: on a track whose module declares it, a press on one of
+ * the 16 step buttons (no Shift, Mute not held, not Session view) is NOT a
+ * sequencer step: movy writes the 0-based button index 0..15 and swallows the
+ * press and its release. step_leds_param paints the 16 step LEDs the same way
+ * pad_leds paints the pads (one palette byte each, bit 7 = blink). A module that
+ * declares step_buttons_param also owns the Loop button on its track: Loop is a
+ * pure modifier there (no Loop mode, no bar selector), see seq/loop-mode.ts.
+ *
+ * loop_knob_param: while Move's Loop button is held on such a track, a turn of
+ * knob N (1..8) is NOT the knob's parameter: movy writes "N:delta" (delta is the
+ * signed relative turn; ":1" is appended while Shift is held, "fine") and
+ * swallows the turn. The display view stays up instead of the knob page.
+ *
+ * display pos field: "<pos>" or "<pos>,<mark>"; mark 0..127 is a start marker
+ * column, absent (or negative) for none. An older movy reads only the pos.
+ *
+ * Cost: up to four get_param reads, only for the ACTIVE track, only every
  * POLL_EVERY ticks (~25 Hz at the device's ~196 ticks/s). A module that
  * declares nothing costs nothing.
  *
@@ -46,12 +65,16 @@ export interface FeedbackKeys {
     textKey: string | null;
     displayKey: string | null;
     deleteKey: string | null;
+    stepKey: string | null;
+    stepLedsKey: string | null;
+    loopKnobKey: string | null;
 }
 
 /** What the module said about the selected clip, as last read. */
 export interface DisplayState {
     seq: number;
     pos: number;                 // 0..127
+    mark: number;                // 0..127 start marker column, -1 = none
     peaks: Uint8Array | null;    // 128 entries, or null when empty
     header: string;
 }
@@ -69,8 +92,12 @@ export function feedbackKeysOf(hierarchy: any): FeedbackKeys | null {
         textKey: keyOf(hierarchy.status_text_param),
         displayKey: keyOf(hierarchy.display_param),
         deleteKey: keyOf(hierarchy.delete_pad_param),
+        stepKey: keyOf(hierarchy.step_buttons_param),
+        stepLedsKey: keyOf(hierarchy.step_leds_param),
+        loopKnobKey: keyOf(hierarchy.loop_knob_param),
     };
-    return k.ledsKey || k.textKey || k.displayKey || k.deleteKey ? k : null;
+    return k.ledsKey || k.textKey || k.displayKey || k.deleteKey
+        || k.stepKey || k.stepLedsKey || k.loopKnobKey ? k : null;
 }
 
 /** "<seq>|<pos>|<peaks>|<header>" -> state. `prev` lets an unchanged seq keep
@@ -82,8 +109,12 @@ export function parseDisplay(raw: string | null | undefined, prev?: DisplayState
     const i3 = i2 < 0 ? -1 : raw.indexOf('|', i2 + 1);
     if (i3 < 0) return null;
     const seq = parseInt(raw.slice(0, i1), 10);
-    const pos = parseInt(raw.slice(i1 + 1, i2), 10);
+    const posField = raw.slice(i1 + 1, i2);
+    const pos = parseInt(posField, 10);
     if (!(seq >= 0) || !(pos >= 0)) return null;
+    const ci = posField.indexOf(',');
+    const markRaw = ci < 0 ? -1 : parseInt(posField.slice(ci + 1), 10);
+    const mark = markRaw >= 0 ? Math.min(DISPLAY_BINS - 1, markRaw) : -1;
     const header = raw.slice(i3 + 1);
     let peaks: Uint8Array | null;
     if (prev && prev.seq === seq) peaks = prev.peaks;
@@ -101,7 +132,7 @@ export function parseDisplay(raw: string | null | undefined, prev?: DisplayState
             if (ok) peaks = a;
         }
     }
-    return { seq, pos: Math.min(DISPLAY_BINS - 1, pos), peaks, header };
+    return { seq, pos: Math.min(DISPLAY_BINS - 1, pos), mark, peaks, header };
 }
 
 /** 64 hex digits -> 32 bytes. Null for anything else (a half-written or
@@ -110,6 +141,20 @@ export function parsePadLeds(raw: string | null | undefined): Uint8Array | null 
     if (!raw || raw.length < PAD_LED_COUNT * 2) return null;
     const out = new Uint8Array(PAD_LED_COUNT);
     for (let i = 0; i < PAD_LED_COUNT; i++) {
+        const v = parseInt(raw.substr(i * 2, 2), 16);
+        if (!(v >= 0)) return null;
+        out[i] = v;
+    }
+    return out;
+}
+
+export const STEP_LED_COUNT = 16;
+
+/** 32 hex digits -> 16 bytes. Null for anything else. */
+export function parseStepLeds(raw: string | null | undefined): Uint8Array | null {
+    if (!raw || raw.length < STEP_LED_COUNT * 2) return null;
+    const out = new Uint8Array(STEP_LED_COUNT);
+    for (let i = 0; i < STEP_LED_COUNT; i++) {
         const v = parseInt(raw.substr(i * 2, 2), 16);
         if (!(v >= 0)) return null;
         out[i] = v;
@@ -136,6 +181,7 @@ export function parseStatus(raw: string | null | undefined): { seq: number; text
 
 interface TrackFeedback {
     leds: Uint8Array | null;
+    stepLeds: Uint8Array | null;
     seq: number;            // -1 = nothing seen yet
     display: DisplayState | null;
 }
@@ -147,7 +193,7 @@ let lastActivity = -1e12;
 
 function stateOf(track: number): TrackFeedback {
     let st = tracks.get(track);
-    if (!st) { st = { leds: null, seq: -1, display: null }; tracks.set(track, st); }
+    if (!st) { st = { leds: null, stepLeds: null, seq: -1, display: null }; tracks.set(track, st); }
     return st;
 }
 
@@ -160,9 +206,10 @@ export function feedbackPoll(
     if (pollTick % POLL_EVERY !== 0) return null;
     const st = stateOf(track);
     if (keys.ledsKey) st.leds = parsePadLeds(read(keys.ledsKey));
+    if (keys.stepLedsKey) st.stepLeds = parseStepLeds(read(keys.stepLedsKey));
     if (keys.displayKey) {
         const d = parseDisplay(read(keys.displayKey), st.display);
-        if (d && (!st.display || d.seq !== st.display.seq || d.pos !== st.display.pos
+        if (d && (!st.display || d.seq !== st.display.seq || d.pos !== st.display.pos || d.mark !== st.display.mark
                   || d.header !== st.display.header)) displayDirty = true;
         st.display = d;
     }
@@ -178,6 +225,11 @@ export function feedbackPoll(
 /** Latest pad colours for a track, or null (not declared / not read yet). */
 export function feedbackLeds(track: number): Uint8Array | null {
     return tracks.get(track)?.leds ?? null;
+}
+
+/** Latest step-row colours for a track, or null (not declared / not read yet). */
+export function feedbackStepLeds(track: number): Uint8Array | null {
+    return tracks.get(track)?.stepLeds ?? null;
 }
 
 /** Forget a track (its module changed) so stale colours/seq never leak. */
@@ -215,4 +267,21 @@ export function displayShowing(nowMs: number, keys: FeedbackKeys | null, track: 
 export function deletePadWrite(keys: FeedbackKeys | null, rackPad1: number): [string, string] | null {
     if (!keys || !keys.deleteKey || !(rackPad1 >= 1)) return null;
     return [keys.deleteKey, String(rackPad1 - 1)];
+}
+
+/** The write a step button press turns into: [key, value], or null when the
+ *  module does not declare step_buttons_param or the button is not 0..15. */
+export function stepPressWrite(keys: FeedbackKeys | null, button: number): [string, string] | null {
+    if (!keys || !keys.stepKey || !(button >= 0 && button < STEP_LED_COUNT)) return null;
+    return [keys.stepKey, String(button)];
+}
+
+/** The write a knob turn under a held Loop button turns into: [key, "N:delta"
+ *  (+ ":1" with Shift)], or null when the module does not declare
+ *  loop_knob_param. `knob` is 0-based, N is 1-based. */
+export function loopKnobWrite(
+    keys: FeedbackKeys | null, knob: number, delta: number, fine: boolean,
+): [string, string] | null {
+    if (!keys || !keys.loopKnobKey || !(knob >= 0 && knob < 8) || !delta) return null;
+    return [keys.loopKnobKey, (knob + 1) + ':' + delta + (fine ? ':1' : '')];
 }

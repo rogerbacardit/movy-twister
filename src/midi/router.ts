@@ -81,6 +81,8 @@ import { holdTouch, holdRelease, holdTurnCancel, assignActive, assignCycle, assi
 import { masterScope, trackScope } from '../lfo/scope.js';
 import { deleteActive, markDeleteActed } from '../seq/edit-ops.js';
 import { displayActivity, deletePadWrite } from '../keyboard/module-feedback.js';
+import { moduleLoopKnob, moduleOwnsLoopKnobs } from '../keyboard/module-input.js';
+import { loopHeld } from '../seq/loop-mode.js';
 import { seqToast } from '../seq/render.js';
 import { leaveModalActive, openLeaveModal, closeLeaveModal, leaveModalMove, leaveModalConfirm, leaveModalPass } from '../app/leave-modal.js';
 import {
@@ -132,6 +134,12 @@ function trackButtonPress(data: number[]): void {
     if (k === MoveMainKnob || k === MASTER_CC) return;
     if (k >= KNOB_CC_BASE && k < KNOB_CC_BASE + NUM_KNOBS) return;
     setButtonHeld(k, data[2] > 0);
+}
+
+/* Loop is held on a track whose module takes Loop + knob (loop_knob_param): the
+ * knobs are the module's, and its display view stays on screen. */
+function loopKnobOwned(): boolean {
+    return loopHeld() && !seqState.sessionMode && moduleOwnsLoopKnobs();
 }
 
 function activeModel() {
@@ -308,16 +316,21 @@ export function onMidiMessageInternal(data: number[]): void {
      * moment (keyboard/module-feedback.ts DISPLAY_IDLE_MS). */
     {
         const hi = status & 0xF0;
+        const isKnob = (hi === 0x90 || hi === 0x80) && d1 < 8
+            || (hi === 0xB0 && d1 >= KNOB_CC_BASE && d1 < KNOB_CC_BASE + NUM_KNOBS);
         if (((hi === 0x90 || hi === 0x80) && d1 < 10)
             || (hi === 0xB0 && (d1 === MoveMainKnob || d1 === MASTER_CC
                                 || (d1 >= KNOB_CC_BASE && d1 < KNOB_CC_BASE + NUM_KNOBS)))) {
-            displayActivity(Date.now());
+            if (!(isKnob && loopKnobOwned())) displayActivity(Date.now());
         }
     }
 
     /* Capacitive knob touch: NoteOn note=0..7. Hold-Clear (Delete) + touch
      * clears that knob's automation lane. */
     if ((status & 0xF0) === 0x90 && d1 < 8) {
+        /* Loop + knob belongs to the module: its touch opens no knob page. (Only
+         * the press: a release is owed to whatever pinned it, below.) */
+        if (d2 > 0 && loopKnobOwned()) return;
         /*
          * A RELEASE IS OWED TO THE PRESS, NOT TO WHAT IS ON SCREEN NOW.
          *
@@ -658,6 +671,7 @@ export function onMidiMessageInternal(data: number[]): void {
             if (k < 5) stepParamsOwner().page?.knobTurn(k, delta);
             return;
         }
+        if (loopKnobOwned() && moduleLoopKnob(k, delta, appState.shiftHeld)) return;
         mlog('knobCC k=' + k + ' d2=' + d2 + ' delta=' + delta);
         const model = knobModel();
         const track = appState.activeTrack.index;

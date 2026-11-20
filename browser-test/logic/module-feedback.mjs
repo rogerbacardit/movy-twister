@@ -14,11 +14,11 @@ export async function run() {
 
     eq('no declaration -> null', feedbackKeysOf({ pad_layout: 'drums' }), null);
     eq('both keys read', JSON.stringify(feedbackKeysOf({ pad_leds_param: 'pad_leds', status_text_param: 'status_text' })),
-       '{"ledsKey":"pad_leds","textKey":"status_text","displayKey":null,"deleteKey":null}');
+       '{"ledsKey":"pad_leds","textKey":"status_text","displayKey":null,"deleteKey":null,"stepKey":null,"stepLedsKey":null,"loopKnobKey":null}');
     eq('one key is enough', JSON.stringify(feedbackKeysOf({ status_text_param: 't' })),
-       '{"ledsKey":null,"textKey":"t","displayKey":null,"deleteKey":null}');
+       '{"ledsKey":null,"textKey":"t","displayKey":null,"deleteKey":null,"stepKey":null,"stepLedsKey":null,"loopKnobKey":null}');
     eq('display and delete keys read', JSON.stringify(feedbackKeysOf({ display_param: 'd', delete_pad_param: 'x' })),
-       '{"ledsKey":null,"textKey":null,"displayKey":"d","deleteKey":"x"}');
+       '{"ledsKey":null,"textKey":null,"displayKey":"d","deleteKey":"x","stepKey":null,"stepLedsKey":null,"loopKnobKey":null}');
 
     eq('short string is rejected', parsePadLeds('0102'), null);
     eq('non-hex is rejected', parsePadLeds('zz'.repeat(32)), null);
@@ -108,4 +108,46 @@ export async function run() {
     eq('delete write: rack pad 32 -> index 31', deletePadWrite({ ...dkeys, deleteKey: 'delete_pad' }, 32)[1], '31');
     eq('no key, no write', deletePadWrite(dkeys, 3), null);
     eq('pad outside the rack, no write', deletePadWrite({ ...dkeys, deleteKey: 'x' }, -1), null);
+
+    /* ── step_buttons_param / step_leds_param / loop_knob_param, display mark ── */
+    const { parseStepLeds, feedbackStepLeds, stepPressWrite, loopKnobWrite } = m;
+    const k3 = feedbackKeysOf({ step_buttons_param: 'step', step_leds_param: 'step_leds', loop_knob_param: 'loop_knob' });
+    eq('step keys are read from the hierarchy root', k3.stepKey + ',' + k3.stepLedsKey + ',' + k3.loopKnobKey, 'step,step_leds,loop_knob');
+    eq('a hierarchy that declares none of them is null', feedbackKeysOf({ levels: {} }), null);
+    eq('a module declaring only pad_leds has no step keys', feedbackKeysOf({ pad_leds_param: 'p' }).stepKey, null);
+    eq('step press write: button 0', JSON.stringify(stepPressWrite(k3, 0)), '["step","0"]');
+    eq('step press write: button 15', stepPressWrite(k3, 15)[1], '15');
+    eq('step press write: out of range', stepPressWrite(k3, 16), null);
+    eq('no step key, no write', stepPressWrite(feedbackKeysOf({ pad_leds_param: 'p' }), 3), null);
+    eq('loop knob write: knob 1 turn +3', JSON.stringify(loopKnobWrite(k3, 0, 3, false)), '["loop_knob","1:3"]');
+    eq('loop knob write: negative delta', loopKnobWrite(k3, 5, -2, false)[1], '6:-2');
+    eq('loop knob write: Shift = fine', loopKnobWrite(k3, 1, 1, true)[1], '2:1:1');
+    eq('loop knob write: a zero turn is nothing', loopKnobWrite(k3, 1, 0, false), null);
+    eq('no loop key, no write', loopKnobWrite(feedbackKeysOf({ pad_leds_param: 'p' }), 1, 1, false), null);
+    const sl = Array.from({ length: 16 }, (_, i) => (i + 1).toString(16).padStart(2, '0')).join('');
+    eq('step leds: 32 hex digits -> 16 bytes', parseStepLeds(sl)[15], 16);
+    eq('step leds: short is rejected', parseStepLeds('0102'), null);
+    feedbackReset();
+    const skeys = { ledsKey: null, textKey: null, displayKey: null, deleteKey: null, stepKey: 'step', stepLedsKey: 'step_leds', loopKnobKey: null };
+    for (let i = 0; i < POLL_EVERY; i++) feedbackPoll(2, skeys, (k) => (k === 'step_leds' ? sl : null));
+    eq('step leds are polled per track', feedbackStepLeds(2)[4], 5);
+    eq('another track has none', feedbackStepLeds(1), null);
+    feedbackReset();
+    for (let i = 0; i < POLL_EVERY; i++) feedbackPoll(2, { ...skeys, stepLedsKey: null }, () => sl);
+    eq('without step_leds_param nothing is read', feedbackStepLeds(2), null);
+
+    const dm = parseDisplay('3|40,12|' + peaks + '|START 1 +3/16');
+    eq('display pos with a mark: pos', dm.pos, 40);
+    eq('display pos with a mark: mark', dm.mark, 12);
+    eq('display without a mark: -1', parseDisplay('3|40|' + peaks + '|H').mark, -1);
+    eq('display mark is clamped', parseDisplay('3|40,999|' + peaks + '|H').mark, 127);
+    eq('display negative mark = none', parseDisplay('3|40,-1|' + peaks + '|H').mark, -1);
+    feedbackReset();
+    const mkeys = { ledsKey: null, textKey: null, displayKey: 'display', deleteKey: null };
+    let mval = '1|10,5|' + peaks + '|H';
+    for (let i = 0; i < POLL_EVERY; i++) feedbackPoll(3, mkeys, () => mval);
+    displayTakeDirty();
+    mval = '1|10,9|' + peaks + '|H';
+    for (let i = 0; i < POLL_EVERY; i++) feedbackPoll(3, mkeys, () => mval);
+    eq('a moving marker repaints', displayTakeDirty(), true);
 }

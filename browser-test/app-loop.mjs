@@ -3646,5 +3646,76 @@ _log('\napp-loop: module display view + delete_pad');
     advance(2);
 }
 
+/* ── a module that takes the step row and Loop + knob ───────────────────── */
+_log('\napp-loop: module step buttons + Loop knob');
+{
+    const CC_LOOP = 58;
+    const declareSteps = (extra) => {
+        resetApp();
+        env.params['synth:ui_hierarchy'] = JSON.stringify({ ...extra, levels: { root: { knobs: [] } } });
+        env.params['synth:step_leds'] = Array.from({ length: 16 }, (_, i) => (30 + i).toString(16).padStart(2, '0')).join('');
+        delete env.params['synth:step'];
+        delete env.params['synth:loop_knob'];
+        appState.trackModels[0][1].reload();
+        advance(40);
+    };
+    const stepTap = (i) => { sendMidi([0x90, STEP_NOTE_BASE + i, 100]); sendMidi([0x80, STEP_NOTE_BASE + i, 0]); advance(2); };
+
+    declareSteps({ step_buttons_param: 'step', step_leds_param: 'step_leds', loop_knob_param: 'loop_knob' });
+    engine.reset();
+    stepTap(6);
+    eq('a step press writes the 0-based button to the module', env.params['synth:step'], '6');
+    eq('and is not a sequencer step', engine.ops.some((o) => o.startsWith('step ') || o.startsWith('tog')), false);
+    eq('the step LEDs are the module\'s', ledByPad[STEP_NOTE_BASE + 3], 33);
+    eq('the last step LED too', ledByPad[STEP_NOTE_BASE + 15], 45);
+
+    /* Loop is a pure modifier on such a track: no Loop mode, the row stays the module's */
+    sendMidi([0xB0, CC_LOOP, 127]);
+    advance(2);
+    eq('Loop does not switch to Loop mode', seqState.loopMode, false);
+    sendMidi([0xB0, 71, 3]);                                  // knob 1, +3
+    advance(2);
+    eq('Loop + knob 1 goes to the module as N:delta', env.params['synth:loop_knob'], '1:3');
+    sendMidi([0xB0, 73, 127]);                                // knob 3, -1
+    advance(2);
+    eq('a negative turn', env.params['synth:loop_knob'], '3:-1');
+    appState.shiftHeld = true;
+    sendMidi([0xB0, 72, 1]);
+    appState.shiftHeld = false;
+    advance(2);
+    eq('Shift adds the fine flag', env.params['synth:loop_knob'], '2:1:1');
+    delete env.params['synth:loop_knob'];
+    sendMidi([0x90, 0, 127]); sendMidi([0x80, 0, 0]);          // a knob touch
+    advance(2);
+    sendMidi([0xB0, CC_LOOP, 0]);
+    advance(2);
+    sendMidi([0xB0, 71, 3]);
+    advance(2);
+    eq('without Loop a knob turn is not sent to the module', env.params['synth:loop_knob'], undefined);
+
+    /* A module that declares none of it keeps the sequencer. */
+    declareSteps({ pad_leds_param: 'pad_leds' });
+    engine.reset();
+    stepTap(6);
+    eq('without step_buttons_param nothing is written', env.params['synth:step'], undefined);
+    sendMidi([0xB0, CC_LOOP, 127]);
+    advance(2);
+    eq('and Loop still enters Loop mode', seqState.loopMode, true);
+    sendMidi([0xB0, 71, 3]);
+    advance(2);
+    eq('and Loop + knob writes no loop_knob', env.params['synth:loop_knob'], undefined);
+    sendMidi([0xB0, CC_LOOP, 0]);
+    advance(2);
+    seqState.loopMode = false;
+
+    /* Shift + step keeps the shifted step functions on a module-owned row. */
+    declareSteps({ step_buttons_param: 'step' });
+    appState.shiftHeld = true;
+    sendMidi([0x90, STEP_NOTE_BASE + 5, 100]); sendMidi([0x80, STEP_NOTE_BASE + 5, 0]);
+    appState.shiftHeld = false;
+    advance(2);
+    eq('Shift + step is not the module\'s', env.params['synth:step'], undefined);
+}
+
 if (failures === 0) _log('\n\x1b[32m\x1b[1mALL APP-LOOP CHECKS PASSED\x1b[0m');
 else { _log(`\n\x1b[31m\x1b[1m${failures} APP-LOOP CHECK(S) FAILED\x1b[0m`); process.exit(1); }
