@@ -10,6 +10,9 @@
  *   "step_buttons_param": "step"         write-only: step button press -> 0..15
  *   "step_leds_param":    "step_leds"    read-only string, 32 hex digits (16 bytes)
  *   "loop_knob_param":    "loop_knob"    write-only: Loop held + knob -> "N:delta[:1]"
+ *   "knob_capture_param": "knob_capture" read-only "0"/"1": 1 = the module owns the knobs
+ *   "knob_delta_param":   "knob_delta"   write-only: a captured knob turn -> "N:delta[:1]"
+ *   "undo_param":         "undo_cmd"     write-only: Undo / Shift+Undo -> "undo" / "redo"
  *
  * pad_leds: one byte (two hex digits) per RACK pad, pad 1 first — the same
  * numbering as the module's declared voices, so the module never needs to know
@@ -45,8 +48,21 @@
  * signed relative turn; ":1" is appended while Shift is held, "fine") and
  * swallows the turn. The display view stays up instead of the knob page.
  *
- * display pos field: "<pos>" or "<pos>,<mark>"; mark 0..127 is a start marker
- * column, absent (or negative) for none. An older movy reads only the pos.
+ * knob_capture_param: while the module answers "1" for the ACTIVE track, every knob
+ * turn (Move's knobs and the Twister's) is NOT the knob's hierarchy parameter: movy
+ * writes "N:delta" to knob_delta_param (same form as loop_knob_param: N = knob 1..8,
+ * signed relative turn, ":1" appended while Shift is held) and swallows the turn,
+ * touch included; the display view stays up. The module decides what each knob
+ * means (a "mode" button on its pads). Read on the same poll as the other keys, so
+ * it takes effect within ~40 ms.
+ *
+ * undo_param: on a track whose module declares it, Move's Undo button writes "undo"
+ * (Shift+Undo: "redo") to the module instead of running movy's own undo; other
+ * tracks keep movy's undo. The button's LED is lit while such a track is active.
+ *
+ * display pos field: "<pos>", "<pos>,<mark>" or "<pos>,<mark>,<end>"; mark and end
+ * 0..127 are a start / end marker column, absent (or negative) for none. An older
+ * movy reads only the pos.
  *
  * Cost: up to four get_param reads, only for the ACTIVE track, only every
  * POLL_EVERY ticks (~25 Hz at the device's ~196 ticks/s). A module that
@@ -68,6 +84,9 @@ export interface FeedbackKeys {
     stepKey: string | null;
     stepLedsKey: string | null;
     loopKnobKey: string | null;
+    captureKey: string | null;
+    knobDeltaKey: string | null;
+    undoKey: string | null;
 }
 
 /** What the module said about the selected clip, as last read. */
@@ -75,6 +94,7 @@ export interface DisplayState {
     seq: number;
     pos: number;                 // 0..127
     mark: number;                // 0..127 start marker column, -1 = none
+    end: number;                 // 0..127 end marker column, -1 = none
     peaks: Uint8Array | null;    // 128 entries, or null when empty
     header: string;
 }
@@ -95,9 +115,13 @@ export function feedbackKeysOf(hierarchy: any): FeedbackKeys | null {
         stepKey: keyOf(hierarchy.step_buttons_param),
         stepLedsKey: keyOf(hierarchy.step_leds_param),
         loopKnobKey: keyOf(hierarchy.loop_knob_param),
+        captureKey: keyOf(hierarchy.knob_capture_param),
+        knobDeltaKey: keyOf(hierarchy.knob_delta_param),
+        undoKey: keyOf(hierarchy.undo_param),
     };
     return k.ledsKey || k.textKey || k.displayKey || k.deleteKey
-        || k.stepKey || k.stepLedsKey || k.loopKnobKey ? k : null;
+        || k.stepKey || k.stepLedsKey || k.loopKnobKey
+        || k.captureKey || k.knobDeltaKey || k.undoKey ? k : null;
 }
 
 /** "<seq>|<pos>|<peaks>|<header>" -> state. `prev` lets an unchanged seq keep
@@ -113,8 +137,11 @@ export function parseDisplay(raw: string | null | undefined, prev?: DisplayState
     const pos = parseInt(posField, 10);
     if (!(seq >= 0) || !(pos >= 0)) return null;
     const ci = posField.indexOf(',');
+    const ci2 = ci < 0 ? -1 : posField.indexOf(',', ci + 1);
     const markRaw = ci < 0 ? -1 : parseInt(posField.slice(ci + 1), 10);
     const mark = markRaw >= 0 ? Math.min(DISPLAY_BINS - 1, markRaw) : -1;
+    const endRaw = ci2 < 0 ? -1 : parseInt(posField.slice(ci2 + 1), 10);
+    const end = endRaw >= 0 ? Math.min(DISPLAY_BINS - 1, endRaw) : -1;
     const header = raw.slice(i3 + 1);
     let peaks: Uint8Array | null;
     if (prev && prev.seq === seq) peaks = prev.peaks;
@@ -132,7 +159,7 @@ export function parseDisplay(raw: string | null | undefined, prev?: DisplayState
             if (ok) peaks = a;
         }
     }
-    return { seq, pos: Math.min(DISPLAY_BINS - 1, pos), mark, peaks, header };
+    return { seq, pos: Math.min(DISPLAY_BINS - 1, pos), mark, end, peaks, header };
 }
 
 /** 64 hex digits -> 32 bytes. Null for anything else (a half-written or
@@ -182,6 +209,7 @@ export function parseStatus(raw: string | null | undefined): { seq: number; text
 interface TrackFeedback {
     leds: Uint8Array | null;
     stepLeds: Uint8Array | null;
+    capture: boolean;       // the module owns the knobs (knob_capture_param)
     seq: number;            // -1 = nothing seen yet
     display: DisplayState | null;
 }
@@ -193,7 +221,7 @@ let lastActivity = -1e12;
 
 function stateOf(track: number): TrackFeedback {
     let st = tracks.get(track);
-    if (!st) { st = { leds: null, stepLeds: null, seq: -1, display: null }; tracks.set(track, st); }
+    if (!st) { st = { leds: null, stepLeds: null, capture: false, seq: -1, display: null }; tracks.set(track, st); }
     return st;
 }
 
@@ -207,9 +235,10 @@ export function feedbackPoll(
     const st = stateOf(track);
     if (keys.ledsKey) st.leds = parsePadLeds(read(keys.ledsKey));
     if (keys.stepLedsKey) st.stepLeds = parseStepLeds(read(keys.stepLedsKey));
+    if (keys.captureKey) st.capture = parseInt(read(keys.captureKey) ?? '', 10) === 1;
     if (keys.displayKey) {
         const d = parseDisplay(read(keys.displayKey), st.display);
-        if (d && (!st.display || d.seq !== st.display.seq || d.pos !== st.display.pos || d.mark !== st.display.mark
+        if (d && (!st.display || d.seq !== st.display.seq || d.pos !== st.display.pos || d.mark !== st.display.mark || d.end !== st.display.end
                   || d.header !== st.display.header)) displayDirty = true;
         st.display = d;
     }
@@ -230,6 +259,11 @@ export function feedbackLeds(track: number): Uint8Array | null {
 /** Latest step-row colours for a track, or null (not declared / not read yet). */
 export function feedbackStepLeds(track: number): Uint8Array | null {
     return tracks.get(track)?.stepLeds ?? null;
+}
+
+/** The module on this track asked to own the knobs (last poll). */
+export function feedbackCapture(track: number): boolean {
+    return tracks.get(track)?.capture ?? false;
 }
 
 /** Forget a track (its module changed) so stale colours/seq never leak. */
@@ -284,4 +318,19 @@ export function loopKnobWrite(
 ): [string, string] | null {
     if (!keys || !keys.loopKnobKey || !(knob >= 0 && knob < 8) || !delta) return null;
     return [keys.loopKnobKey, (knob + 1) + ':' + delta + (fine ? ':1' : '')];
+}
+
+/** The write a captured knob turn becomes: [key, "N:delta[:1]"], or null when the
+ *  module declares no knob_delta_param. `knob` is 0-based. */
+export function knobDeltaWrite(
+    keys: FeedbackKeys | null, knob: number, delta: number, fine: boolean,
+): [string, string] | null {
+    if (!keys || !keys.knobDeltaKey || !(knob >= 0 && knob < 8) || !delta) return null;
+    return [keys.knobDeltaKey, (knob + 1) + ':' + delta + (fine ? ':1' : '')];
+}
+
+/** The write Move's Undo (Shift = redo) becomes: [key, "undo" | "redo"], or null. */
+export function undoWrite(keys: FeedbackKeys | null, redo: boolean): [string, string] | null {
+    if (!keys || !keys.undoKey) return null;
+    return [keys.undoKey, redo ? 'redo' : 'undo'];
 }

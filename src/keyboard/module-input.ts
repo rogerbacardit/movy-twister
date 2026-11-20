@@ -1,11 +1,13 @@
 /* Input a module can claim on its own track (keyboard/module-feedback.ts
- * documents the keys): the 16 step buttons and Loop + knob. The glue between
+ * documents the keys): the 16 step buttons, Loop + knob, captured knobs and Undo. The glue between
  * the pure key helpers and the active track's port. A module that declares
  * nothing is never touched: every function here answers false for it. */
 
 import { appState } from '../app/state.js';
 import { portFor } from '../track/registry.js';
-import { loopKnobWrite, stepPressWrite, type FeedbackKeys } from './module-feedback.js';
+import {
+    feedbackCapture, knobDeltaWrite, loopKnobWrite, stepPressWrite, undoWrite, type FeedbackKeys,
+} from './module-feedback.js';
 
 function active(): { keys: FeedbackKeys; track: number; comp: string } | null {
     const track = appState.activeTrack.index;
@@ -43,6 +45,41 @@ export function moduleLoopKnob(knob: number, delta: number, fine: boolean): bool
     const a = active();
     if (!a) return false;
     const w = loopKnobWrite(a.keys, knob, delta, fine);
+    if (!w) return false;
+    portFor(a.track).setParam(a.comp + ':' + w[0], w[1]);
+    appState.dirty = true;
+    return true;
+}
+
+/** The active track's module has taken the knobs (knob_capture_param reads 1). */
+export function moduleKnobsCaptured(): boolean {
+    const a = active();
+    return !!a && !!a.keys.captureKey && !!a.keys.knobDeltaKey && feedbackCapture(a.track);
+}
+
+/** A knob turn the module owns: Loop held -> loop_knob, else captured -> knob_delta.
+ *  True = consumed. `loop` = Move's Loop button is held. */
+export function moduleKnobTurn(knob: number, delta: number, fine: boolean, loop: boolean): boolean {
+    if (loop && moduleLoopKnob(knob, delta, fine)) return true;
+    const a = active();
+    if (!a || !moduleKnobsCaptured()) return false;
+    const w = knobDeltaWrite(a.keys, knob, delta, fine);
+    if (!w) return false;
+    portFor(a.track).setParam(a.comp + ':' + w[0], w[1]);
+    appState.dirty = true;
+    return true;
+}
+
+/** The active track's module takes Undo / Shift+Undo (undo_param). */
+export function moduleOwnsUndo(): boolean {
+    return !!active()?.keys.undoKey;
+}
+
+/** Undo (or redo) goes to the module. False = not the module's, movy undoes. */
+export function moduleUndo(redo: boolean): boolean {
+    const a = active();
+    if (!a) return false;
+    const w = undoWrite(a.keys, redo);
     if (!w) return false;
     portFor(a.track).setParam(a.comp + ':' + w[0], w[1]);
     appState.dirty = true;

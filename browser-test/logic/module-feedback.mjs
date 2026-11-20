@@ -14,11 +14,11 @@ export async function run() {
 
     eq('no declaration -> null', feedbackKeysOf({ pad_layout: 'drums' }), null);
     eq('both keys read', JSON.stringify(feedbackKeysOf({ pad_leds_param: 'pad_leds', status_text_param: 'status_text' })),
-       '{"ledsKey":"pad_leds","textKey":"status_text","displayKey":null,"deleteKey":null,"stepKey":null,"stepLedsKey":null,"loopKnobKey":null}');
+       '{"ledsKey":"pad_leds","textKey":"status_text","displayKey":null,"deleteKey":null,"stepKey":null,"stepLedsKey":null,"loopKnobKey":null,"captureKey":null,"knobDeltaKey":null,"undoKey":null}');
     eq('one key is enough', JSON.stringify(feedbackKeysOf({ status_text_param: 't' })),
-       '{"ledsKey":null,"textKey":"t","displayKey":null,"deleteKey":null,"stepKey":null,"stepLedsKey":null,"loopKnobKey":null}');
+       '{"ledsKey":null,"textKey":"t","displayKey":null,"deleteKey":null,"stepKey":null,"stepLedsKey":null,"loopKnobKey":null,"captureKey":null,"knobDeltaKey":null,"undoKey":null}');
     eq('display and delete keys read', JSON.stringify(feedbackKeysOf({ display_param: 'd', delete_pad_param: 'x' })),
-       '{"ledsKey":null,"textKey":null,"displayKey":"d","deleteKey":"x","stepKey":null,"stepLedsKey":null,"loopKnobKey":null}');
+       '{"ledsKey":null,"textKey":null,"displayKey":"d","deleteKey":"x","stepKey":null,"stepLedsKey":null,"loopKnobKey":null,"captureKey":null,"knobDeltaKey":null,"undoKey":null}');
 
     eq('short string is rejected', parsePadLeds('0102'), null);
     eq('non-hex is rejected', parsePadLeds('zz'.repeat(32)), null);
@@ -150,4 +150,36 @@ export async function run() {
     mval = '1|10,9|' + peaks + '|H';
     for (let i = 0; i < POLL_EVERY; i++) feedbackPoll(3, mkeys, () => mval);
     eq('a moving marker repaints', displayTakeDirty(), true);
+
+    /* ── knob_capture_param / knob_delta_param / undo_param, display end marker ── */
+    const { feedbackCapture, knobDeltaWrite, undoWrite } = m;
+    const ck = feedbackKeysOf({ knob_capture_param: 'cap', knob_delta_param: 'kd', undo_param: 'ud' });
+    eq('capture keys are read', ck.captureKey + ',' + ck.knobDeltaKey + ',' + ck.undoKey, 'cap,kd,ud');
+    eq('each of them alone declares feedback', feedbackKeysOf({ undo_param: 'ud' }).undoKey, 'ud');
+    eq('knob delta write', knobDeltaWrite(ck, 0, 3, false)[1], '1:3');
+    eq('knob delta write names the key', knobDeltaWrite(ck, 5, -2, true)[0] + ' ' + knobDeltaWrite(ck, 5, -2, true)[1], 'kd 6:-2:1');
+    eq('knob delta: a zero turn is nothing', knobDeltaWrite(ck, 1, 0, false), null);
+    eq('knob delta: knob 9 is nothing', knobDeltaWrite(ck, 8, 1, false), null);
+    eq('no knob_delta_param, no write', knobDeltaWrite(feedbackKeysOf({ pad_leds_param: 'p' }), 1, 1, false), null);
+    eq('undo write', undoWrite(ck, false)[0] + ' ' + undoWrite(ck, false)[1], 'ud undo');
+    eq('redo write', undoWrite(ck, true)[1], 'redo');
+    eq('no undo_param, no write', undoWrite(feedbackKeysOf({ pad_leds_param: 'p' }), false), null);
+    feedbackReset();
+    const capKeys = { ledsKey: null, textKey: null, displayKey: null, deleteKey: null, captureKey: 'cap' };
+    let capv = '1';
+    for (let i = 0; i < POLL_EVERY; i++) feedbackPoll(4, capKeys, (k) => (k === 'cap' ? capv : null));
+    eq('capture is read per track', feedbackCapture(4), true);
+    eq('another track is not captured', feedbackCapture(1), false);
+    capv = '0';
+    for (let i = 0; i < POLL_EVERY; i++) feedbackPoll(4, capKeys, (k) => (k === 'cap' ? capv : null));
+    eq('capture goes back to 0', feedbackCapture(4), false);
+    feedbackReset();
+    for (let i = 0; i < POLL_EVERY; i++) feedbackPoll(4, { ...capKeys, captureKey: null }, () => '1');
+    eq('without knob_capture_param nothing is read', feedbackCapture(4), false);
+    const de = parseDisplay('3|40,12,96|' + peaks + '|END 1 12/16');
+    eq('display with start and end markers', de.mark + ',' + de.end, '12,96');
+    eq('display with an end marker only', parseDisplay('3|40,-1,96|' + peaks + '|H').mark + ',' + parseDisplay('3|40,-1,96|' + peaks + '|H').end, '-1,96');
+    eq('display without an end marker: -1', parseDisplay('3|40,12|' + peaks + '|H').end, -1);
+    eq('display end is clamped', parseDisplay('3|40,1,999|' + peaks + '|H').end, 127);
+    eq('display pos alone has no markers', parseDisplay('3|40|' + peaks + '|H').end, -1);
 }

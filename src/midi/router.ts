@@ -81,7 +81,7 @@ import { holdTouch, holdRelease, holdTurnCancel, assignActive, assignCycle, assi
 import { masterScope, trackScope } from '../lfo/scope.js';
 import { deleteActive, markDeleteActed } from '../seq/edit-ops.js';
 import { displayActivity, deletePadWrite } from '../keyboard/module-feedback.js';
-import { moduleLoopKnob, moduleOwnsLoopKnobs } from '../keyboard/module-input.js';
+import { moduleKnobTurn, moduleKnobsCaptured, moduleOwnsLoopKnobs } from '../keyboard/module-input.js';
 import { loopHeld } from '../seq/loop-mode.js';
 import { seqToast } from '../seq/render.js';
 import { leaveModalActive, openLeaveModal, closeLeaveModal, leaveModalMove, leaveModalConfirm, leaveModalPass } from '../app/leave-modal.js';
@@ -136,10 +136,11 @@ function trackButtonPress(data: number[]): void {
     setButtonHeld(k, data[2] > 0);
 }
 
-/* Loop is held on a track whose module takes Loop + knob (loop_knob_param): the
- * knobs are the module's, and its display view stays on screen. */
+/* Loop is held on a track whose module takes Loop + knob (loop_knob_param), or the
+ * module has captured the knobs (knob_capture_param): the knobs are the module's,
+ * and its display view stays on screen. */
 function loopKnobOwned(): boolean {
-    return loopHeld() && !seqState.sessionMode && moduleOwnsLoopKnobs();
+    return !seqState.sessionMode && ((loopHeld() && moduleOwnsLoopKnobs()) || moduleKnobsCaptured());
 }
 
 function activeModel() {
@@ -671,7 +672,7 @@ export function onMidiMessageInternal(data: number[]): void {
             if (k < 5) stepParamsOwner().page?.knobTurn(k, delta);
             return;
         }
-        if (loopKnobOwned() && moduleLoopKnob(k, delta, appState.shiftHeld)) return;
+        if (loopKnobOwned() && moduleKnobTurn(k, delta, appState.shiftHeld, loopHeld())) return;
         mlog('knobCC k=' + k + ' d2=' + d2 + ' delta=' + delta);
         const model = knobModel();
         const track = appState.activeTrack.index;

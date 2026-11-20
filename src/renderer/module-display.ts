@@ -1,8 +1,8 @@
 /* A module's waveform overview on the main screen (keyboard/module-feedback.ts
  * `display_param`). 128 px = 128 peaks, one column each, mirrored around the
  * centre line; the playhead is a 1 px line with a 1 px black gap either side so
- * it stays visible through a loud passage on the 1-bit OLED. `mark` (>= 0) is a
- * module's start marker, see below. Header: the
+ * it stays visible through a loud passage on the 1-bit OLED. `mark` / `end` (>= 0) are a
+ * module's start / end markers, see below. Header: the
  * track and the module's own text ("PLAY 1 - 4 BARS"), inverted bar. */
 
 import { fontWidth } from '../font/index.js';
@@ -45,5 +45,13 @@ export function drawModuleDisplay(d: DisplayState, track: number): void {
         for (let y = WAVE_TOP; y <= WAVE_BOTTOM; y += 2) fill_rect(d.mark, y, 1, 1, 1);
         fill_rect(d.mark, WAVE_TOP, Math.min(4, W - d.mark), 2, 1);
         fill_rect(d.mark, WAVE_BOTTOM - 1, Math.min(4, W - d.mark), 2, 1);
+    }
+    /* End marker (a module's loop end): the mirror of the start marker, its flag
+     * pointing left. */
+    if (d.end >= 0 && d.end < W) {
+        for (let y = WAVE_TOP + 1; y <= WAVE_BOTTOM; y += 2) fill_rect(d.end, y, 1, 1, 1);
+        const w = Math.min(4, d.end + 1);
+        fill_rect(d.end - w + 1, WAVE_TOP, w, 2, 1);
+        fill_rect(d.end - w + 1, WAVE_BOTTOM - 1, w, 2, 1);
     }
 }

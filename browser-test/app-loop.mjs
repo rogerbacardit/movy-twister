@@ -3717,5 +3717,127 @@ _log('\napp-loop: module step buttons + Loop knob');
     eq('Shift + step is not the module\'s', env.params['synth:step'], undefined);
 }
 
+/* ── a module that captures the knobs and takes Undo ─────────────────────── */
+_log('\napp-loop: module knob capture + undo_param');
+{
+    const CC_SHIFT = 49, CC_UNDO_B = 56;
+    const { VIEW_KNOBS: VIEW_KNOBS_P } = await import('../dist/esm/app/state.js');
+    const { onMidiMessageExternal: onExternalControlChange } = await import('../dist/esm/midi/external.js');
+    const { resetUndoState, canUndo, undoDepth } = await import('../dist/esm/undo/state.js');
+    const { resetUndoGroups } = await import('../dist/esm/undo/group.js');
+    const { resetUndoApply } = await import('../dist/esm/undo/apply.js');
+    const { resetAutomation } = await import('../dist/esm/seq/automation.js');
+    const declareCap = (extra, cap) => {
+        engine.reset();
+        env.setParams({
+            'synth:name': 'CapTest',
+            'synth:chain_params': JSON.stringify([{ key: 'vol', name: 'Volume', type: 'float', min: 0, max: 1, step: 0.01 }]),
+            'synth:ui_hierarchy': JSON.stringify({ ...extra, levels: { root: { knobs: ['vol'] } } }),
+            'synth:vol': '0.5',
+        });
+        if (cap !== undefined) env.params['synth:knob_capture'] = cap;
+        resetSeqState(); resetSeqEngine(); resetAutomation();
+        globalThis.init();
+        appState.trackModels[0][1].reload();
+        advance(12);
+        appState.currentView = VIEW_KNOBS_P;
+        appState.activeTrack = trackRef(0);
+        advance(40);
+    };
+    /* The observable for "the knob reached the hierarchy parameter": with a step held in
+     * step-automation mode, such a turn locks the parameter (an engine `aset`). */
+    const hierWrote = () => engine.ops.some((o) => o.startsWith('aset '));
+    const armProbe = () => { engine.reset(); seqState.stepAutoMode = true; seqState.holdStep = 4; };
+    const endProbe = () => { seqState.stepAutoMode = false; seqState.holdStep = -1; };
+    const keysDecl = { knob_capture_param: 'knob_capture', knob_delta_param: 'knob_delta', undo_param: 'undo_cmd' };
+
+    /* baseline: not captured, a knob turn is the hierarchy parameter and nothing goes to knob_delta */
+    declareCap(keysDecl, '0');
+    armProbe();
+    sendMidi([0xB0, 71, 3]);
+    advance(6);
+    eq('not captured: the knob edits its parameter', hierWrote(), true);
+    eq('not captured: nothing goes to knob_delta', env.params['synth:knob_delta'], undefined);
+
+    /* captured: the turn is the module's, the hierarchy parameter is untouched */
+    declareCap(keysDecl, '1');
+    armProbe();
+    sendMidi([0xB0, 71, 3]);
+    advance(6);
+    eq('captured: knob 1 goes to knob_delta as N:delta', env.params['synth:knob_delta'], '1:3');
+    eq('captured: the hierarchy parameter is not written', hierWrote(), false);
+    sendMidi([0xB0, 74, 127]);
+    advance(2);
+    eq('captured: a negative turn on knob 4', env.params['synth:knob_delta'], '4:-1');
+    appState.shiftHeld = true;
+    sendMidi([0xB0, 72, 1]);
+    appState.shiftHeld = false;
+    advance(2);
+    eq('captured: Shift adds the fine flag', env.params['synth:knob_delta'], '2:1:1');
+    delete env.params['synth:knob_delta'];
+    armProbe();
+    sendMidi([0x90, 0, 127]); sendMidi([0x80, 0, 0]);          // a knob touch is the module's too
+    advance(2);
+    eq('captured: a touch writes nothing', env.params['synth:knob_delta'], undefined);
+    eq('captured: and the hierarchy parameter is still untouched', hierWrote(), false);
+    /* the Twister (factory CC 8-15 on channel 1, absolute) takes the same road */
+    onExternalControlChange([0xB0, 8, 64]);                    // sets the origin
+    onExternalControlChange([0xB0, 8, 67]);                    // +3 on knob 1
+    advance(2);
+    eq('captured: a Twister knob goes to knob_delta', env.params['synth:knob_delta'], '1:3');
+    eq('captured: the Twister did not move the hierarchy parameter', hierWrote(), false);
+    /* back to 0: the knob is the parameter again */
+    env.params['synth:knob_capture'] = '0';
+    advance(40);
+    delete env.params['synth:knob_delta'];
+    armProbe();
+    sendMidi([0xB0, 71, 3]);
+    advance(6);
+    eq('capture released: the knob edits its parameter again', hierWrote(), true);
+    eq('capture released: nothing goes to knob_delta', env.params['synth:knob_delta'], undefined);
+
+    /* a module that declares neither is untouched (the capture key alone is not enough) */
+    declareCap({ knob_capture_param: 'knob_capture' }, '1');
+    armProbe();
+    sendMidi([0xB0, 71, 3]);
+    advance(6);
+    eq('capture without knob_delta_param: the knob stays the parameter', hierWrote(), true);
+    declareCap({ pad_leds_param: 'pad_leds' }, '1');
+    armProbe();
+    sendMidi([0xB0, 71, 3]);
+    advance(6);
+    eq('a module declaring nothing keeps its knobs', hierWrote() && env.params['synth:knob_delta'] === undefined, true);
+
+    /* undo_param: Undo / Shift+Undo go to the module, movy's undo does not run */
+    declareCap({ undo_param: 'undo_cmd' });
+    resetUndoState(); resetUndoGroups();
+    sendMidi([0x90, STEP_NOTE_BASE + 7, 127]); sendMidi([0x80, STEP_NOTE_BASE + 7, 0]);
+    advance(2);
+    const depth = undoDepth();
+    eq('movy has something to undo', canUndo(), true);
+    sendMidi([0xB0, CC_UNDO_B, 127]); sendMidi([0xB0, CC_UNDO_B, 0]);
+    advance(2);
+    eq('Undo writes "undo" to the module', env.params['synth:undo_cmd'], 'undo');
+    eq('and movy does not undo', undoDepth(), depth);
+    sendMidi([0xB0, CC_SHIFT, 127]);
+    sendMidi([0xB0, CC_UNDO_B, 127]); sendMidi([0xB0, CC_UNDO_B, 0]);
+    sendMidi([0xB0, CC_SHIFT, 0]);
+    advance(2);
+    eq('Shift+Undo writes "redo"', env.params['synth:undo_cmd'], 'redo');
+    eq('and movy still does not undo', undoDepth(), depth);
+    /* a module without undo_param: movy's own undo, nothing written */
+    declareCap({ pad_leds_param: 'pad_leds' });
+    resetUndoState(); resetUndoGroups();
+    sendMidi([0x90, STEP_NOTE_BASE + 7, 127]); sendMidi([0x80, STEP_NOTE_BASE + 7, 0]);
+    advance(2);
+    const depth2 = undoDepth();
+    sendMidi([0xB0, CC_UNDO_B, 127]); sendMidi([0xB0, CC_UNDO_B, 0]);
+    advance(2);
+    eq('without undo_param movy undoes as before', undoDepth(), depth2 - 1);
+    eq('and nothing is written to the module', env.params['synth:undo_cmd'], undefined);
+    resetUndoState(); resetUndoGroups(); resetUndoApply();
+    endProbe();
+}
+
 if (failures === 0) _log('\n\x1b[32m\x1b[1mALL APP-LOOP CHECKS PASSED\x1b[0m');
 else { _log(`\n\x1b[31m\x1b[1m${failures} APP-LOOP CHECK(S) FAILED\x1b[0m`); process.exit(1); }
