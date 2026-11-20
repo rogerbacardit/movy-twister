@@ -3555,5 +3555,31 @@ _log('\napp-loop: clearing a send slot leaves its detail page');
     seqState.sessionMode = false;
 }
 
+/* ── a module that paints its own pads and names a status line ───────────── */
+_log('\napp-loop: module feedback (pad_leds / status_text)');
+{
+    resetApp();
+    const hex = (fn) => Array.from({ length: 32 }, (_, i) => fn(i).toString(16).padStart(2, '0')).join('');
+    env.params['synth:ui_hierarchy'] = JSON.stringify({
+        pad_leds_param: 'pad_leds', status_text_param: 'status_text',
+        levels: { root: { knobs: [] } },
+    });
+    env.params['synth:pad_leds'] = hex((i) => (i === 0 ? 0x80 | 127 : 40 + i));
+    env.params['synth:status_text'] = '0:';
+    appState.trackModels[0][1].reload();
+    advance(40);
+    eq('the module declares feedback keys', !!appState.trackModels[0][1].getFeedbackKeys(), true);
+    /* rack pad 1 = grid pad 68 (bottom-left); pad 2 = 69; pad 5 = row 2, col 0 = 76 */
+    eq('pad 2 shows the module colour', padColor(69), 41);
+    eq('pad 5 shows the module colour', padColor(72 + 4), 44);
+    eq('a pad past the rack stays black', padColor(72), 0);
+    env.params['synth:status_text'] = '1:MUTE 2';
+    advance(40);
+    eq('a new status seq shows as a toast', seqToastText(), 'MUTE 2');
+    env.params['synth:pad_leds'] = hex(() => 33);
+    advance(40);
+    eq('colour changes follow', padColor(69), 33);
+}
+
 if (failures === 0) _log('\n\x1b[32m\x1b[1mALL APP-LOOP CHECKS PASSED\x1b[0m');
 else { _log(`\n\x1b[31m\x1b[1m${failures} APP-LOOP CHECK(S) FAILED\x1b[0m`); process.exit(1); }

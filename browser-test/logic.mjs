@@ -56,6 +56,7 @@ import { run as run_step_piano } from './logic/step-piano.mjs';
 import { run as run_external_midi } from './logic/external-midi.mjs';
 import { run as run_ext_knobs } from './logic/ext-knobs.mjs';
 import { run as run_midi_in } from './logic/midi-in.mjs';
+import { run as run_module_feedback } from './logic/module-feedback.mjs';
 import { run as run_track_watch } from './logic/track-watch.mjs';
 import { run as run_tracks_refs } from './logic/tracks-refs.mjs';
 import { run as run_tracks_chain } from './logic/tracks-chain.mjs';
@@ -151,6 +152,7 @@ const SUITES = [
     run_external_midi,
     run_ext_knobs,
     run_midi_in,
+    run_module_feedback,
     run_track_watch,
     run_tracks_refs,
     run_tracks_chain,
